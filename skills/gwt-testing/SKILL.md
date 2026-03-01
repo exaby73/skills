@@ -27,6 +27,7 @@ When this skill says:
 
 ## Rules
 1. Keep maximum nesting depth to 3 levels: `suite -> suite -> case`.
+   Exception: allow one additional nested level for `Then` variants when validating the same outcome across interfaces or variants (for example `via RPC` and `via REST`).
 2. Never nest `Given` blocks inside another `Given` block.
 3. Keep `Given` setup hooks focused on shared context and test data, not primary behavior under test.
 4. Prefer assertion-only case blocks.
@@ -48,8 +49,9 @@ When this skill says:
 5. Add assertion-only `Then ...` case blocks.
 6. If a `When` has only one `Then`, optionally collapse to a single case title: `When ... then ...`.
 7. Move logic from `Given` hooks into `When` hooks when that logic is action-specific.
-8. Keep nesting shallow and remove redundant wrappers.
-9. Run tests and formatter.
+8. If a `Then` needs interface/variant coverage, nest variant blocks under that `Then` only (for example `via RPC`, `via REST`).
+9. Keep nesting shallow and remove redundant wrappers.
+10. Run tests and formatter.
 
 ## Pseudocode Pattern
 ```pseudo
@@ -170,6 +172,25 @@ Choose utility location by reuse scope.
 - Move cross-file utilities to shared test utility locations used by the codebase.
 - If the repository has no established shared test utility location, create an appropriate `utils` directory for shared test helpers.
 
+## Then Variant Nesting Exception
+Use one extra nesting level only for variant coverage of the same `Then` outcome.
+
+```pseudo
+suite("Given an endpoint that returns a user", () => {
+  suite("When requesting user 42", () => {
+    suite("Then status is successful", () => {
+      case("via RPC", () => {
+        // assert only
+      })
+
+      case("via REST", () => {
+        // assert only
+      })
+    })
+  })
+})
+```
+
 ## Refactoring Guide
 When asked to refactor or check existing tests, evaluate against all rules, not only the rule that triggered the edit.
 
@@ -189,7 +210,7 @@ Use this pass order:
 - Calling the SUT inside a case block when it can be executed in `When` setup hooks.
 - Mixing setup/action/asserts in a single case block.
 - Adding wrapper suite blocks with no new context.
-- Depth greater than `suite -> suite -> case`.
+- Depth greater than `suite -> suite -> case`, except one additional level for `Then` variants.
 - A title that claims an action runs in one block when it actually runs in another block.
 
 ## Review Checklist
@@ -203,4 +224,4 @@ Use this pass order:
 - Are single `When` + single `Then` cases collapsed into one case block?
 - Are file-specific utilities placed at the bottom of the test file (with tests first)?
 - Are shared utilities moved to shared locations that follow existing codebase patterns (or a new appropriate `utils` directory when no pattern exists)?
-- Is nesting depth <= 3?
+- Is nesting depth <= 3, or <= 4 only when the 4th level is `Then` variants (for example `via RPC`/`via REST`)?
