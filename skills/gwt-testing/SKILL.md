@@ -35,6 +35,10 @@ When this skill says:
 7. If a `When` has only one `Then`, use a single case title (`When ... then ...`); in this collapsed form, putting the `When` action inside the case body is acceptable.
 8. Remove wrapper suite blocks that do not add scenario context.
 9. Write explicit scenario titles: `Given <subject> with <condition>`, `When <action>`, and `Then <outcome>`.
+10. Place test utilities based on scope:
+    - If a utility is specific to one test file, place it at the bottom of that file so test blocks remain the first code in the file.
+    - If a utility is reused across test files, move it to shared test utilities following existing codebase conventions.
+    - If no shared utility convention exists, create an appropriate `utils` directory and place shared utilities there.
 
 ## Writing Workflow
 1. Define scenarios as top-level `Given ...` suite blocks.
@@ -159,6 +163,13 @@ suite("Given a counter at zero", () => {
 })
 ```
 
+## Utility Placement
+Choose utility location by reuse scope.
+
+- Keep file-specific utilities in the same test file, below all test blocks.
+- Move cross-file utilities to shared test utility locations used by the codebase.
+- If the repository has no established shared test utility location, create an appropriate `utils` directory for shared test helpers.
+
 ## Refactoring Guide
 When asked to refactor or check existing tests, evaluate against all rules, not only the rule that triggered the edit.
 
@@ -190,4 +201,6 @@ Use this pass order:
 - After each logic move, was `When`/`Then` collapse re-evaluated?
 - Do suite and case titles match what actually happens in each block's scope?
 - Are single `When` + single `Then` cases collapsed into one case block?
+- Are file-specific utilities placed at the bottom of the test file (with tests first)?
+- Are shared utilities moved to shared locations that follow existing codebase patterns (or a new appropriate `utils` directory when no pattern exists)?
 - Is nesting depth <= 3?
