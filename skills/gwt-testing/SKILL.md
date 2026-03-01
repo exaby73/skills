@@ -159,6 +159,19 @@ suite("Given a counter at zero", () => {
 })
 ```
 
+## Refactoring Guide
+When asked to refactor or check existing tests, evaluate against all rules, not only the rule that triggered the edit.
+
+Use this pass order:
+
+1. Map current structure as `Given`, `When`, and `Then` blocks.
+2. Move action-specific logic out of `Given` setup hooks into the correct `When` block.
+3. After each logic move, immediately re-evaluate collapse opportunities:
+   - If a `When` block now has only one `Then`, collapse to `When ... then ...`.
+   - If additional outcomes still exist, keep `When` + multiple `Then` cases.
+4. Re-check title-to-scope alignment after structural edits.
+5. Run the full review checklist before finishing.
+
 ## Anti-Patterns
 - Nesting `Given` inside `Given`.
 - Keeping action execution in `Given` setup when it can be moved to a `When` block.
@@ -169,10 +182,12 @@ suite("Given a counter at zero", () => {
 - A title that claims an action runs in one block when it actually runs in another block.
 
 ## Review Checklist
+- Are all rules reviewed, not just the rule that prompted the refactor?
 - Are there any nested `Given` blocks?
 - Does each case block contain assertions only?
 - Does `Given` setup contain only shared context?
 - Is action logic moved into the relevant `When` block?
+- After each logic move, was `When`/`Then` collapse re-evaluated?
 - Do suite and case titles match what actually happens in each block's scope?
 - Are single `When` + single `Then` cases collapsed into one case block?
 - Is nesting depth <= 3?
