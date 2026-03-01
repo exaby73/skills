@@ -10,14 +10,14 @@ Use these instructions to write clean, readable tests with Given/When/Then seman
 ## Terminology Map
 Use the agnostic terms below throughout this skill.
 
-| Agnostic term | JS/TS example | Dart example |
-| --- | --- | --- |
-| Suite block | `describe` | `group` |
-| Case block | `it` / `test` | `test` |
-| Setup once (for a suite) | `before` | `setUpAll` |
-| Setup each (per case) | `beforeEach` | `setUp` |
-| Teardown once (for a suite) | `after` | `tearDownAll` |
-| Teardown each (per case) | `afterEach` | `tearDown` |
+| Agnostic term               | JS/TS example | Dart example  |
+| --------------------------- | ------------- | ------------- |
+| Suite block                 | `describe`    | `group`       |
+| Case block                  | `it` / `test` | `test`        |
+| Setup once (for a suite)    | `before`      | `setUpAll`    |
+| Setup each (per case)       | `beforeEach`  | `setUp`       |
+| Teardown once (for a suite) | `after`       | `tearDownAll` |
+| Teardown each (per case)    | `afterEach`   | `tearDown`    |
 
 When this skill says:
 - "suite block", read `describe` (JS/TS) or `group` (Dart)
@@ -28,43 +28,151 @@ When this skill says:
 ## Rules
 1. Keep maximum nesting depth to 3 levels: `suite -> suite -> case`.
 2. Never nest `Given` blocks inside another `Given` block.
-3. Put setup and action code in setup hooks for the scenario.
+3. Keep `Given` setup hooks focused on shared context and test data, not primary behavior under test.
 4. Prefer assertion-only case blocks.
-5. If a `When` has only one `Then`, use a single case title (`When ... then ...`); in this collapsed form, putting the `When` action inside the case body is acceptable.
-6. Remove wrapper describes that do not add scenario context.
-7. Write explicit scenario titles: `Given <subject> with <condition>`.
+5. Move executable behavior into a dedicated `When` block whenever possible. Use setup hooks inside that `When` block to run the action once per case.
+6. Ensure block titles describe behavior that actually happens in that block's scope. Do not title a case `When <action> ...` if `<action>` already ran in another block's setup hook.
+7. If a `When` has only one `Then`, use a single case title (`When ... then ...`); in this collapsed form, putting the `When` action inside the case body is acceptable.
+8. Remove wrapper suite blocks that do not add scenario context.
+9. Write explicit scenario titles: `Given <subject> with <condition>`, `When <action>`, and `Then <outcome>`.
 
 ## Writing Workflow
-1. Define scenarios as top-level `Given` suite blocks.
-2. Add setup hooks per scenario to arrange and act.
-3. Add case blocks for outcomes (`When ... then ...`) with assertions only.
-4. Keep nesting shallow and remove redundant wrappers.
-5. Run tests and formatter.
+1. Define scenarios as top-level `Given ...` suite blocks.
+2. Add `Given` setup hooks for shared context only.
+3. Add nested `When ...` suite blocks for each action path.
+4. Run the action in setup hooks inside the `When` block when multiple `Then` cases share it.
+5. Add assertion-only `Then ...` case blocks.
+6. If a `When` has only one `Then`, optionally collapse to a single case title: `When ... then ...`.
+7. Move logic from `Given` hooks into `When` hooks when that logic is action-specific.
+8. Keep nesting shallow and remove redundant wrappers.
+9. Run tests and formatter.
 
 ## Pseudocode Pattern
 ```pseudo
 suite("Given <subject> with <state>", () => {
   setup_each(() => {
-    // arrange
-    // act
+    // arrange shared context
   })
 
-  case("When <event> then <outcome>", () => {
-    // assert only
+  suite("When <action>", () => {
+    setup_each(() => {
+      // act
+    })
+
+    case("Then <outcome A>", () => {
+      // assert only
+    })
+
+    case("Then <outcome B>", () => {
+      // assert only
+    })
+  })
+})
+```
+
+## Title-to-Scope Alignment
+Use titles that match where behavior occurs.
+
+Bad example:
+
+```pseudo
+suite("Given a counter at zero", () => {
+  setup_each(() => {
+    // Bad: action belongs in a When block, not Given setup.
+    counter.increment()
+  })
+
+  case("Then value is one", () => {
+    assert(counter.value == 1)
+  })
+})
+```
+
+Good example:
+
+```pseudo
+suite("Given a counter at zero", () => {
+  setup_each(() => {
+    // arrange
+  })
+
+  suite("When incremented", () => {
+    setup_each(() => {
+      counter.increment()
+    })
+
+    case("Then value is one", () => {
+      assert(counter.value == 1)
+    })
+
+    case("Then value is not zero", () => {
+      assert(counter.value != 0)
+    })
+  })
+})
+```
+
+## Logic Movement for Clean Blocks
+Move logic to the narrowest block that owns that behavior.
+
+- Keep data creation and shared fixtures in `Given` setup hooks.
+- Move action-specific calls from `Given` setup hooks into the relevant `When` block.
+- Keep `Then` case blocks assertion-only.
+- Only keep action execution in case bodies for a single `When ... then ...` collapsed case.
+
+## When/Then Collapse
+Apply collapse when one action has only one outcome assertion.
+
+Bad example (not collapsed):
+
+```pseudo
+suite("Given a counter at zero", () => {
+  setup_each(() => {
+    // arrange
+  })
+
+  suite("When incremented", () => {
+    setup_each(() => {
+      counter.increment()
+    })
+
+    case("Then value is one", () => {
+      assert(counter.value == 1)
+    })
+  })
+})
+```
+
+Good example (collapsed):
+
+```pseudo
+suite("Given a counter at zero", () => {
+  setup_each(() => {
+    // arrange
+  })
+
+  case("When incremented then value is one", () => {
+    counter.increment()
+
+    assert(counter.value == 1)
   })
 })
 ```
 
 ## Anti-Patterns
 - Nesting `Given` inside `Given`.
-- Calling the SUT inside a case block when it can be executed in setup hooks.
+- Keeping action execution in `Given` setup when it can be moved to a `When` block.
+- Calling the SUT inside a case block when it can be executed in `When` setup hooks.
 - Mixing setup/action/asserts in a single case block.
 - Adding wrapper suite blocks with no new context.
 - Depth greater than `suite -> suite -> case`.
+- A title that claims an action runs in one block when it actually runs in another block.
 
 ## Review Checklist
 - Are there any nested `Given` blocks?
 - Does each case block contain assertions only?
-- Is setup/action moved into setup hooks of the relevant scenario?
+- Does `Given` setup contain only shared context?
+- Is action logic moved into the relevant `When` block?
+- Do suite and case titles match what actually happens in each block's scope?
 - Are single `When` + single `Then` cases collapsed into one case block?
 - Is nesting depth <= 3?
