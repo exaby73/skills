@@ -40,6 +40,7 @@ When this skill says:
     - If a utility is specific to one test file, place it at the bottom of that file so test blocks remain the first code in the file.
     - If a utility is reused across test files, move it to shared test utilities following existing codebase conventions.
     - If no shared utility convention exists, create an appropriate `utils` directory and place shared utilities there.
+11. Extract a value into a named variable only when that value is used more than once, and place it in the nearest shared scope (for example `Given` or `When`) to make test data updates predictable and centralized.
 
 ## Writing Workflow
 1. Define scenarios as top-level `Given ...` suite blocks.
@@ -172,6 +173,64 @@ Choose utility location by reuse scope.
 - Move cross-file utilities to shared test utility locations used by the codebase.
 - If the repository has no established shared test utility location, create an appropriate `utils` directory for shared test helpers.
 
+## Reused Values
+Extract repeated values into named variables near test setup only when the same value is used more than once.
+
+Bad example (no variable extracted):
+
+```pseudo
+suite("Given a user lookup", () => {
+  suite("When searching by user id", () => {
+    case("Then it returns the matching user", () => {
+      result = findUser("user-42")
+      assert(result.id == "user-42")
+    })
+
+    case("Then it records an audit message for that user", () => {
+      assert(formatAuditMessage("user-42") == "audit:user-42")
+    })
+  })
+})
+```
+
+Bad example (scope too broad):
+
+```pseudo
+suite("Given a user lookup", () => {
+  userId = "user-42" // Too broad: only shared inside the When block below.
+
+  suite("When searching by user id", () => {
+    case("Then it returns the matching user", () => {
+      result = findUser(userId)
+      assert(result.id == userId)
+    })
+
+    case("Then it records an audit message for that user", () => {
+      assert(formatAuditMessage(userId) == "audit:" + userId)
+    })
+  })
+})
+```
+
+Good example:
+
+```pseudo
+suite("Given a user lookup", () => {
+  suite("When searching by user id", () => {
+    userId = "user-42" // Nearest shared scope.
+
+    case("Then it returns the matching user", () => {
+      result = findUser(userId)
+      assert(result.id == userId)
+    })
+
+    case("Then it records an audit message for that user", () => {
+      assert(formatAuditMessage(userId) == "audit:" + userId)
+    })
+  })
+})
+```
+
 ## Then Variant Nesting Exception
 Use one extra nesting level only for variant coverage of the same `Then` outcome.
 
@@ -224,4 +283,5 @@ Use this pass order:
 - Are single `When` + single `Then` cases collapsed into one case block?
 - Are file-specific utilities placed at the bottom of the test file (with tests first)?
 - Are shared utilities moved to shared locations that follow existing codebase patterns (or a new appropriate `utils` directory when no pattern exists)?
+- Are values extracted into named variables only when reused more than once, and placed in the nearest shared scope (for example `Given` or `When`)?
 - Is nesting depth <= 3, or <= 4 only when the 4th level is `Then` variants (for example `via RPC`/`via REST`)?
