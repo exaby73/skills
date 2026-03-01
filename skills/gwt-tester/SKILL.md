@@ -1,9 +1,9 @@
 ---
-name: gwt-testing
+name: gwt-tester
 description: Write or refactor tests using clear Given/When/Then structure. Use when creating new tests, improving test readability, or standardizing test files with setup hooks, assertion-only Then blocks, and shallow suite nesting.
 ---
 
-# GWT Testing
+# GWT Tester
 
 Use these instructions to write clean, readable tests with Given/When/Then semantics.
 
