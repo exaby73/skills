@@ -26,12 +26,19 @@ EOF
 
 - Omit `--format` to keep default Markdown.
 - The script prints the created file path to stdout.
+- Run this step in an environment that has real system clipboard access.
 
 4. Return the result.
 
 - Include the generated text unless the user asks for path-only output.
 - Include the file path returned by the script.
 - If clipboard copy is unavailable, mention the warning and still provide the file path.
+
+## Execution Environment
+
+- Execute [scripts/save_output_and_copy.sh](scripts/save_output_and_copy.sh) from a normal local shell session when clipboard behavior matters.
+- Avoid restricted or isolated runtimes for clipboard verification (for example: sandboxes, CI runners, or locked-down containers), because clipboard commands may succeed without updating the host clipboard.
+- If restricted execution is unavoidable, treat file creation as authoritative and report clipboard copy as best-effort.
 
 ## Format Rules
 
