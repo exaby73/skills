@@ -1,22 +1,28 @@
 ---
 name: luna-local-review-loop
-description: Delegate local repository implementation, documentation, testing, validation, and review fixes to ephemeral GPT-5.6 Luna Max workers with least-privilege permission brokering, explicit task ownership, and repeated parent code-reviewer passes until local approval. Use when Codex must orchestrate multi-step local changes through subagents while keeping worker execution and validation evidence bounded.
+description: Route local repository implementation, documentation, testing, validation, and review fixes between the parent and ephemeral GPT-5.6 Luna Max workers, using parent-owned durable goal and plan state, least-privilege permission brokering, explicit task ownership, and repeated parent code-reviewer passes until local approval. Use when Codex must decide whether local changes remain parent-direct or run through subagents while keeping worker execution and validation evidence bounded.
 ---
 
 # Luna Local Review Loop
 
-Use this skill to coordinate local repository work through Luna Max workers and finish with an approved parent review.
+Use this skill to route local repository work between the parent and Luna Max, then finish with an approved parent review.
 
-## Set ownership
+## Own durable state
 
-- Keep the parent responsible for the goal, decomposition, worker launch and collection, cross-worker decisions, permission brokerage, and final local review with `code-reviewer`.
-- Delegate executable investigation, implementation, documentation, tests, validation, and review fixes to Luna Max workers; keep the parent as orchestrator and final reviewer.
-- Define an explicit scope, owned paths, expected result, and validator for every worker task. Have the worker own the task, run the validator, and interpret its result; have the parent judge completion from the evidence.
+- When the user request or repository rules require a goal, have the parent define or retrieve it. The parent owns and manages the durable goal and plan state, including scope, acceptance criteria, validators, evidence, status, completion, and blocking decisions. Workers may report evidence against that state, but never own durable goal or plan state. When no goal is requested or required, do not create one merely to delegate work.
+- Keep the parent responsible for decomposition, worker launch and collection, cross-worker decisions, permission brokerage, and final local review with `code-reviewer`.
+- Define an explicit scope, owned paths, expected result, and validator for every worker task. Have the worker execute the task, run the validator, interpret its result, and report the changed-file summary, result, validator command and output, and unresolved limitations; have the parent judge completion from the evidence.
 - Require workers to leave staging and commits untouched. Workers must never stage or commit.
+
+## Route work
+
+- Let the parent execute directly only when the task is clearly trivial: expected to take no more than 2 minutes, normally touch no more than 1 file, have no meaningful external side effects or long validation, and cost less to do directly than to start and coordinate a worker. Examples include generating a commit message or making a single targeted file edit.
+- Use Luna Max for everything else. Luna Max is mandatory when a task may touch 3 or more files or may exceed 5 minutes. In the grey zone, bias toward Luna.
+- Treat the approximately 95% Luna / 5% parent-direct split as operating intent, not a quota. Parent-direct work still obeys repository rules and required validation.
 
 ## Launch Luna Max
 
-Run every executable task with this command shape, using safe quoting:
+Run every executable task routed to Luna Max with this command shape, using safe quoting:
 
 ```zsh
 codex exec \
@@ -34,11 +40,11 @@ codex exec \
 ## Orchestrate local work
 
 1. Decompose the request into worker-sized tasks and attach a concrete validator to each task.
-2. Launch workers only in the target repository. Run workers in parallel only when scopes are independent, owned paths do not overlap, and each worker has an explicit validator. Otherwise, run tasks sequentially and collect each result before starting dependent work.
+2. Apply the routing gate to each task before execution. Launch Luna workers only in the target repository. Run workers in parallel only when scopes are independent, owned paths do not overlap, and each worker has an explicit validator. Otherwise, run tasks sequentially and collect each result before starting dependent work.
 3. Collect the worker’s changed-file summary, result, validator command and output, and any unresolved limitation. Treat a failed or unrun validator as unresolved work.
 4. Invoke the parent `code-reviewer` skill against the complete local change and relevant repository context.
-5. Turn every review finding into a fresh Luna Max worker task. Include the finding, evidence, exact owned scope, and validator; do not resolve the finding from the parent or silently fold it into another task.
-6. Re-run the parent `code-reviewer` review after each finding’s fix and validation. Repeat the fresh-worker/fresh-review cycle until the parent review explicitly approves the local change.
+5. Route every review finding and its fix through the same threshold. Turn a worker-routed finding into a fresh Luna Max worker task; let the parent handle it directly only when it independently qualifies as a clearly trivial parent-direct task. Include the finding, evidence, exact owned scope, and validator; do not silently fold a worker-routed finding into another task.
+6. Re-run the parent `code-reviewer` review after each finding’s fix and validation. Repeat the routed-fix/review cycle until the parent review explicitly approves the local change.
 
 ## Broker blocked permissions
 
