@@ -57,12 +57,12 @@ Init is idempotent:
 2. It verifies project-local code-reviewer setup, conditionally installing it from the repository root when absent.
 3. It verifies project-local Caveman setup, conditionally installing it from the repository root when absent.
 4. It creates `.agents/agent-registry/` and acquires a local atomic `mkdir` lock.
-5. It ensures the exact `.agents/agent-registry/` line occurs once in the repository-root `.gitignore`, preserving an existing file's mode and using `0644` for a new file.
+5. It ensures the exact `.agents/agent-registry/` line occurs once in the repository-root `.gitignore`, preserving an existing regular file's mode and using `0644` for a new file. It rejects a symbolic-link `.gitignore` with an actionable filesystem error instead of replacing the link.
 6. It atomically creates `.agents/agent-registry/registry.json` when absent, or validates the existing version-1 registry without overwriting it.
 
 If an existing registry has a different `repository_root` or fails validation, init stops and preserves it for investigation. Do not copy a registry from another checkout.
 
-Validate init without network access by running `scripts/test-init.sh`. Its temporary Git repository and fake `npx` verify both exact project-local install commands, idempotence, registry creation, a new `.gitignore` mode of `0644`, and preservation of an existing custom mode.
+Validate init without network access by running `scripts/test-init.sh`. Its temporary Git repository and fake `npx` verify both exact project-local install commands, idempotence, registry creation, safe symbolic-link rejection, a new `.gitignore` mode of `0644`, preservation of an existing custom mode, resume-only activation, and conservative lock reclamation.
 
 ## Location, locking, and atomic writes
 
@@ -74,7 +74,7 @@ repo_root/.agents/agent-registry/registry.json
 repo_root/.agents/agent-registry/.lock/   # transient local lock, ignored
 ```
 
-Every mutation takes the `.lock` directory using atomic `mkdir`, writes a temporary JSON file in the same directory, validates it with `jq`, and renames it into place. Readers see either the old valid registry or the new valid registry. The lock records the owning shell PID and is released on normal exit and interruption. `kill -0` is used only to probe whether a lock owner still exists; the registry never sends a termination signal to a worker. If a command times out on a lock, inspect the PID and remove only a confirmed-stale `.lock` directory; never remove the registry or use registry data to stop a process.
+Every mutation takes the `.lock` directory using atomic `mkdir`, writes a temporary JSON file in the same directory, validates it with `jq`, and renames it into place. Readers see either the old valid registry or the new valid registry. The lock records the owning shell PID and is released on normal exit and interruption. A failed `kill -0` is ambiguous: it can mean a nonexistent PID or `EPERM` for a live owner. Both init and registry commands use a second `ps` presence probe and accept only an explicit no-process diagnostic as proof of staleness; a visible, permission-denied, or otherwise inconclusive probe retains the lock. The registry never sends a termination signal to a worker. If a command times out on a lock, inspect the PID and remove only a confirmed-stale `.lock` directory; never remove the registry or use registry data to stop a process.
 
 ## Version-1 schema
 
@@ -134,7 +134,7 @@ Each current worker object starts like this:
 }
 ```
 
-After binding, the worker has the same non-null session ID, current handle, and `bound_at` as its ledger row and moves to `bound`. `activate` then moves it to `active`. A worker's task ID, scope, session ID, and binding are immutable; only `record-resume-handle` may replace its current handle, and only while the task is `bound` or `active` and uses its exact bound session. Statuses are `reserved`, `bound`, `active`, `stopping`, `completed`, `failed`, `blocked`, `interrupted`, and `retired`; the first four are non-terminal. Terminal workers must be permanently retired before pruning.
+After binding, the worker has the same non-null session ID, current handle, and `bound_at` as its ledger row and moves to `bound`. `activate` requires the exact current handle and refuses both an omitted handle and the launch handle; the latest identity-ledger `handle_history` entry must have `kind: "resume"`. Record a fresh same-session resume handle first, then activate. The generic `update` command rejects `bound -> active`, so it cannot bypass this gate. A worker's task ID, scope, session ID, and binding are immutable; only `record-resume-handle` may replace its current handle, and only while the task is `bound` or `active` and uses its exact bound session. Statuses are `reserved`, `bound`, `active`, `stopping`, `completed`, `failed`, `blocked`, `interrupted`, and `retired`; the first four are non-terminal. Terminal workers must be permanently retired before pruning.
 
 ## Query with jq
 
@@ -185,11 +185,11 @@ All commands accept `--repo PATH` or `-C PATH`; lifecycle commands require that 
 | `register --task-id ID --scope TEXT [--notes TEXT]` | Compatibility spelling for `reserve`; it never accepts a session ID or handle. |
 | `bind` or `attach --task-id ID --session-id ID --handle ID` | Write the emitted session ID and process/agent handle exactly once, then move the worker to `bound`. |
 | `record-resume-handle --task-id ID --session-id ID --handle ID` | Append a fresh same-session execution handle with timestamp and `kind: "resume"`; update the current handle. Only exact-session tasks in `bound` or `active` state are allowed. |
-| `activate --task-id ID --session-id ID [--handle ID]` | Change the exact bound worker to `active`; repeated activation is a safe no-op. |
+| `activate --task-id ID --session-id ID --handle ID` | Change the exact bound worker to `active`; requires the current handle and a latest `kind: "resume"` history entry, so omitted and launch handles are rejected. Repeated activation is a safe no-op. |
 | `list` | Emit all current worker entries as JSON. |
 | `active` or `list --active` | Emit `reserved`, `bound`, `active`, and `stopping` entries. |
 | `query --task-id ID`, `--session-id ID`, or `--handle ID` | Emit matching current entries; combine selectors for an exact recovery query. Add `--active-only` to exclude terminal entries. |
-| `update --task-id ID --status STATE [--session-id ID] [--handle ID] [--evidence TEXT] [--notes TEXT]` | Update the exact worker through a legal transition. A bound worker requires its exact session ID and current handle; terminal states require evidence. |
+| `update --task-id ID --status STATE [--session-id ID] [--handle ID] [--evidence TEXT] [--notes TEXT]` | Update the exact worker through a legal non-activation transition. `bound -> active` is rejected; use resume-handle recording plus `activate`. A bound worker requires its exact session ID and current handle; terminal states require evidence. |
 | `retire --task-id ID [--session-id ID] [--handle ID] [--evidence TEXT] [--notes TEXT]` | Permanently record retirement for the exact worker using its current handle. An unbound launch failure may still be retired by task ID with evidence. |
 | `prune` or `clear` | Remove retired worker entries only after all non-terminal and unretired terminal entries are gone. The identity ledger remains. |
 | `prune --task-id ID` | Remove one named retired entry only; it refuses active or unretired terminal entries. |
@@ -218,12 +218,14 @@ Stable exit codes are:
 The parent owns this sequence for every launch:
 
 1. Read repository instructions and identify command classes reserved for the parent. In repositories that require elevated pnpm tests, the parent owns every `pnpm test` and `pnpm run test:*` command; the worker must not run them.
-2. Choose a fresh stable task ID and write an exact one-task scope with owned paths, expected result, validator, and boundaries.
+2. Choose a fresh stable task ID and write an exact one-task scope with owned paths, expected result, validator, sandbox, and boundaries. Select `task_sandbox` before the reservation and handshake. The resumed session inherits it; `codex exec resume` does not accept `-s`, so do not retry with a sandbox override.
 3. Reserve before launch. The reservation must be durable before `codex exec` starts:
 
    ```zsh
    task_id='issue-123-worker-1'
-   task_scope='owned paths: src/a.ts; exact task: implement validator; validator: pnpm check; no staging or commits'
+   task_sandbox='workspace-write' # use read-only for investigation, planning, or review; workspace-write for repository changes
+   readonly task_sandbox
+   task_scope="owned paths: src/a.ts; exact task: implement validator; sandbox: $task_sandbox; validator: pnpm check; no staging or commits"
    "$skill_root/scripts/registry.sh" reserve \
      --repo "$repo_root" \
      --task-id "$task_id" \
@@ -236,7 +238,7 @@ The parent owns this sequence for every launch:
    launch_argv=(codex exec \
      -m 'gpt-5.6-luna' \
      -c 'model_reasoning_effort="max"' \
-     -s 'workspace-write' \
+     -s "$task_sandbox" \
      -C "$repo_root" \
      'Handshake only. Do not read, write, test, or otherwise work in the repository. Reply exactly READY_TO_BIND, then stop so the parent can bind this session and resume it with the reserved task.')
    # Start launch_argv through supported orchestration and let it exit.
@@ -279,6 +281,7 @@ The parent owns this sequence for every launch:
 
    ```zsh
    # Through supported orchestration, start this exact argv with stdin pending:
+   # Resume inherits task_sandbox from the recorded session; resume has no -s option.
    # codex exec resume -m gpt-5.6-luna -c model_reasoning_effort=max "$captured_session_id" -
    # Use the fresh process/agent handle returned by orchestration, never shell $!.
    captured_handle='<fresh process or agent handle returned by orchestration>'
@@ -356,9 +359,10 @@ Do not report cleanup complete while a worker entry remains. Do not delete Codex
 - `ERROR [3] code-reviewer skill prerequisite/setup failed`: fix `npx`, its install/network failure, or the missing project-local `.agents/skills/code-reviewer/SKILL.md`, then rerun init. Verify both `-y` flags and their order if using a fake `npx` in tests. A global copy does not satisfy this check.
 - `ERROR [3] Caveman skill prerequisite/setup failed`: fix `npx`, its install/network failure, or the missing project-local `.agents/skills/caveman/SKILL.md`, then rerun init. Verify both `-y` flags and their order if using a fake `npx` in tests. A global copy does not satisfy this check.
 - `ERROR [4] path is not inside a Git repository`: pass `--repo PATH` to the repository root or a directory inside it.
+- `ERROR [10] repository .gitignore is a symbolic link`: init intentionally refuses to replace links. Replace `.gitignore` with a regular file or update the resolved target manually, then rerun init.
 - `ERROR [4] worker registry is not initialized`: run init for that exact repository before reserve, query, or cleanup.
 - `ERROR [5] registry fails schema validation` or `repository_root` mismatch: preserve the JSON for evidence, do not copy another repository’s registry, and repair the target registry through the parent’s approved recovery process.
 - `ERROR [6] identity conflict`, duplicate/cross-task handle, or exact session/current-handle mismatch: stop. Query `identity_ledger[].handle_history`, record only a fresh handle for the original non-terminal session, and continue only the original task/session; reserve a fresh identity for genuinely new work.
 - `ERROR [8] active workers remain` or pruning is refused: collect evidence, use supported orchestration to stop and wait for every real worker, record terminal state, permanently retire exact sessions, prune, and assert again.
-- `ERROR [9] registry lock is busy`: wait for the owning command. If its PID is no longer running, remove only the confirmed-stale `.lock` directory and retry; never remove `registry.json`.
+- `ERROR [9] registry lock is busy`: wait for the owning command. A failed `kill -0` may be `EPERM`, not staleness; inspect the PID with `ps -p PID` and remove only a confirmed-nonexistent owner lock. If the probe is permission-denied or inconclusive, preserve the lock and resolve the owner/permissions before retrying; never remove `registry.json`.
 - `ERROR [10] atomic write/filesystem failure`: check permissions and free space for the repository’s `.agents/agent-registry/` directory. The previous valid registry is intended to remain in place when a rename fails.

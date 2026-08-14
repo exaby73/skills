@@ -84,6 +84,21 @@ for expected_mode in 444 600 640 755; do
 done
 [[ "$(wc -l < "$NPM_LOG" | tr -d ' ')" == '2' ]] || fail 'idempotent init reinstalled existing dependencies'
 
+readonly GITIGNORE_TARGET="$TEMP_ROOT/gitignore-target"
+printf '%s\n' 'target-only' > "$GITIGNORE_TARGET"
+rm -f "$REPO_ROOT/.gitignore"
+ln -s "$GITIGNORE_TARGET" "$REPO_ROOT/.gitignore"
+set +e
+PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" > /dev/null 2> "$TEMP_ROOT/gitignore-symlink.err"
+symlink_status=$?
+set -e
+[[ "$symlink_status" == '10' ]] || fail "symlinked .gitignore init returned $symlink_status instead of filesystem error 10"
+grep -Fq -- 'repository .gitignore is a symbolic link' "$TEMP_ROOT/gitignore-symlink.err" || fail 'symlinked .gitignore error was not actionable'
+[[ -L "$REPO_ROOT/.gitignore" ]] || fail 'symlinked .gitignore was replaced'
+cmp -s "$GITIGNORE_TARGET" <(printf '%s\n' 'target-only') || fail 'symlink target changed after rejected init'
+rm -f "$REPO_ROOT/.gitignore"
+touch "$REPO_ROOT/.gitignore"
+
 cat > "$FAKE_BIN/stat" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -109,21 +124,123 @@ printf '%s\n' 'existing-entry' '.agents/agent-registry/' > "$REPO_ROOT/.gitignor
 FAKE_STAT_MODE=640 PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" >/dev/null || fail 'init failed after failed BSD stat probe output'
 [[ "$(FAKE_STAT_MODE=640 PATH="$FAKE_BIN:$PATH" file_mode "$REPO_ROOT/.gitignore")" == '640' ]] || fail 'failed BSD stat probe output leaked into captured mode'
 [[ "$(file_mode "$REPO_ROOT/.gitignore")" == '640' ]] || fail 'existing .gitignore mode was not preserved after failed BSD stat probe'
+rm -f "$FAKE_BIN/stat"
 
 readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
-readonly UPDATE_TASK_ID='test-init-bound-active'
-readonly UPDATE_TASK_SCOPE='test-init bound to active transition'
+readonly LOCK_DIR="$REPO_ROOT/.agents/agent-registry/.lock"
+readonly UPDATE_TASK_ID='test-init-update-activation-bypass'
+readonly UPDATE_TASK_SCOPE='test-init update activation bypass rejection'
 readonly UPDATE_SESSION_ID='test-init-session'
 readonly UPDATE_HANDLE='test-init-handle'
 
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --scope "$UPDATE_TASK_SCOPE" >/dev/null || fail 'could not reserve update regression worker'
 "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" >/dev/null || fail 'could not bind update regression worker'
-"$REGISTRY_SCRIPT" update --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --status active >/dev/null || fail 'bound to active update failed'
-
-activated_at="$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .activated_at' "$REPO_ROOT/.agents/agent-registry/registry.json")"
-[[ -n "$activated_at" && "$activated_at" != 'null' ]] || fail 'bound to active update did not set activated_at'
-"$REGISTRY_SCRIPT" update --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --status active >/dev/null || fail 'active to active update failed'
-[[ "$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .activated_at' "$REPO_ROOT/.agents/agent-registry/registry.json")" == "$activated_at" ]] || fail 'active update overwrote activated_at'
+set +e
+"$REGISTRY_SCRIPT" update --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --status active > /dev/null 2> "$TEMP_ROOT/update-activation-bypass.err"
+update_activation_status=$?
+set -e
+[[ "$update_activation_status" == '6' ]] || fail "bound-to-active update returned $update_activation_status instead of conflict error 6"
+grep -Fq -- 'cannot activate' "$TEMP_ROOT/update-activation-bypass.err" || fail 'bound-to-active update error was not actionable'
+[[ "$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'bound' ]] || fail 'bound-to-active update bypass changed worker state'
+[[ "$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .activated_at' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'null' ]] || fail 'bound-to-active update bypass set activated_at'
 "$REGISTRY_SCRIPT" retire --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --evidence 'test cleanup' >/dev/null || fail 'could not retire update regression worker'
+
+readonly ACTIVATE_TASK_ID='test-init-resume-only-activation'
+readonly ACTIVATE_TASK_SCOPE='test-init resume-only activation'
+readonly ACTIVATE_SESSION_ID='test-init-resume-session'
+readonly ACTIVATE_LAUNCH_HANDLE='test-init-launch-handle'
+readonly ACTIVATE_RESUME_HANDLE='test-init-resume-handle'
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --scope "$ACTIVATE_TASK_SCOPE" >/dev/null || fail 'could not reserve activation regression worker'
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_LAUNCH_HANDLE" >/dev/null || fail 'could not bind activation regression worker'
+
+set +e
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" > /dev/null 2> "$TEMP_ROOT/activation-handleless.err"
+handleless_status=$?
+set -e
+[[ "$handleless_status" == '2' ]] || fail "handle-less activation returned $handleless_status instead of usage error 2"
+grep -Fq -- 'handle is required for activation' "$TEMP_ROOT/activation-handleless.err" || fail 'handle-less activation error was not actionable'
+[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'bound' ]] || fail 'handle-less activation changed worker state'
+
+set +e
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_LAUNCH_HANDLE" > /dev/null 2> "$TEMP_ROOT/activation-launch-handle.err"
+launch_handle_status=$?
+set -e
+[[ "$launch_handle_status" == '6' ]] || fail "launch-handle activation returned $launch_handle_status instead of conflict error 6"
+grep -Fq -- 'launch handle cannot activate' "$TEMP_ROOT/activation-launch-handle.err" || fail 'launch-handle activation error was not actionable'
+[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'bound' ]] || fail 'launch-handle activation changed worker state'
+
+"$REGISTRY_SCRIPT" record-resume-handle --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_RESUME_HANDLE" >/dev/null || fail 'could not record activation resume handle'
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_RESUME_HANDLE" >/dev/null || fail 'valid resume activation failed'
+[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'active' ]] || fail 'valid resume activation did not make worker active'
+[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.identity_ledger[] | select(.task_id == $task_id) | .handle_history[-1].kind' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'resume' ]] || fail 'valid activation did not require a resume history entry'
+"$REGISTRY_SCRIPT" retire --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_RESUME_HANDLE" --evidence 'test cleanup' >/dev/null || fail 'could not retire activation regression worker'
+
+cat > "$FAKE_BIN/ps" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${FAKE_PS_MODE:?}" in
+  live)
+    printf '%s\n' "${2:-999999}"
+    ;;
+  missing)
+    exit 1
+    ;;
+  *)
+    printf 'unexpected fake ps mode: %s\n' "$FAKE_PS_MODE" >&2
+    exit 64
+    ;;
+esac
+EOF
+chmod 0755 "$FAKE_BIN/ps"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_BIN/sleep"
+chmod 0755 "$FAKE_BIN/sleep"
+readonly FAKE_BASH_ENV="$TEMP_ROOT/fake-bash-env"
+cat > "$FAKE_BASH_ENV" <<'EOF'
+kill() {
+  case "${FAKE_KILL_MODE:?}" in
+    eperm)
+      printf '%s\n' 'fake kill: Operation not permitted' >&2
+      ;;
+    missing)
+      printf '%s\n' 'fake kill: No such process' >&2
+      ;;
+    *)
+      printf 'unexpected fake kill mode: %s\n' "$FAKE_KILL_MODE" >&2
+      ;;
+  esac
+  return 1
+}
+EOF
+mkdir -p "$LOCK_DIR"
+printf '%s\n' '999999' > "$LOCK_DIR/pid"
+
+set +e
+BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=eperm FAKE_PS_MODE=live PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id 'test-init-live-lock-owner' --scope 'test-init live lock owner' > /dev/null 2> "$TEMP_ROOT/registry-live-lock.err"
+registry_live_lock_status=$?
+set -e
+[[ "$registry_live_lock_status" == '9' ]] || fail "registry retained-lock probe returned $registry_live_lock_status instead of lock timeout 9"
+[[ -d "$LOCK_DIR" && -f "$LOCK_DIR/pid" ]] || fail 'registry reclaimed a lock whose failed kill probe still had a visible owner'
+grep -Fq -- 'registry lock is busy' "$TEMP_ROOT/registry-live-lock.err" || fail 'registry retained-lock error was not actionable'
+
+set +e
+BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=eperm FAKE_PS_MODE=live PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" > /dev/null 2> "$TEMP_ROOT/init-live-lock.err"
+init_live_lock_status=$?
+set -e
+[[ "$init_live_lock_status" == '9' ]] || fail "init retained-lock probe returned $init_live_lock_status instead of lock timeout 9"
+[[ -d "$LOCK_DIR" && -f "$LOCK_DIR/pid" ]] || fail 'init reclaimed a lock whose failed kill probe still had a visible owner'
+
+readonly LOCK_TASK_ID='test-init-reclaim-stale-lock'
+readonly LOCK_TASK_SCOPE='test-init reclaim confirmed stale lock'
+BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$LOCK_TASK_ID" --scope "$LOCK_TASK_SCOPE" >/dev/null || fail 'registry did not reclaim a confirmed-stale lock'
+[[ ! -d "$LOCK_DIR" ]] || fail 'registry did not release lock after reclaiming confirmed-stale owner'
+
+mkdir -p "$LOCK_DIR"
+printf '%s\n' '999999' > "$LOCK_DIR/pid"
+BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" >/dev/null || fail 'init did not reclaim a confirmed-stale lock'
+[[ ! -d "$LOCK_DIR" ]] || fail 'init did not release lock after reclaiming confirmed-stale owner'
+BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" retire --repo "$REPO_ROOT" --task-id "$LOCK_TASK_ID" --evidence 'test cleanup' >/dev/null || fail 'could not retire lock regression worker'
+BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" prune --repo "$REPO_ROOT" --task-id "$LOCK_TASK_ID" >/dev/null || fail 'could not prune lock regression worker'
 
 printf 'test-init: PASS\n'

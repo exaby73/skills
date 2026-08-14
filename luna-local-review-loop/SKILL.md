@@ -7,6 +7,12 @@ description: Route local repository implementation, documentation, testing, vali
 
 Use this skill to route local repository work between the parent and Luna Max, then finish with an approved parent review. Read [README.md](README.md) for the operator contract and use the bundled scripts as the registry source of truth.
 
+The registry requires `activate` to receive the current handle and a latest
+identity-ledger history entry with `kind: "resume"`; the launch handle and an
+omitted handle are rejected. `init` rejects a symbolic-link `.gitignore`
+instead of replacing it. Lock reclamation treats a failed `kill -0` as
+ambiguous and removes a lock only after a confirmed-nonexistent PID probe.
+
 ## Identify the role
 
 - Determine whether this invocation is the parent or a delegated worker before acting. Only the parent may decompose work, reserve or bind worker identities, launch, collect, retire, or coordinate workers, and only the parent runs the parent-owned review and delivery loop.
@@ -33,13 +39,15 @@ Use this skill to route local repository work between the parent and Luna Max, t
 
 ## Launch Luna Max (parent only)
 
-The worker identity is not known before `codex exec` starts. Reserve the task and exact scope first, launch a handshake that does no repository work, capture the emitted session ID and process/agent handle, and bind them exactly once. The handshake invocation then ends. Resume that exact session with stdin pending, record its fresh orchestration handle, activate it, and only then feed the reserved task prompt and EOF. A one-shot `codex exec` prompt cannot wait for a later parent message.
+The worker identity is not known before `codex exec` starts. Reserve the task and exact scope first, launch a handshake that does no repository work, capture the emitted session ID and process/agent handle, and bind them exactly once. The handshake invocation then ends. Resume that exact session with stdin pending, record its fresh resume handle, activate with that current handle, and only then feed the reserved task prompt and EOF. A one-shot `codex exec` prompt cannot wait for a later parent message.
 
 ```zsh
 skill_root='/absolute/path/to/luna-local-review-loop'
 repo_root='/absolute/path/to/repository'
 task_id='issue-123-worker-1'
-task_scope='owned paths: src/a.ts; exact task: implement validator; validator: pnpm check; no staging or commits'
+task_sandbox='workspace-write' # use read-only for investigation, planning, or review; workspace-write for repository changes
+readonly task_sandbox
+task_scope="owned paths: src/a.ts; exact task: implement validator; sandbox: $task_sandbox; validator: pnpm check; no staging or commits"
 
 "$skill_root/scripts/registry.sh" reserve \
   --repo "$repo_root" \
@@ -49,7 +57,7 @@ task_scope='owned paths: src/a.ts; exact task: implement validator; validator: p
 launch_argv=(codex exec \
   -m 'gpt-5.6-luna' \
   -c 'model_reasoning_effort="max"' \
-  -s 'workspace-write' \
+  -s "$task_sandbox" \
   -C "$repo_root" \
   'Handshake only. Do not read, write, test, or otherwise work in the repository. Reply exactly READY_TO_BIND, then stop so the parent can bind this session and resume it with the reserved task.')
 
@@ -88,7 +96,7 @@ task_prompt="$(printf '%s\n' \
 # Collect output until this exact resumed process exits.
 ```
 
-The resumed worker prompt must release only the reserved one-task scope after activation. Never treat the handshake prompt as the task prompt. Use the minimum sandbox that permits the scoped task: read-only for investigation, planning, or review tasks requiring no writes; `workspace-write` for implementation, documentation, tests, or other repository changes. Any broader access still goes through permission brokerage. Never use a replacement identity, `--last`, or an unrecorded session. Stop if Luna Max cannot run and ask the user to choose Luna High, Terra High, or no subagents rather than silently changing the model or reasoning effort.
+Choose `task_sandbox` before reservation and the handshake, include it in the immutable task scope, and launch the session with that value. Same-session resume inherits the session sandbox; `codex exec resume` does not accept `-s`, so do not retry it with a sandbox override. Use the minimum sandbox that permits the scoped task: `read-only` for investigation, planning, or review tasks requiring no writes; `workspace-write` for implementation, documentation, tests, or other repository changes. The resumed worker prompt must release only the reserved one-task scope after activation. Never treat the handshake prompt as the task prompt. Any broader access still goes through permission brokerage. Never use a replacement identity, `--last`, or an unrecorded session. Stop if Luna Max cannot run and ask the user to choose Luna High, Terra High, or no subagents rather than silently changing the model or reasoning effort.
 
 Every worker session is fresh and owns exactly one task. Once terminal, its session and handle are permanently retired; start later work or a new finding with a fresh task and fresh identity.
 

@@ -121,7 +121,7 @@ Usage:
   registry.sh reserve|register --task-id ID --scope TEXT [--notes TEXT] [--repo PATH]
   registry.sh bind|attach --task-id ID --session-id ID --handle ID [--repo PATH]
   registry.sh record-resume-handle --task-id ID --session-id ID --handle ID [--repo PATH]
-  registry.sh activate --task-id ID --session-id ID [--handle ID] [--repo PATH]
+  registry.sh activate --task-id ID --session-id ID --handle ID [--repo PATH]
   registry.sh list [--active] [--repo PATH]
   registry.sh active [--repo PATH]
   registry.sh query --task-id ID|--session-id ID|--handle ID [--active-only] [--repo PATH]
@@ -132,8 +132,8 @@ Usage:
   registry.sh assert-empty [--repo PATH]
 
 Reserve before launching. Bind exactly once after codex exec emits the session
-and process/agent handle, then activate. Terminal entries must be retired
-before pruning.
+and launch handle, record the fresh same-session resume handle, then activate
+with that current handle. Terminal entries must be retired before pruning.
 EOF
   exit "$exit_code"
 }
@@ -213,7 +213,7 @@ acquire_lock() {
       case "$owner_pid" in
         ''|0|*[!0-9]*) ;;
         *)
-          if ! kill -0 "$owner_pid" 2>/dev/null; then
+          if pid_is_confirmed_nonexistent "$owner_pid"; then
             rm -f "$LOCK_DIR/pid" 2>/dev/null || true
             if rmdir "$LOCK_DIR" 2>/dev/null; then
               continue
@@ -238,6 +238,34 @@ acquire_lock() {
   trap release_lock EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+}
+
+pid_is_confirmed_nonexistent() {
+  local owner_pid="$1"
+  local kill_error=''
+  local ps_output=''
+
+  if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
+    return 1
+  fi
+
+  # kill -0 has no portable EPERM-versus-ESRCH exit status. A visible PID is
+  # live or inaccessible, so retain the lock. The ps probe is only a second
+  # presence check; an explicit no-process diagnostic is the stale proof.
+  if ps_output="$(ps -p "$owner_pid" -o pid= 2>/dev/null)"; then
+    if [[ "$ps_output" == *[![:space:]]* ]]; then
+      return 1
+    fi
+  fi
+
+  case "$kill_error" in
+    *[Nn]o\ such\ process*|*[Nn]o\ such\ file*|*[Nn]o\ process*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 validate_identity() {
@@ -350,6 +378,14 @@ require_bound_identity() {
   fi
 }
 
+require_resume_handle_for_activation() {
+  local task_id="$1"
+  local latest_kind
+
+  latest_kind="$(jq -r --arg task_id "$task_id" '[.identity_ledger[] | select(.task_id == $task_id) | .handle_history[-1].kind][0] // ""' "$REGISTRY_PATH")"
+  [[ "$latest_kind" == resume ]] || die "$EXIT_CONFLICT" "cannot activate task-id $task_id: latest identity-ledger handle-history entry is kind=${latest_kind:-unknown}; record a fresh same-session resume handle before activation. The launch handle cannot activate a worker."
+}
+
 require_bound_session() {
   local task_id="$1"
   local session_id="$2"
@@ -382,7 +418,7 @@ require_bound_session() {
       die "$EXIT_CONFLICT" "refusing resume handle for task-id $task_id: worker is terminal ($current_status). Record resume handles only for bound or active same-session tasks."
       ;;
     reserved)
-      die "$EXIT_CONFLICT" "refusing resume handle for task-id $task_id: worker is reserved without a bound session. Bind and activate the launch identity first."
+      die "$EXIT_CONFLICT" "refusing resume handle for task-id $task_id: worker is reserved without a bound session. Bind the launch identity first, then resume the same session and record its fresh handle."
       ;;
     *)
       die "$EXIT_SCHEMA" "worker task-id $task_id has unknown status: $current_status. Preserve the registry and repair it before retrying."
@@ -568,11 +604,13 @@ command_activate() {
 
   validate_identity task-id "$task_id"
   validate_identity session-id "$session_id"
-  [[ -z "$handle" ]] || validate_identity handle "$handle"
+  [[ -n "$handle" ]] || die "$EXIT_USAGE" 'handle is required for activation; use the current handle recorded by record-resume-handle, not the launch handle or an omitted handle.'
+  validate_identity handle "$handle"
   resolve_repo_root
   ensure_registry
   acquire_lock
   require_bound_identity "$task_id" "$session_id" "$handle"
+  require_resume_handle_for_activation "$task_id"
   current_status="$(current_worker_field "$task_id" 'status')"
 
   case "$current_status" in
@@ -650,9 +688,10 @@ command_update() {
   current_status="$(current_worker_field "$task_id" 'status')"
 
   case "$current_status:$status" in
-    reserved:reserved|reserved:failed|reserved:blocked|reserved:interrupted|bound:bound|bound:active|bound:stopping|bound:completed|bound:failed|bound:blocked|bound:interrupted|active:active|active:stopping|active:completed|active:failed|active:blocked|active:interrupted|stopping:stopping|stopping:completed|stopping:failed|stopping:blocked|stopping:interrupted) ;;
+    reserved:reserved|reserved:failed|reserved:blocked|reserved:interrupted|bound:bound|bound:stopping|bound:completed|bound:failed|bound:blocked|bound:interrupted|active:active|active:stopping|active:completed|active:failed|active:blocked|active:interrupted|stopping:stopping|stopping:completed|stopping:failed|stopping:blocked|stopping:interrupted) ;;
     reserved:*) die "$EXIT_CONFLICT" "invalid state transition for task-id $task_id: $current_status -> $status. Bind before activation and use retire for final retirement." ;;
-    bound:*) die "$EXIT_CONFLICT" "invalid state transition for task-id $task_id: $current_status -> $status. Bind before activation and use retire for final retirement." ;;
+    bound:active) die "$EXIT_CONFLICT" "cannot activate task-id $task_id through update. Record a fresh same-session resume handle, then use activate with the exact current session and handle." ;;
+    bound:*) die "$EXIT_CONFLICT" "invalid state transition for task-id $task_id: $current_status -> $status. Use activate for bound-to-active and retire for final retirement." ;;
     active:*) die "$EXIT_CONFLICT" "invalid state transition for task-id $task_id: $current_status -> $status." ;;
     stopping:*) die "$EXIT_CONFLICT" "invalid state transition for task-id $task_id: $current_status -> $status." ;;
     completed:*|failed:*|blocked:*|interrupted:*|retired:*) die "$EXIT_CONFLICT" "worker task-id $task_id is already terminal ($current_status). Terminal state is immutable; retire it and start a fresh task for later work." ;;

@@ -271,7 +271,7 @@ acquire_lock() {
       case "$owner_pid" in
         ''|0|*[!0-9]*) ;;
         *)
-          if ! kill -0 "$owner_pid" 2>/dev/null; then
+          if pid_is_confirmed_nonexistent "$owner_pid"; then
             rm -f "$LOCK_DIR/pid" 2>/dev/null || true
             if rmdir "$LOCK_DIR" 2>/dev/null; then
               continue
@@ -298,6 +298,34 @@ acquire_lock() {
   trap 'exit 143' TERM
 }
 
+pid_is_confirmed_nonexistent() {
+  local owner_pid="$1"
+  local kill_error=''
+  local ps_output=''
+
+  if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
+    return 1
+  fi
+
+  # kill -0 has no portable EPERM-versus-ESRCH exit status. A visible PID is
+  # live or inaccessible, so retain the lock. The ps probe is only a second
+  # presence check; an explicit no-process diagnostic is the stale proof.
+  if ps_output="$(ps -p "$owner_pid" -o pid= 2>/dev/null)"; then
+    if [[ "$ps_output" == *[![:space:]]* ]]; then
+      return 1
+    fi
+  fi
+
+  case "$kill_error" in
+    *[Nn]o\ such\ process*|*[Nn]o\ such\ file*|*[Nn]o\ process*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 validate_registry_file() {
   local registry_file="$1"
   if [[ ! -s "$registry_file" ]] || ! jq -e "$SCHEMA_FILTER" "$registry_file" >/dev/null 2>&1; then
@@ -309,6 +337,10 @@ ensure_gitignore_entry() {
   local gitignore_path="$REPO_ROOT/.gitignore"
   local gitignore_mode='0644'
   local temp_path
+
+  if [[ -L "$gitignore_path" ]]; then
+    die "$EXIT_FILESYSTEM" "repository .gitignore is a symbolic link: $gitignore_path. Init refuses to replace symlinks; replace it with a regular file or update the resolved target manually, then rerun init."
+  fi
 
   if [[ -e "$gitignore_path" && ! -f "$gitignore_path" ]]; then
     die "$EXIT_FILESYSTEM" "repository .gitignore is not a regular file: $gitignore_path. Resolve that path and rerun init."
