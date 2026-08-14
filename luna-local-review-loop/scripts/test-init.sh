@@ -114,6 +114,15 @@ state_root_real="$(cd "$STATE_ROOT" && pwd -P)"
 [[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'init modified repository files'
 jq -e '.schema_version == 2 and (.repository_identity | type == "string" and length > 0) and .workers == [] and .identity_ledger == []' "$registry_path" >/dev/null || fail 'new registry schema is invalid'
 
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy --scope 'recover external state after legacy registry reappears' >/dev/null
+mkdir -p "$REPO_ROOT/.agents/agent-registry"
+cat >"$REPO_ROOT/.agents/agent-registry/registry.json" <<EOF
+{"schema_version":1,"registry":"luna-local-review-loop","workers":[{"task_id":"restored-legacy-live","status":"active"}]}
+EOF
+"$REGISTRY_SCRIPT" query --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy >/dev/null || fail 'reappearing legacy state blocked external registry recovery'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy --status interrupted --evidence 'external recovery remained authoritative' >/dev/null
+rm -rf "$REPO_ROOT/.agents/agent-registry"
+
 schema_repo="$TEST_ROOT/schema-repo"
 schema_state="$TEST_ROOT/schema-state"
 mkdir -p "$schema_repo/.agents/skills"
@@ -275,6 +284,9 @@ kill "$zombie_parent_pid" 2>/dev/null || true
 wait "$zombie_parent_pid" 2>/dev/null || true
 
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --scope 'atomic initial reservation ownership' --pid "$$" --token initial-owner >/dev/null
+if "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --status interrupted --evidence 'tokenless live-owner retirement' >/dev/null 2>&1; then
+	fail 'tokenless recovery retired a task owned by a live invocation'
+fi
 if "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --status failed --evidence 'wrong owner' --invocation-token wrong-owner >/dev/null 2>&1; then
 	fail 'a mismatched invocation token retired an owned reservation'
 fi

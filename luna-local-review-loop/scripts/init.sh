@@ -168,6 +168,7 @@ require_commands() {
 resolve_paths() {
 	local candidate
 	local repo_fingerprint
+	local registry_candidate
 	local state_candidate
 
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_REPOSITORY" "repository path does not exist or is not a directory: $REPO_INPUT."
@@ -176,11 +177,16 @@ resolve_paths() {
 	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
 	REPO_IDENTITY="$(repository_instance_identity)" || die "$EXIT_REPOSITORY" "cannot derive repository instance identity: $REPO_ROOT."
 	LEGACY_REGISTRY_PATH="$REPO_ROOT/.agents/agent-registry/registry.json"
-	refuse_live_legacy_registry
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
 	case "$state_candidate/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $state_candidate." ;;
 	esac
+	repo_fingerprint="$(printf '%s' "$REPO_ROOT" | shasum -a 256 | awk '{print $1}')"
+	[[ -n "$repo_fingerprint" ]] || die "$EXIT_FILESYSTEM" 'could not derive repository state key.'
+	registry_candidate="$state_candidate/$repo_fingerprint/registry.json"
+	if [[ "$EXISTING_ONLY" -eq 0 && ! -e "$registry_candidate" ]]; then
+		refuse_live_legacy_registry
+	fi
 	if [[ "$EXISTING_ONLY" -eq 1 ]]; then
 		[[ -d "$STATE_ROOT_INPUT" ]] || die "$EXIT_FILESYSTEM" "state root does not exist: $STATE_ROOT_INPUT."
 	else
@@ -190,8 +196,6 @@ resolve_paths() {
 	case "$STATE_ROOT/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $STATE_ROOT." ;;
 	esac
-	repo_fingerprint="$(printf '%s' "$REPO_ROOT" | shasum -a 256 | awk '{print $1}')"
-	[[ -n "$repo_fingerprint" ]] || die "$EXIT_FILESYSTEM" 'could not derive repository state key.'
 	REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
 	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
 	LOCK_DIR="$REGISTRY_DIR/.lock"
@@ -329,7 +333,7 @@ pid_is_confirmed_nonexistent() {
 		?*) return 1 ;;
 		esac
 	fi
-	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
+	if kill_error="$(LC_ALL=C kill -0 "$owner_pid" 2>&1)"; then
 		if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
 			case "$process_state" in
 			Z*) return 0 ;;

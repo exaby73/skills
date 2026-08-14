@@ -44,7 +44,7 @@ Print it with:
 
 Init is validation-only and idempotent. It physically resolves existing path components before normalizing missing suffixes, rejects repository-local state before creation, and rejects a symlinked repository-fingerprint directory before chmod or write. Each registry also records a durable identity derived from the physical Git directory. If a different repository later occupies the same path, init refuses to attach the old registry and tells the parent to recover it with the original checkout. It does not edit the target repository. When required project skills are missing, it prints the explicit universal-target install commands. Run those only as a separate, intentional project change.
 
-Before creating external state, init checks the previous project-local schema-v1 registry path. If that registry still contains a reserved, bound, active, or stopping worker, init refuses to continue and prints recovery instructions. Recover and retire those workers with the previous skill version first; the new version never silently abandons live legacy state.
+Before creating external state for the first time, init checks the previous project-local schema-v1 registry path. If that registry still contains a reserved, bound, active, or stopping worker, init refuses to continue and prints recovery instructions. Recover and retire those workers with the previous skill version first; the new version never silently abandons live legacy state. Once a valid external registry exists, it remains authoritative and recovery commands continue to open it even if an old project-local registry later reappears.
 
 ## Registry schema
 
@@ -152,7 +152,7 @@ Only that JSON result is emitted on stdout. The external artifact directory prin
 | `query` / `active` | Read ledger task or live workers |
 | `assert-no-active` / `assert-empty` | Prove no reserved, bound, or active workers remain |
 
-Low-level commands exist for recovery and inspection. Normal launches should use `run-worker.sh` so registry and process state transition together.
+Low-level commands exist for recovery and inspection. Tokenless retirement is allowed only when no invocation owns the task or the recorded owner is confirmed exited; a live owner must use its exact invocation token. Process probes force the stable C locale, treat zombies as exited, and remain conservative when access is ambiguous. Normal launches should use `run-worker.sh` so registry and process state transition together.
 
 ## Permission brokerage
 
@@ -179,4 +179,4 @@ Run without network access:
 ./luna-local-review-loop/scripts/test-init.sh
 ```
 
-The test covers non-mutating init, repository-instance binding, symlink-safe external state and artifact paths, live legacy-registry refusal, inverse ledger/worker consistency, external persistent state, stale mutation-lock contention, sandbox-preserving single-child retry chains, atomic initial reservation ownership, active-only continuation claims, a fast handshake with no invocation handle, portable artifact counting, stale-child clearing during atomic reclaim, serialized exact-session continuation without PTY/EOF, normal, zombie, and hard-kill child recovery, strict finish statuses, artifact-independent recovery, structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.
+The test covers non-mutating init, repository-instance binding, symlink-safe external state and artifact paths, first-creation legacy-registry refusal, external recovery when legacy state reappears, inverse ledger/worker consistency, external persistent state, conservative stale-process detection, stale mutation-lock contention, sandbox-preserving single-child retry chains, atomic initial reservation ownership, live-owner token enforcement, active-only continuation claims, a fast handshake with no invocation handle, portable artifact counting, stale-child clearing during atomic reclaim, serialized exact-session continuation without PTY/EOF, normal, zombie, and hard-kill child recovery, strict finish statuses, artifact-independent recovery, structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.

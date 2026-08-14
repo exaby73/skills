@@ -24,7 +24,7 @@ repo_root='/absolute/path/to/repository'
 "$skill_root/scripts/init.sh" --repo "$repo_root"
 ```
 
-Init validates `codex`, `jq`, Git, project-local Caveman, and project-local code-reviewer. It stores the registry below `${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}` using a deterministic repository key and binds that state to the physical Git repository instance. If another repository later occupies the same path, stop and recover the registry only with the original checkout; never attach its sessions to the replacement repository. Init never edits `.gitignore`, `skills-lock.json`, `.agents/skills`, or another repository file, and never installs from the network. If a skill is missing, init prints explicit universal-target install commands; the parent decides whether to run them and reviews the resulting project changes.
+Init validates `codex`, `jq`, Git, project-local Caveman, and project-local code-reviewer. It stores the registry below `${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}` using a deterministic repository key and binds that state to the physical Git repository instance. If another repository later occupies the same path, stop and recover the registry only with the original checkout; never attach its sessions to the replacement repository. A live project-local schema-v1 registry blocks only first-time external-state creation; once valid external state exists, recovery access remains available even if legacy state reappears. Init never edits `.gitignore`, `skills-lock.json`, `.agents/skills`, or another repository file, and never installs from the network. If a skill is missing, init prints explicit universal-target install commands; the parent decides whether to run them and reviews the resulting project changes.
 
 ## Route work
 
@@ -98,7 +98,7 @@ Each structured worker result contains outcome, concise summary, changed files, 
 
 ## Close every lifecycle
 
-The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. Explicit `finish` accepts only `failed`, `blocked`, or `interrupted`; `completed` requires a validated structured result. Finish is registry-only and remains available if worker artifacts are missing. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
+The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. Explicit `finish` accepts only `failed`, `blocked`, or `interrupted`; `completed` requires a validated structured result. Finish is registry-only and remains available if worker artifacts are missing. Tokenless low-level retirement is rejected while the recorded invocation owner is live; only that owner may retire with its exact token. Dead-process probes run in the C locale, count zombies as exited, and block on ambiguous access. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
 
 ```sh
 "$skill_root/scripts/run-worker.sh" finish \

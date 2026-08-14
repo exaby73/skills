@@ -127,7 +127,7 @@ pid_is_confirmed_nonexistent() {
 		?*) return 1 ;;
 		esac
 	fi
-	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
+	if kill_error="$(LC_ALL=C kill -0 "$owner_pid" 2>&1)"; then
 		if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
 			case "$process_state" in
 			Z*) return 0 ;;
@@ -620,6 +620,11 @@ command_complete_and_retire() {
 		jq -e --arg task_id "$task_id" --arg token "$invocation_token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own live task $task_id."
 	else
 		jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_NOT_FOUND" "live task not found: $task_id."
+		local invocation_pid
+		invocation_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_pid // empty' "$REGISTRY_PATH")"
+		if [[ -n "$invocation_pid" ]] && ! pid_is_confirmed_nonexistent "$invocation_pid"; then
+			die "$EXIT_CONFLICT" "invocation PID $invocation_pid remains live for task $task_id; use its invocation token or stop and verify that owner before retirement."
+		fi
 	fi
 	local active_child_pid
 	active_child_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .active_child_pid // empty' "$REGISTRY_PATH")"
