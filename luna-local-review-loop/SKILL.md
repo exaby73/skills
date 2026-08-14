@@ -9,7 +9,7 @@ Use this skill to route local repository work between the parent and Luna Max, t
 
 ## Identify the role
 
-- Determine whether this invocation is the parent or a delegated worker before acting. Only the parent may decompose work, launch, collect, reassign, or coordinate workers, and only the parent runs the parent-owned review and delivery loop.
+- Determine whether this invocation is the parent or a delegated worker before acting. Only the parent may decompose work, launch, collect, retire, or coordinate workers, and only the parent runs the parent-owned review and delivery loop.
 - A delegated worker executes its assigned task directly. It must never spawn, delegate to, or coordinate subagents or nested workers. It skips parent-only routing, launch, orchestration, delivery, and review-monitor steps; it validates its assigned scope and reports evidence to the parent.
 
 ## Own durable state
@@ -32,7 +32,7 @@ Use this skill to route local repository work between the parent and Luna Max, t
 
 ## Launch Luna Max (parent only)
 
-Run every executable task routed to Luna Max with this command shape, using safe quoting. Preserve the worker session so the parent can resume it when permission brokerage is needed:
+Run every executable task routed to Luna Max with this command shape, using safe quoting. Preserve the fresh worker session only so the parent can resume that same task when permission brokerage is needed:
 
 ```zsh
 codex exec \
@@ -43,9 +43,14 @@ codex exec \
   '<task>'
 ```
 
-- Capture the session ID reported by `codex exec` and retain it with the worker task. The parent must use that exact session for every continuation; never use `--last` or launch a replacement worker to return brokered output.
+- Capture the session ID reported by `codex exec` and retain it with the worker task. The parent must use that exact session for every continuation of that same task; never use `--last` or launch a replacement worker to return brokered output.
 - Define least privilege as the minimum permission that still permits all required task actions: use read-only only for investigation, planning, or review tasks requiring no writes; use `workspace-write` for implementation, documentation, tests, or any other task that must modify repository files. Any broader access still goes through permission brokerage. Never use `danger-full-access` or bypass approvals.
 - Stop if Luna Max cannot run. Ask the user to explicitly choose Luna High, Terra High, or no subagents; never silently change the model or reasoning effort.
+
+## Enforce worker lifecycle (parent only)
+
+- Create every worker session fresh for exactly one explicitly scoped task. Before work starts, record its task, worker or session ID, process or agent handle, and state in a parent-owned active-worker registry. Never reuse or reassign a worker or session, and never resume it for another task or finding. Resumption is allowed only to continue that same task, including returning output from an exact command the parent ran through blocked-command permission brokerage. Once that task reaches a terminal result, retire its session permanently; start later work or a new finding in a fresh worker session.
+- Before marking any goal complete or blocked, or whenever a goal otherwise ends, collect final evidence from every worker, interrupt or terminate every still-running worker, wait for shutdown, retire every session ID, clear the active-worker registry, and verify that no worker remains active. Retiring a session means marking its ID unusable for future work; do not invent destructive deletion of persisted Codex history when the CLI lacks supported deletion.
 
 ## Orchestrate work and close the loop (parent only)
 
@@ -72,12 +77,12 @@ PERMISSION NEEDED: <specific permission>
 - Review the exact command for safety, scope, and least privilege. If it is safe and in scope, run only that exact command through the parent approval path and return its output to the worker for interpretation.
 - Do not substitute a command, broaden its scope, or ask the worker to work around the block. Stop and ask the user when the exact command is unsafe, out of scope, or its permission is ambiguous.
 - Apply this brokerage to tests, containers, Docker, network access, external-file operations, and any other command requiring an approval unavailable to a non-interactive worker.
-- After the parent runs the exact approved command, resume the recorded worker session with its captured result so the same worker can interpret it and continue:
+- After the parent runs the exact approved command, resume the recorded worker session with its captured result so the same worker can interpret it and continue that same task:
 
   ```zsh
   codex exec resume '<captured-worker-session-id>' -
   ```
 
-  Feed the resumed prompt the exact command, exit status, and captured output. Use the captured session ID, not `--last` or a new worker.
+  Feed the resumed prompt the exact command, exit status, and captured output. Use the captured session ID, not `--last` or a new worker; this continuation is only for that same task.
 
 Keep the loop local, evidence-based, and bounded by the stated task scopes and validators.
