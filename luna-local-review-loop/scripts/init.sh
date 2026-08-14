@@ -69,6 +69,8 @@ readonly SCHEMA_FILTER='
         and (.checkpoint_evidence | type == "string")
         and ((.invocation_pid == null and .invocation_token == null)
              or ((.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
+        and ((.active_child_pid == null)
+             or ((.active_child_pid | nonempty_string) and (.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
@@ -92,6 +94,20 @@ readonly SCHEMA_FILTER='
           and .bound_at == $worker.bound_at
           and .activated_at == $worker.activated_at
         )
+      )
+      and all($root.identity_ledger[];
+        . as $row
+        | if .status == "retired" then true
+          else any($root.workers[];
+            .task_id == $row.task_id
+            and .scope == $row.scope
+            and .retry_of == $row.retry_of
+            and .session_id == $row.session_id
+            and .status == $row.status
+            and .bound_at == $row.bound_at
+            and .activated_at == $row.activated_at
+          )
+          end
       )
     ) catch false
   | .

@@ -135,7 +135,7 @@ scripts/run-worker.sh launch \
 - `unresolved`: remaining limitations;
 - `parentAction`: a non-empty exact action for `needs_parent_action`; `null` for terminal outcomes.
 
-Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, separate stderr logs, and each final result. A registry-backed invocation claim serializes the first resume, later continuations, and explicit retirement; the initial claim is stored in the same mutation as reservation. Stale claims are reclaimed under the registry mutation lock, while stale mutation locks are claimed with an in-directory recovery marker and atomically renamed aside so a contender cannot delete a new owner. Runner termination first signals and waits for whichever registry or Codex child is active, then retires the task using its invocation token. This prevents concurrent or orphaned registry transitions and session resumes while keeping long streams, repeated diffs, reconnect noise, or unrelated warnings from burying or corrupting the final report.
+Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, separate stderr logs, and each final result. Artifact roots and task directories are rejected when symlinked or resolved outside their real parent. A registry-backed invocation claim serializes the first resume, later continuations, and explicit retirement; continuation claims atomically require active state, and the initial claim is stored in the same mutation as reservation. Every Codex child waits behind a start gate until its PID is durable. Stale claims are reclaimed under the registry mutation lock only after that child PID is confirmed nonexistent; PID reuse or ambiguous process access blocks recovery rather than risking unsafe retirement. Stale mutation locks are claimed with an in-directory recovery marker and atomically renamed aside so a contender cannot delete a new owner. Runner termination first signals and waits for whichever registry or Codex child is active, then retires the task using its invocation token. This prevents concurrent or orphaned registry transitions and session resumes while keeping long streams, repeated diffs, reconnect noise, or unrelated warnings from burying or corrupting the final report.
 
 ## Low-level registry commands
 
@@ -146,7 +146,8 @@ Only that JSON result is emitted on stdout. The external artifact directory prin
 | `bind` | Bind one globally unique Codex session to one reserved task |
 | `activate` | Activate the exact bound task/session |
 | `checkpoint` | Save evidence while keeping a task active |
-| `claim-invocation` / `release-invocation` | Atomically serialize one live runner per task and reclaim a dead owner |
+| `claim-invocation` / `release-invocation` | Atomically serialize one live runner per task, require active continuation state, and reclaim only a dead owner whose recorded child is gone |
+| `record-child` / `clear-child` | Persist and clear the gated Codex child's PID |
 | `complete-and-retire` | Atomically record terminal evidence and remove live worker entry |
 | `query` / `active` | Read ledger task or live workers |
 | `assert-no-active` / `assert-empty` | Prove no reserved, bound, or active workers remain |
@@ -178,4 +179,4 @@ Run without network access:
 ./luna-local-review-loop/scripts/test-init.sh
 ```
 
-The test covers non-mutating init, symlink-safe external state paths, live legacy-registry refusal, external persistent state, stale mutation-lock contention, single-child retry chains, atomic initial reservation ownership, a fast handshake with no invocation handle, portable artifact counting, atomic stale-claim recovery, serialized exact-session continuation without PTY/EOF, child termination before retirement, strict finish statuses, artifact-independent recovery, structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.
+The test covers non-mutating init, symlink-safe external state and artifact paths, live legacy-registry refusal, inverse ledger/worker consistency, external persistent state, stale mutation-lock contention, single-child retry chains, atomic initial reservation ownership, active-only continuation claims, a fast handshake with no invocation handle, portable artifact counting, atomic stale-claim recovery, serialized exact-session continuation without PTY/EOF, normal and hard-kill child recovery, strict finish statuses, artifact-independent recovery, structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.

@@ -28,7 +28,8 @@ FINISHED=0
 SESSION_ID=''
 INVOCATION_TOKEN=''
 INVOCATION_CLAIMED=0
-ACTIVE_CHILD_PID=''
+ACTIVE_CODEX_PID=''
+ACTIVE_HELPER_PID=''
 
 usage() {
 	local exit_code="${1:-0}"
@@ -85,7 +86,9 @@ prepare_invocation() {
 
 claim_invocation() {
 	prepare_invocation
-	run_registry_quiet claim-invocation --task-id "$TASK_ID" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+	local claim_args=(claim-invocation --task-id "$TASK_ID" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")
+	[[ "$MODE" != continue ]] || claim_args+=(--require-status active)
+	run_registry_quiet "${claim_args[@]}"
 	INVOCATION_CLAIMED=1
 }
 
@@ -99,26 +102,112 @@ release_invocation() {
 stop_active_child_and_exit() {
 	local signal_name="$1"
 	local exit_code="$2"
-	local child_pid="$ACTIVE_CHILD_PID"
-	if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
-		kill -s "$signal_name" "$child_pid" 2>/dev/null || true
-		wait "$child_pid" 2>/dev/null || true
-	fi
-	ACTIVE_CHILD_PID=''
+	local child_pid
+	for child_pid in "$ACTIVE_HELPER_PID" "$ACTIVE_CODEX_PID"; do
+		if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+			kill -s "$signal_name" "$child_pid" 2>/dev/null || true
+			wait "$child_pid" 2>/dev/null || true
+		fi
+	done
+	ACTIVE_HELPER_PID=''
+	ACTIVE_CODEX_PID=''
 	exit "$exit_code"
 }
 
-wait_for_active_child() {
+wait_for_helper() {
 	local child_status=0
-	wait "$ACTIVE_CHILD_PID" || child_status=$?
-	ACTIVE_CHILD_PID=''
+	wait "$ACTIVE_HELPER_PID" || child_status=$?
+	ACTIVE_HELPER_PID=''
 	return "$child_status"
 }
 
 run_registry_quiet() {
 	"$REGISTRY_SCRIPT" "$@" >/dev/null &
-	ACTIVE_CHILD_PID=$!
-	wait_for_active_child
+	ACTIVE_HELPER_PID=$!
+	wait_for_helper
+}
+
+create_real_child_directory() {
+	local parent="$1"
+	local name="$2"
+	local label="$3"
+	local parent_real
+	local path
+	local resolved
+	parent_real="$(cd -P "$parent" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label parent directory: $parent."
+	path="$parent/$name"
+	[[ ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must be a real directory, not a symlink: $path."
+	if [[ ! -e "$path" ]]; then
+		if ! mkdir "$path" 2>/dev/null; then
+			[[ -d "$path" && ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "cannot create $label: $path."
+		fi
+	fi
+	[[ -d "$path" && ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must be a real directory: $path."
+	resolved="$(cd -P "$path" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label: $path."
+	[[ "$resolved" == "$parent_real/$name" ]] || die "$EXIT_RUNTIME_STATE" "$label resolved outside its parent: $path -> $resolved."
+	chmod 0700 "$resolved" || die "$EXIT_RUNTIME_STATE" "cannot restrict $label permissions: $resolved."
+	printf '%s\n' "$resolved"
+}
+
+require_real_child_directory() {
+	local parent="$1"
+	local name="$2"
+	local label="$3"
+	local parent_real
+	local path
+	local resolved
+	parent_real="$(cd -P "$parent" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label parent directory: $parent."
+	path="$parent/$name"
+	[[ -d "$path" && ! -L "$path" ]] || die "$EXIT_WORKER" "$label is missing or symlinked: $path."
+	resolved="$(cd -P "$path" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label: $path."
+	[[ "$resolved" == "$parent_real/$name" ]] || die "$EXIT_RUNTIME_STATE" "$label resolved outside its parent: $path -> $resolved."
+	printf '%s\n' "$resolved"
+}
+
+run_gated_codex() {
+	local artifact_dir="$1"
+	local stream_log="$2"
+	local stream_stderr="$3"
+	local stdin_path="$4"
+	shift 4
+	local gate_path="$artifact_dir/.start-$INVOCATION_TOKEN"
+	local parent_pid="$$"
+	local child_status=0
+	local child_pid
+	rm -f "$gate_path"
+	(
+		while [[ ! -f "$gate_path" ]]; do
+			kill -0 "$parent_pid" 2>/dev/null || exit 125
+			sleep 0.05
+		done
+		if [[ -n "$stdin_path" ]]; then
+			exec "$@" <"$stdin_path"
+		else
+			exec "$@"
+		fi
+	) >"$stream_log" 2>"$stream_stderr" &
+	ACTIVE_CODEX_PID=$!
+	child_pid="$ACTIVE_CODEX_PID"
+	if ! run_registry_quiet record-child --task-id "$TASK_ID" --pid "$child_pid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
+		kill -TERM "$child_pid" 2>/dev/null || true
+		wait "$child_pid" 2>/dev/null || true
+		ACTIVE_CODEX_PID=''
+		return 1
+	fi
+	if ! : >"$gate_path"; then
+		kill -TERM "$child_pid" 2>/dev/null || true
+		wait "$child_pid" 2>/dev/null || true
+		ACTIVE_CODEX_PID=''
+		return 1
+	fi
+	wait "$child_pid" || child_status=$?
+	rm -f "$gate_path"
+	if ! run_registry_quiet clear-child --task-id "$TASK_ID" --pid "$child_pid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
+		ACTIVE_CODEX_PID=''
+		return 1
+	fi
+	ACTIVE_CODEX_PID=''
+	return "$child_status"
 }
 
 trap 'stop_active_child_and_exit INT 130' INT
@@ -162,16 +251,16 @@ resume_task() {
 	stream_stderr="$artifact_dir/stream-$attempt.stderr.log"
 	result_path="$artifact_dir/result-$attempt.json"
 
-	"$CODEX_BIN" exec resume \
+	local codex_status=0
+	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$PROMPT_FILE" "$CODEX_BIN" exec resume \
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		--json \
 		--output-schema "$RESULT_SCHEMA" \
 		--output-last-message "$result_path" \
-		"$SESSION_ID" - <"$PROMPT_FILE" >"$stream_log" 2>"$stream_stderr" &
-	ACTIVE_CHILD_PID=$!
-	if ! wait_for_active_child; then
+		"$SESSION_ID" - || codex_status=$?
+	if [[ "$codex_status" -ne 0 ]]; then
 		die "$EXIT_WORKER" "Codex resume failed for task $TASK_ID. Logs: $stream_log and $stream_stderr"
 	fi
 	validate_result "$result_path" || die "$EXIT_WORKER" "worker returned invalid structured output: $result_path."
@@ -214,26 +303,26 @@ launch_worker() {
 	INVOCATION_CLAIMED=1
 
 	local registry_dir
+	local artifact_root
 	local artifact_dir
 	local launch_log
 	local launch_stderr
 	registry_dir="$(dirname "$registry_path")"
-	artifact_dir="$registry_dir/artifacts/$TASK_ID"
-	mkdir -p "$artifact_dir"
-	chmod 0700 "$registry_dir/artifacts" "$artifact_dir" 2>/dev/null || true
+	artifact_root="$(create_real_child_directory "$registry_dir" artifacts 'artifact root')"
+	artifact_dir="$(create_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
 	launch_log="$artifact_dir/launch.jsonl"
 	launch_stderr="$artifact_dir/launch.stderr.log"
 
-	"$CODEX_BIN" exec \
+	local codex_status=0
+	run_gated_codex "$artifact_dir" "$launch_log" "$launch_stderr" '' "$CODEX_BIN" exec \
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		-s "$TASK_SANDBOX" \
 		-C "$REPO_INPUT" \
 		--json \
-		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' >"$launch_log" 2>"$launch_stderr" &
-	ACTIVE_CHILD_PID=$!
-	if ! wait_for_active_child; then
+		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' || codex_status=$?
+	if [[ "$codex_status" -ne 0 ]]; then
 		SESSION_ID="$(extract_session_id "$launch_log")"
 		[[ -z "$SESSION_ID" ]] || run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
 		die "$EXIT_WORKER" "Codex handshake failed for task $TASK_ID. Logs: $launch_log and $launch_stderr"
@@ -249,16 +338,16 @@ continue_worker() {
 	validate_common
 	local registry_path
 	local registry_dir
+	local artifact_root
 	local artifact_dir
 	local worker
 	registry_path="$($REGISTRY_SCRIPT path --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")"
 	registry_dir="$(dirname "$registry_path")"
-	artifact_dir="$registry_dir/artifacts/$TASK_ID"
-	[[ -d "$artifact_dir" ]] || die "$EXIT_WORKER" "worker artifact directory is missing: $artifact_dir."
+	artifact_root="$(require_real_child_directory "$registry_dir" artifacts 'artifact root')"
+	artifact_dir="$(require_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
 	trap finish_on_error EXIT
 	claim_invocation
 	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")"
-	[[ "$(jq -r '.status' <<<"$worker")" == active ]] || die "$EXIT_WORKER" "continue requires an active registered task: $TASK_ID."
 	SESSION_ID="$(jq -r '.session_id' <<<"$worker")"
 	resume_task "$artifact_dir"
 }
