@@ -20,7 +20,7 @@ TASK_ID=''
 SCOPE=''
 RETRY_OF=''
 PROMPT_FILE=''
-TASK_SANDBOX='workspace-write'
+TASK_SANDBOX=''
 MODEL='gpt-5.6-luna'
 REASONING_EFFORT='max'
 CODEX_BIN="${CODEX_BIN:-codex}"
@@ -67,7 +67,7 @@ validate_common() {
 	[[ -f "$RESULT_SCHEMA" ]] || die "$EXIT_PREREQUISITE" "worker result schema not found: $RESULT_SCHEMA."
 	[[ "$TASK_ID" =~ ^[A-Za-z0-9._-]+$ ]] || die "$EXIT_USAGE" 'task-id must contain only letters, numbers, dot, underscore, or hyphen.'
 	[[ -f "$PROMPT_FILE" && ! -L "$PROMPT_FILE" ]] || die "$EXIT_USAGE" "prompt-file must be a regular non-symlink file: $PROMPT_FILE."
-	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_USAGE" 'sandbox must be read-only or workspace-write.' ;; esac
+	case "$TASK_SANDBOX" in '' | read-only | workspace-write) ;; *) die "$EXIT_USAGE" 'sandbox must be read-only or workspace-write.' ;; esac
 	runtime_state_is_writable
 }
 
@@ -299,8 +299,11 @@ launch_worker() {
 	trap finish_on_error EXIT
 	local reserve_args=(reserve --task-id "$TASK_ID" --scope "$SCOPE" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")
 	[[ -z "$RETRY_OF" ]] || reserve_args+=(--retry-of "$RETRY_OF")
+	[[ -z "$TASK_SANDBOX" ]] || reserve_args+=(--sandbox "$TASK_SANDBOX")
 	run_registry_quiet "${reserve_args[@]}"
 	INVOCATION_CLAIMED=1
+	TASK_SANDBOX="$("$REGISTRY_SCRIPT" query --task-id "$TASK_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" | jq -r '.sandbox')"
+	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
 
 	local registry_dir
 	local artifact_root

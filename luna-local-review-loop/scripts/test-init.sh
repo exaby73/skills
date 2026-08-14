@@ -12,6 +12,16 @@ fail() {
 	exit 1
 }
 
+process_is_live_non_zombie() {
+	local pid="$1"
+	local process_state=''
+	process_state="$(ps -p "$pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"
+	case "$process_state" in
+	Z* | '') return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
 TEST_ROOT="$(mktemp -d)"
 readonly TEST_ROOT
 trap 'rm -rf "$TEST_ROOT"' EXIT
@@ -102,7 +112,7 @@ state_root_real="$(cd "$STATE_ROOT" && pwd -P)"
 [[ ! -e "$REPO_ROOT/.agents/agent-registry" ]] || fail 'init created project-local registry state'
 [[ ! -e "$REPO_ROOT/.gitignore" ]] || fail 'init modified repository ignore rules'
 [[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'init modified repository files'
-jq -e '.schema_version == 2 and .workers == [] and .identity_ledger == []' "$registry_path" >/dev/null || fail 'new registry schema is invalid'
+jq -e '.schema_version == 2 and (.repository_identity | type == "string" and length > 0) and .workers == [] and .identity_ledger == []' "$registry_path" >/dev/null || fail 'new registry schema is invalid'
 
 schema_repo="$TEST_ROOT/schema-repo"
 schema_state="$TEST_ROOT/schema-state"
@@ -113,12 +123,31 @@ git -C "$schema_repo" init -q
 schema_registry="$($INIT_SCRIPT --repo "$schema_repo" --state-root "$schema_state" --print-path)"
 schema_timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 jq --arg timestamp "$schema_timestamp" '
-  .identity_ledger += [{task_id:"orphan-live-row", scope:"damaged registry", retry_of:null, session_id:null, status:"reserved", reserved_at:$timestamp, bound_at:null, activated_at:null, terminal_at:null, retired_at:null, terminal_status:null, terminal_evidence:""}]
+  .identity_ledger += [{task_id:"orphan-live-row", scope:"damaged registry", sandbox:"workspace-write", retry_of:null, session_id:null, status:"reserved", reserved_at:$timestamp, bound_at:null, activated_at:null, terminal_at:null, retired_at:null, terminal_status:null, terminal_evidence:""}]
 ' "$schema_registry" >"$schema_registry.tmp"
 mv "$schema_registry.tmp" "$schema_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$schema_repo" --state-root "$schema_state" >"$TEST_ROOT/orphan-ledger.out" 2>&1; then
 	fail 'schema accepted a live identity-ledger row without a worker entry'
 fi
+
+identity_repo="$TEST_ROOT/identity-repo"
+identity_state="$TEST_ROOT/identity-state"
+mkdir -p "$identity_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$identity_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$identity_repo/.agents/skills/caveman"
+git -C "$identity_repo" init -q
+"$INIT_SCRIPT" --repo "$identity_repo" --state-root "$identity_state" >/dev/null
+"$REGISTRY_SCRIPT" reserve --repo "$identity_repo" --state-root "$identity_state" --task-id original-checkout-worker --scope 'bind state to original repository instance' >/dev/null
+rm -rf "$identity_repo"
+sleep 1
+mkdir -p "$identity_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$identity_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$identity_repo/.agents/skills/caveman"
+git -C "$identity_repo" init -q
+if "$INIT_SCRIPT" --existing-path --repo "$identity_repo" --state-root "$identity_state" >"$TEST_ROOT/replaced-repository.out" 2>&1; then
+	fail 'init attached live state to a replacement repository at the same path'
+fi
+rg -F 'different Git repository instance' "$TEST_ROOT/replaced-repository.out" >/dev/null || fail 'repository replacement refusal lacked identity evidence'
 
 if CODEX_BIN="$TEST_ROOT/missing-codex" "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/missing-codex.out" 2>&1; then
 	fail 'normal init accepted a missing Codex CLI'
@@ -202,10 +231,13 @@ fi
 jq -e 'any(.workers[]; .task_id == "reserved-continuation" and .status == "reserved" and .invocation_pid == null and .invocation_token == null)' "$registry_path" >/dev/null || fail 'rejected continuation mutated or retired its reservation'
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id reserved-continuation --status interrupted --evidence 'continuation predicate test complete' >/dev/null
 
-"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-launch --scope 'exact retry scope' >/dev/null
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-launch --scope 'exact retry scope' --sandbox read-only >/dev/null
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-launch --status failed --evidence 'pre-bind launch failed' >/dev/null
 if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-retry --scope 'exact retry scope' >/dev/null 2>&1; then
 	fail 'duplicate scope was accepted without retry-of'
+fi
+if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id privilege-escalating-retry --scope 'exact retry scope' --retry-of failed-launch --sandbox workspace-write >/dev/null 2>&1; then
+	fail 'retry changed the original sandbox'
 fi
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id retry-launch --scope 'exact retry scope' --retry-of failed-launch >/dev/null
 if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id duplicate-retry --scope 'exact retry scope' --retry-of failed-launch >/dev/null 2>&1; then
@@ -215,7 +247,32 @@ fi
 if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id duplicate-retired-retry --scope 'exact retry scope' --retry-of failed-launch >/dev/null 2>&1; then
 	fail 'retired failed attempt accepted a second retry child'
 fi
-jq -e 'any(.identity_ledger[]; .task_id == "retry-launch" and .retry_of == "failed-launch" and .scope == "exact retry scope")' "$registry_path" >/dev/null || fail 'retry linkage was not recorded'
+jq -e 'any(.identity_ledger[]; .task_id == "retry-launch" and .retry_of == "failed-launch" and .scope == "exact retry scope" and .sandbox == "read-only")' "$registry_path" >/dev/null || fail 'retry linkage or inherited sandbox was not recorded'
+
+zombie_pid_file="$TEST_ROOT/zombie.pid"
+bash -c '(exit 0) & printf "%s\n" "$!" >"$1"; sleep 30' _ "$zombie_pid_file" &
+zombie_parent_pid=$!
+poll_attempt=0
+while [[ ! -s "$zombie_pid_file" && "$poll_attempt" -lt 100 ]]; do
+	sleep 0.01
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -s "$zombie_pid_file" ]] || fail 'zombie fixture did not publish its child PID'
+zombie_pid="$(cat "$zombie_pid_file")"
+poll_attempt=0
+while [[ "$(ps -p "$zombie_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')" != Z* && "$poll_attempt" -lt 100 ]]; do
+	sleep 0.01
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ "$(ps -p "$zombie_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')" == Z* ]] || fail 'zombie fixture never reached defunct state'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --scope 'reclaim a defunct invocation owner' >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --session-id 01zombie-recovery-session >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --session-id 01zombie-recovery-session >/dev/null
+"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --pid "$zombie_pid" --token zombie-owner >/dev/null
+"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --pid "$$" --token zombie-reclaimer >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --status interrupted --evidence 'defunct owner reclaimed' --invocation-token zombie-reclaimer >/dev/null
+kill "$zombie_parent_pid" 2>/dev/null || true
+wait "$zombie_parent_pid" 2>/dev/null || true
 
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --scope 'atomic initial reservation ownership' --pid "$$" --token initial-owner >/dev/null
 if "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --status failed --evidence 'wrong owner' --invocation-token wrong-owner >/dev/null 2>&1; then
@@ -249,6 +306,16 @@ jq -e 'any(.identity_ledger[]; .task_id == "failed-runner" and .session_id == nu
 retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-runner-retry --scope 'runner retry scope' --retry-of failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/retry.err")"
 jq -e '.outcome == "completed"' <<<"$retry_output" >/dev/null || fail 'runner retry did not complete'
 
+if FAKE_FAIL_HANDSHAKE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id read-only-failed-runner --scope 'read-only runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/read-only-failed.out" 2>&1; then
+	fail 'read-only failed handshake unexpectedly succeeded'
+fi
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id read-only-escalating-retry --scope 'read-only runner retry scope' --retry-of read-only-failed-runner --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/read-only-escalating.out" 2>&1; then
+	fail 'runner retry escalated read-only task to workspace-write'
+fi
+read_only_retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id read-only-runner-retry --scope 'read-only runner retry scope' --retry-of read-only-failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/read-only-retry.err")"
+jq -e '.outcome == "completed"' <<<"$read_only_retry_output" >/dev/null || fail 'read-only runner retry did not complete'
+jq -e 'any(.identity_ledger[]; .task_id == "read-only-runner-retry" and .sandbox == "read-only" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'runner retry did not preserve read-only sandbox'
+
 runner_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-worker --scope 'one fast task' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/runner.err")"
 jq -e '.outcome == "completed" and .summary == "worker concise result"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output'
 "$REGISTRY_SCRIPT" assert-no-active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'completed worker was not atomically retired'
@@ -263,6 +330,11 @@ sleep 0.01 &
 stale_owner_pid=$!
 wait "$stale_owner_pid"
 "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$stale_owner_pid" --token stale-owner >/dev/null
+stale_child_pid=99999999
+if process_is_live_non_zombie "$stale_child_pid"; then
+	fail 'chosen stale child PID unexpectedly belongs to a live process'
+fi
+"$REGISTRY_SCRIPT" record-child --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$stale_child_pid" --token stale-owner >/dev/null
 sleep 30 &
 claim_owner_a=$!
 sleep 30 &
@@ -286,7 +358,7 @@ if [[ "$claim_status_a" -eq 0 ]]; then
 else
 	winning_claim_token='contender-b'
 fi
-jq -e --arg token "$winning_claim_token" 'any(.workers[]; .task_id == "continued-worker" and .invocation_token == $token)' "$registry_path" >/dev/null || fail 'atomic stale claim winner was not recorded'
+jq -e --arg token "$winning_claim_token" 'any(.workers[]; .task_id == "continued-worker" and .invocation_token == $token and .active_child_pid == null)' "$registry_path" >/dev/null || fail 'atomic stale claim winner was not recorded or stale child identity was retained'
 if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --prompt-file "$CONTINUE_FILE" >"$TEST_ROOT/concurrent.out" 2>&1; then
 	fail 'concurrent continuation bypassed the registry-backed invocation claim'
 fi
@@ -313,9 +385,11 @@ fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
 resume_count="$(rg -c 'exec resume .*01fake-session-[0-9]+ -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 5 ]] || fail "expected five exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 6 ]] || fail "expected six exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 10 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 13 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
+[[ "$read_only_count" -eq 2 ]] || fail "expected original and retry handshakes to use read-only sandbox, got $read_only_count"
 if rg -F 'irrelevant connector warning' "$(dirname "$registry_path")/artifacts/fast-worker/launch.jsonl" >/dev/null; then
 	fail 'handshake stderr corrupted the JSONL event stream'
 fi
@@ -338,11 +412,11 @@ terminated_status=0
 wait "$terminating_runner_pid" || terminated_status=$?
 [[ "$terminated_status" -ne 0 ]] || fail 'terminated runner exited successfully'
 poll_attempt=0
-while kill -0 "$codex_child_pid" 2>/dev/null && [[ "$poll_attempt" -lt 100 ]]; do
+while process_is_live_non_zombie "$codex_child_pid" && [[ "$poll_attempt" -lt 100 ]]; do
 	sleep 0.05
 	poll_attempt=$((poll_attempt + 1))
 done
-if kill -0 "$codex_child_pid" 2>/dev/null; then
+if process_is_live_non_zombie "$codex_child_pid"; then
 	fail 'Codex child survived runner termination and registry retirement'
 fi
 jq -e 'any(.identity_ledger[]; .task_id == "terminated-worker" and .status == "retired" and .terminal_status == "failed") and all(.workers[]; .task_id != "terminated-worker")' "$registry_path" >/dev/null || fail 'terminated runner retired registry state before child cleanup completed'
@@ -360,7 +434,7 @@ done
 hard_killed_child_pid="$(cat "$CODEX_CHILD_PID_FILE")"
 kill -KILL "$hard_killed_runner_pid"
 wait "$hard_killed_runner_pid" 2>/dev/null || true
-kill -0 "$hard_killed_child_pid" 2>/dev/null || fail 'hard-killed runner did not leave a live child for recovery test'
+process_is_live_non_zombie "$hard_killed_child_pid" || fail 'hard-killed runner did not leave a live child for recovery test'
 jq -e --arg runner_pid "$hard_killed_runner_pid" --arg child_pid "$hard_killed_child_pid" 'any(.workers[]; .task_id == "hard-killed-worker" and .status == "active" and .invocation_pid == $runner_pid and .active_child_pid == $child_pid)' "$registry_path" >/dev/null || fail 'registry lost durable child identity after hard kill'
 if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --status interrupted --evidence 'must not retire live child' >"$TEST_ROOT/live-child-finish.out" 2>&1; then
 	fail 'recovery retired a task while its hard-kill-surviving child was live'
@@ -368,11 +442,11 @@ fi
 jq -e 'any(.workers[]; .task_id == "hard-killed-worker" and .active_child_pid != null)' "$registry_path" >/dev/null || fail 'rejected recovery removed hard-kill child evidence'
 kill -TERM "$hard_killed_child_pid"
 poll_attempt=0
-while kill -0 "$hard_killed_child_pid" 2>/dev/null && [[ "$poll_attempt" -lt 100 ]]; do
+while process_is_live_non_zombie "$hard_killed_child_pid" && [[ "$poll_attempt" -lt 100 ]]; do
 	sleep 0.05
 	poll_attempt=$((poll_attempt + 1))
 done
-if kill -0 "$hard_killed_child_pid" 2>/dev/null; then
+if process_is_live_non_zombie "$hard_killed_child_pid"; then
 	fail 'hard-kill recovery child did not stop'
 fi
 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --status interrupted --evidence 'child stopped and identity verified' >"$TEST_ROOT/hard-kill-finish.out"

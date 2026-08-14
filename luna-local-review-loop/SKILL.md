@@ -24,7 +24,7 @@ repo_root='/absolute/path/to/repository'
 "$skill_root/scripts/init.sh" --repo "$repo_root"
 ```
 
-Init validates `codex`, `jq`, Git, project-local Caveman, and project-local code-reviewer. It stores the registry below `${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}` using a deterministic repository key. It never edits `.gitignore`, `skills-lock.json`, `.agents/skills`, or another repository file, and never installs from the network. If a skill is missing, init prints explicit universal-target install commands; the parent decides whether to run them and reviews the resulting project changes.
+Init validates `codex`, `jq`, Git, project-local Caveman, and project-local code-reviewer. It stores the registry below `${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}` using a deterministic repository key and binds that state to the physical Git repository instance. If another repository later occupies the same path, stop and recover the registry only with the original checkout; never attach its sessions to the replacement repository. Init never edits `.gitignore`, `skills-lock.json`, `.agents/skills`, or another repository file, and never installs from the network. If a skill is missing, init prints explicit universal-target install commands; the parent decides whether to run them and reviews the resulting project changes.
 
 ## Route work
 
@@ -55,7 +55,7 @@ Never add `--ephemeral` to a resumable worker. The durable identity is the Codex
 
 The launcher uses `--ignore-user-config` so unrelated MCP servers/connectors do not start. Add task-relevant context to the prompt or target repository configuration; do not re-enable the full user connector set merely for convenience.
 
-The registry atomically claims each live invocation. A stale claim may be replaced only while holding the registry mutation lock, and stale mutation-lock recovery first claims an in-directory marker before atomically renaming the old lock aside. Concurrent recovery attempts therefore cannot delete a new owner or resume the same session. Every Codex child waits behind a start gate until its PID is durably recorded; recovery refuses retirement until that PID is confirmed nonexistent, including after a runner crash or `SIGKILL`. PID reuse is handled conservatively as still live, requiring manual process inspection instead of unsafe retirement. If the runner receives `INT` or `TERM`, it signals and waits for its active registry or Codex child before token-checked registry retirement. Artifact paths must remain real, non-symlink directories below the external registry path. Never bypass these controls by deleting registry state manually.
+The registry atomically claims each live invocation. A stale claim may be replaced only while holding the registry mutation lock, and stale mutation-lock recovery first claims an in-directory marker before atomically renaming the old lock aside. Concurrent recovery attempts therefore cannot delete a new owner or resume the same session. Every Codex child waits behind a start gate until its PID is durably recorded; recovery refuses retirement until that PID is confirmed exited, including after a runner crash or `SIGKILL`. Zombie children count as exited. PID reuse or ambiguous process access is handled conservatively as still live, requiring manual inspection instead of unsafe retirement. A successful stale-claim recovery clears the proven-dead child PID before the replacement invocation records its own. If the runner receives `INT` or `TERM`, it signals and waits for its active registry or Codex child before token-checked registry retirement. Artifact paths must remain real, non-symlink directories below the external registry path. Never bypass these controls by deleting registry state manually.
 
 Use `read-only` for investigation/review and `workspace-write` for implementation. The parent shell must separately allow the owning Codex runtime-state directory (normally `$CODEX_HOME` or `~/.codex`) to be written. This runtime permission is distinct from the worker repository sandbox. If the launcher reports exit 11, stop and obtain that narrow outer permission; never broaden the repository sandbox as a workaround.
 
@@ -83,7 +83,7 @@ If a launch failed or was interrupted, retire it with evidence, then retry the e
   --prompt-file '/absolute/path/to/task-prompt.txt'
 ```
 
-Only retired `failed` or `interrupted` attempts permit exact-scope retry. A failed attempt may have only one retry child, and no retry is permitted while another live worker owns that scope. If the child also fails, link the next retry to that child. The ledger keeps the complete linear retry chain.
+Only retired `failed` or `interrupted` attempts permit exact-scope retry. The retry inherits its parent's stored sandbox when `--sandbox` is omitted; an explicit sandbox must match, so retry cannot escalate permissions. A failed attempt may have only one retry child, and no retry is permitted while another live worker owns that scope. If the child also fails, link the next retry to that child. The ledger keeps the complete linear retry chain.
 
 ## Judge evidence and review
 

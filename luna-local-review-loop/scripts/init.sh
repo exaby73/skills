@@ -15,6 +15,7 @@ REPO_INPUT='.'
 STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 REPO_ROOT=''
+REPO_IDENTITY=''
 STATE_ROOT=''
 REGISTRY_DIR=''
 REGISTRY_PATH=''
@@ -32,6 +33,7 @@ readonly SCHEMA_FILTER='
       (.schema_version == 2)
       and (.registry == "luna-local-review-loop")
       and (.repository_root | nonempty_string)
+      and (.repository_identity | nonempty_string)
       and (.created_at | nonempty_string)
       and (.updated_at | nonempty_string)
       and (.identity_ledger | type == "array")
@@ -39,6 +41,7 @@ readonly SCHEMA_FILTER='
       and all($root.identity_ledger[];
         (.task_id | nonempty_string)
         and (.scope | nonempty_string)
+        and (.sandbox == "read-only" or .sandbox == "workspace-write")
         and (.retry_of | nullable_string)
         and (.session_id | nullable_string)
         and (valid_status(.status))
@@ -58,6 +61,7 @@ readonly SCHEMA_FILTER='
       and all($root.workers[];
         (.task_id | nonempty_string)
         and (.scope | nonempty_string)
+        and (.sandbox == "read-only" or .sandbox == "workspace-write")
         and (.retry_of | nullable_string)
         and (.session_id | nullable_string)
         and (valid_status(.status))
@@ -80,7 +84,7 @@ readonly SCHEMA_FILTER='
       and all($root.identity_ledger[];
         . as $row
         | if .retry_of == null then true
-          else any($root.identity_ledger[]; .task_id == $row.retry_of and .scope == $row.scope)
+          else any($root.identity_ledger[]; .task_id == $row.retry_of and .scope == $row.scope and .sandbox == $row.sandbox)
           end
       )
       and all($root.workers[];
@@ -88,6 +92,7 @@ readonly SCHEMA_FILTER='
         | any($root.identity_ledger[];
           .task_id == $worker.task_id
           and .scope == $worker.scope
+          and .sandbox == $worker.sandbox
           and .retry_of == $worker.retry_of
           and .session_id == $worker.session_id
           and .status == $worker.status
@@ -101,6 +106,7 @@ readonly SCHEMA_FILTER='
           else any($root.workers[];
             .task_id == $row.task_id
             and .scope == $row.scope
+            and .sandbox == $row.sandbox
             and .retry_of == $row.retry_of
             and .session_id == $row.session_id
             and .status == $row.status
@@ -141,7 +147,7 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq mkdir rm rmdir mv kill ps sleep awk shasum cat)
+	local required_commands=(bash git jq mkdir rm rmdir mv kill ps sleep awk shasum stat cat)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
 		required_commands+=(mktemp date chmod)
 	fi
@@ -168,6 +174,7 @@ resolve_paths() {
 	candidate="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate."
 	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
+	REPO_IDENTITY="$(repository_instance_identity)" || die "$EXIT_REPOSITORY" "cannot derive repository instance identity: $REPO_ROOT."
 	LEGACY_REGISTRY_PATH="$REPO_ROOT/.agents/agent-registry/registry.json"
 	refuse_live_legacy_registry
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
@@ -189,6 +196,23 @@ resolve_paths() {
 	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
 	LOCK_DIR="$REGISTRY_DIR/.lock"
 	validate_registry_dir
+}
+
+repository_instance_identity() {
+	local git_dir
+	local git_dir_real
+	local filesystem_identity=''
+	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
+	if filesystem_identity="$(stat -f '%d:%i:%B' "$git_dir_real" 2>/dev/null)"; then
+		:
+	elif filesystem_identity="$(stat -c '%d:%i:%W' "$git_dir_real" 2>/dev/null)"; then
+		:
+	else
+		return 1
+	fi
+	[[ -n "$filesystem_identity" ]] || return 1
+	printf '%s' "$git_dir_real:$filesystem_identity" | shasum -a 256 | awk '{print $1}'
 }
 
 refuse_live_legacy_registry() {
@@ -297,12 +321,21 @@ release_lock() {
 pid_is_confirmed_nonexistent() {
 	local owner_pid="$1"
 	local kill_error=''
-	local ps_output=''
+	local process_state=''
 
-	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
-		return 1
+	if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
+		case "$process_state" in
+		Z*) return 0 ;;
+		?*) return 1 ;;
+		esac
 	fi
-	if ps_output="$(ps -p "$owner_pid" -o pid= 2>/dev/null)" && [[ "$ps_output" == *[![:space:]]* ]]; then
+	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
+		if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
+			case "$process_state" in
+			Z*) return 0 ;;
+			?*) return 1 ;;
+			esac
+		fi
 		return 1
 	fi
 	case "$kill_error" in
@@ -366,8 +399,9 @@ write_new_registry() {
 	temp_path="$(mktemp "$REGISTRY_DIR/.registry.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create temporary registry in $REGISTRY_DIR."
 	jq -n \
 		--arg root "$REPO_ROOT" \
+		--arg identity "$REPO_IDENTITY" \
 		--arg timestamp "$timestamp" \
-		'{schema_version: 2, registry: "luna-local-review-loop", repository_root: $root, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' >"$temp_path"
+		'{schema_version: 2, registry: "luna-local-review-loop", repository_root: $root, repository_identity: $identity, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' >"$temp_path"
 	jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" 'new registry failed schema validation.'
 	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry permissions: $temp_path."
 	mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish registry: $REGISTRY_PATH."
@@ -411,6 +445,7 @@ if [[ -e "$REGISTRY_PATH" ]]; then
 	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "registry is not a regular file: $REGISTRY_PATH."
 	jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 2 validation: $REGISTRY_PATH. Preserve it for investigation."
 	[[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" == "$REPO_ROOT" ]] || die "$EXIT_SCHEMA" "registry repository root does not match $REPO_ROOT: $REGISTRY_PATH."
+	[[ "$(jq -r '.repository_identity' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_SCHEMA" "registry belongs to a different Git repository instance at $REPO_ROOT: $REGISTRY_PATH. Preserve live state and recover it only with the original checkout; after proving no live workers remain, remove or archive this external registry before initializing the replacement checkout."
 else
 	[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_FILESYSTEM" "registry does not exist: $REGISTRY_PATH. Run init before launch."
 	write_new_registry

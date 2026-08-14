@@ -31,6 +31,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   and all($root.identity_ledger[];
     . as $row
     | (.task_id | nonempty) and (.scope | nonempty)
+    and ($row.sandbox == "read-only" or $row.sandbox == "workspace-write")
     and (["reserved", "bound", "active", "retired"] | index($row.status) != null)
     and (if $row.status == "reserved" then $row.session_id == null
          elif $row.status == "bound" or $row.status == "active" then ($row.session_id | nonempty)
@@ -41,6 +42,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   and all($root.workers[];
     . as $worker
     | (.task_id | nonempty) and (.scope | nonempty)
+      and ($worker.sandbox == "read-only" or $worker.sandbox == "workspace-write")
       and (.status == "reserved" or .status == "bound" or .status == "active")
       and (($worker.invocation_pid == null and $worker.invocation_token == null)
            or (($worker.invocation_pid | nonempty) and ($worker.invocation_token | nonempty)))
@@ -49,6 +51,7 @@ readonly TRANSITION_SCHEMA_FILTER='
       and any($root.identity_ledger[];
         .task_id == $worker.task_id
         and .scope == $worker.scope
+        and .sandbox == $worker.sandbox
         and .session_id == $worker.session_id
         and .status == $worker.status
       )
@@ -59,6 +62,7 @@ readonly TRANSITION_SCHEMA_FILTER='
       else any($root.workers[];
         .task_id == $row.task_id
         and .scope == $row.scope
+        and .sandbox == $row.sandbox
         and .session_id == $row.session_id
         and .status == $row.status
       )
@@ -74,7 +78,7 @@ usage() {
 	cat <<'EOF'
 Usage:
   registry.sh init|path [--repo PATH] [--state-root PATH]
-  registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--pid PID --token TOKEN] [--repo PATH] [--state-root PATH]
+  registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--sandbox read-only|workspace-write] [--pid PID --token TOKEN] [--repo PATH] [--state-root PATH]
   registry.sh bind --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
   registry.sh activate --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
   registry.sh checkpoint --task-id ID --evidence TEXT [--repo PATH] [--state-root PATH]
@@ -115,12 +119,21 @@ release_lock() {
 pid_is_confirmed_nonexistent() {
 	local owner_pid="$1"
 	local kill_error=''
-	local ps_output=''
+	local process_state=''
 
-	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
-		return 1
+	if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
+		case "$process_state" in
+		Z*) return 0 ;;
+		?*) return 1 ;;
+		esac
 	fi
-	if ps_output="$(ps -p "$owner_pid" -o pid= 2>/dev/null)" && [[ "$ps_output" == *[![:space:]]* ]]; then
+	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
+		if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
+			case "$process_state" in
+			Z*) return 0 ;;
+			?*) return 1 ;;
+			esac
+		fi
 		return 1
 	fi
 	case "$kill_error" in
@@ -235,6 +248,7 @@ command_reserve() {
 	local task_id=''
 	local scope=''
 	local retry_of=''
+	local sandbox=''
 	local owner_pid=''
 	local token=''
 	while [[ $# -gt 0 ]]; do
@@ -258,6 +272,10 @@ command_reserve() {
 			retry_of="$2"
 			shift 2
 			;;
+		--sandbox)
+			sandbox="${2:-}"
+			shift 2
+			;;
 		--pid)
 			owner_pid="${2:-}"
 			shift 2
@@ -273,6 +291,7 @@ command_reserve() {
 	validate_identity 'task-id' "$task_id"
 	validate_scope "$scope"
 	[[ -z "$retry_of" ]] || validate_identity 'retry-of' "$retry_of"
+	case "$sandbox" in '' | read-only | workspace-write) ;; *) die "$EXIT_USAGE" 'sandbox must be read-only or workspace-write.' ;; esac
 	if [[ -n "$owner_pid" || -n "$token" ]]; then
 		[[ -n "$owner_pid" && -n "$token" ]] || die "$EXIT_USAGE" 'reserve requires both --pid and --token when claiming the initial invocation.'
 		case "$owner_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "invocation PID must be a positive integer: $owner_pid." ;; esac
@@ -282,21 +301,31 @@ command_reserve() {
 	acquire_lock
 	jq -e --arg task_id "$task_id" 'all(.identity_ledger[]; .task_id != $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "task-id is permanently reserved: $task_id."
 	if [[ -n "$retry_of" ]]; then
-		jq -e --arg retry_of "$retry_of" --arg scope "$scope" '
-      any(.identity_ledger[]; .task_id == $retry_of and .scope == $scope and .status == "retired" and (.terminal_status == "failed" or .terminal_status == "interrupted"))
-    ' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "retry-of must name a retired failed/interrupted task with the exact same scope: $retry_of."
+		local retry_sandbox
+		retry_sandbox="$(jq -r --arg retry_of "$retry_of" --arg scope "$scope" '
+      .identity_ledger[]
+      | select(.task_id == $retry_of and .scope == $scope and .status == "retired" and (.terminal_status == "failed" or .terminal_status == "interrupted"))
+      | .sandbox
+    ' "$REGISTRY_PATH")"
+		[[ -n "$retry_sandbox" && "$retry_sandbox" != null ]] || die "$EXIT_CONFLICT" "retry-of must name a retired failed/interrupted task with the exact same scope: $retry_of."
+		if [[ -z "$sandbox" ]]; then
+			sandbox="$retry_sandbox"
+		else
+			[[ "$sandbox" == "$retry_sandbox" ]] || die "$EXIT_CONFLICT" "retry sandbox must match parent task $retry_of: expected $retry_sandbox, got $sandbox."
+		fi
 		jq -e --arg scope "$scope" 'all(.workers[]; .scope != $scope)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'another live task already owns this retry scope.'
 		jq -e --arg retry_of "$retry_of" 'all(.identity_ledger[]; .retry_of != $retry_of)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "retry attempt already has a child; retry the latest failed/interrupted child instead: $retry_of."
 	else
+		sandbox="${sandbox:-workspace-write}"
 		jq -e --arg scope "$scope" 'all(.identity_ledger[]; .scope != $scope)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'scope is already reserved; use --retry-of with the failed/interrupted task ID to retry the exact scope.'
 	fi
 	local timestamp
 	timestamp="$(now_utc)"
 	atomic_write '
     .updated_at = $timestamp
-    | .identity_ledger += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", reserved_at: $timestamp, bound_at: null, activated_at: null, terminal_at: null, retired_at: null, terminal_status: null, terminal_evidence: ""}]
-    | .workers += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: (($owner_pid | select(length > 0)) // null), invocation_token: (($token | select(length > 0)) // null), active_child_pid: null}]
-  ' --arg task_id "$task_id" --arg scope "$scope" --arg retry_of "${retry_of:-}" --arg owner_pid "${owner_pid:-}" --arg token "${token:-}" --arg timestamp "$timestamp"
+    | .identity_ledger += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", reserved_at: $timestamp, bound_at: null, activated_at: null, terminal_at: null, retired_at: null, terminal_status: null, terminal_evidence: ""}]
+    | .workers += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: (($owner_pid | select(length > 0)) // null), invocation_token: (($token | select(length > 0)) // null), active_child_pid: null}]
+  ' --arg task_id "$task_id" --arg scope "$scope" --arg sandbox "$sandbox" --arg retry_of "${retry_of:-}" --arg owner_pid "${owner_pid:-}" --arg token "${token:-}" --arg timestamp "$timestamp"
 	printf 'Reserved task=%s\n' "$task_id"
 }
 
@@ -465,7 +494,7 @@ command_claim_invocation() {
 	timestamp="$(now_utc)"
 	atomic_write '
     .updated_at = $timestamp
-    | .workers |= map(if .task_id == $task_id then .invocation_pid = $owner_pid | .invocation_token = $token | .updated_at = $timestamp else . end)
+    | .workers |= map(if .task_id == $task_id then .invocation_pid = $owner_pid | .invocation_token = $token | .active_child_pid = null | .updated_at = $timestamp else . end)
   ' --arg task_id "$task_id" --arg owner_pid "$owner_pid" --arg token "$token" --arg timestamp "$timestamp"
 	printf 'Claimed invocation task=%s token=%s\n' "$task_id" "$token"
 }
