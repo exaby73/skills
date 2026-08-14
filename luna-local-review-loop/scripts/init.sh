@@ -3,6 +3,9 @@
 set -euo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
+
 readonly EXIT_OK=0
 readonly EXIT_USAGE=2
 readonly EXIT_PREREQUISITE=3
@@ -26,6 +29,7 @@ ALLOW_INSTANCE_MARKER_CREATE=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
+  def positive_pid: type == "string" and test("^[1-9][0-9]*$");
   def nullable_string: . == null or (. | nonempty_string);
   def valid_status($status): ["reserved", "bound", "active", "retired"] | index($status) != null;
   def valid_terminal($status): ["completed", "failed", "blocked", "interrupted"] | index($status) != null;
@@ -73,9 +77,9 @@ readonly SCHEMA_FILTER='
         and ((.activated_at == null) or (.activated_at | nonempty_string))
         and (.checkpoint_evidence | type == "string")
         and ((.invocation_pid == null and .invocation_token == null)
-             or ((.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
+             or ((.invocation_pid | positive_pid) and (.invocation_token | nonempty_string)))
         and ((.active_child_pgid == null)
-             or ((.active_child_pgid | nonempty_string) and (.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
+             or ((.active_child_pgid | positive_pid) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
@@ -169,8 +173,6 @@ require_commands() {
 
 resolve_paths() {
 	local candidate
-	local repo_fingerprint
-	local registry_candidate
 	local state_candidate
 
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_REPOSITORY" "repository path does not exist or is not a directory: $REPO_INPUT."
@@ -182,12 +184,8 @@ resolve_paths() {
 	case "$state_candidate/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $state_candidate." ;;
 	esac
-	repo_fingerprint="$(printf '%s' "$REPO_ROOT" | shasum -a 256 | awk '{print $1}')"
-	[[ -n "$repo_fingerprint" ]] || die "$EXIT_FILESYSTEM" 'could not derive repository state key.'
-	registry_candidate="$state_candidate/$repo_fingerprint/registry.json"
-	if [[ "$EXISTING_ONLY" -eq 0 && ! -e "$registry_candidate" ]]; then
+	if [[ "$EXISTING_ONLY" -eq 0 && ! -e "$STATE_ROOT_INPUT" ]]; then
 		refuse_live_legacy_registry
-		ALLOW_INSTANCE_MARKER_CREATE=1
 	fi
 	if [[ "$EXISTING_ONLY" -eq 1 ]]; then
 		[[ -d "$STATE_ROOT_INPUT" ]] || die "$EXIT_FILESYSTEM" "state root does not exist: $STATE_ROOT_INPUT."
@@ -198,10 +196,6 @@ resolve_paths() {
 	case "$STATE_ROOT/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $STATE_ROOT." ;;
 	esac
-	REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
-	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
-	LOCK_DIR="$REGISTRY_DIR/.lock"
-	validate_registry_dir
 }
 
 repository_instance_identity() {
@@ -216,6 +210,8 @@ repository_instance_identity() {
 	[[ ! -L "$marker_path" ]] || return 1
 	if [[ ! -e "$marker_path" ]]; then
 		[[ "$allow_create" -eq 1 ]] || return 1
+		refuse_live_external_registry_for_path
+		refuse_live_legacy_registry
 		nonce="$(od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
 		[[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
 		if ! (set -o noclobber; printf '%s\n' "$nonce" >"$marker_path") 2>/dev/null; then
@@ -225,7 +221,7 @@ repository_instance_identity() {
 	[[ -f "$marker_path" && ! -L "$marker_path" ]] || return 1
 	IFS= read -r nonce <"$marker_path" || return 1
 	[[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
-	printf '%s' "$git_dir_real:$nonce" | shasum -a 256 | awk '{print $1}'
+	printf '%s' "$nonce" | shasum -a 256 | awk '{print $1}'
 }
 
 refuse_live_legacy_registry() {
@@ -240,6 +236,64 @@ refuse_live_legacy_registry() {
   ' "$LEGACY_REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "legacy project registry cannot be validated safely: $LEGACY_REGISTRY_PATH. Preserve it and recover with the previous skill version before initializing external state."
 	live_count="$(jq '[.workers[] | select(.status == "reserved" or .status == "bound" or .status == "active" or .status == "stopping")] | length' "$LEGACY_REGISTRY_PATH")"
 	[[ "$live_count" -eq 0 ]] || die "$EXIT_SCHEMA" "legacy project registry contains $live_count live worker(s): $LEGACY_REGISTRY_PATH. Reinstall the previous skill version, retire or recover every live worker, verify its registry is empty, then rerun this version. The legacy registry was not changed."
+}
+
+refuse_live_external_registry_for_path() {
+	local candidate
+	local live_count
+	for candidate in "$STATE_ROOT"/*/registry.json; do
+		[[ -e "$candidate" ]] || continue
+		[[ -f "$candidate" && ! -L "$candidate" ]] || die "$EXIT_SCHEMA" "external registry candidate is not a regular file: $candidate. Preserve it for inspection."
+		if jq -e --arg root "$REPO_ROOT" '.schema_version == 2 and .repository_root == $root and (.workers | type == "array")' "$candidate" >/dev/null 2>&1; then
+			live_count="$(jq '.workers | length' "$candidate")"
+			[[ "$live_count" -eq 0 ]] || die "$EXIT_REPOSITORY" "the Git-directory instance marker is missing while $live_count live worker(s) remain for $REPO_ROOT in $candidate. Restore the original marker or retire those workers before initializing a replacement repository."
+		fi
+	done
+}
+
+resolve_registry_location() {
+	local candidate
+	local candidate_dir
+	local candidate_identity
+	local match=''
+	local match_count=0
+	local repo_fingerprint
+
+	for candidate in "$STATE_ROOT"/*/registry.json; do
+		[[ -e "$candidate" ]] || continue
+		[[ -f "$candidate" && ! -L "$candidate" ]] || die "$EXIT_SCHEMA" "external registry candidate is not a regular file: $candidate. Preserve it for inspection."
+		candidate_dir="$(dirname "$candidate")"
+		[[ -d "$candidate_dir" && ! -L "$candidate_dir" ]] || die "$EXIT_FILESYSTEM" "external registry directory must be real, not symlinked: $candidate_dir."
+		candidate_identity="$(jq -r '.repository_identity // empty' "$candidate" 2>/dev/null)" || die "$EXIT_SCHEMA" "cannot inspect external registry identity: $candidate."
+		if [[ "$candidate_identity" == "$REPO_IDENTITY" ]]; then
+			match="$candidate"
+			match_count=$((match_count + 1))
+		fi
+	done
+	[[ "$match_count" -le 1 ]] || die "$EXIT_SCHEMA" "multiple external registries claim repository identity $REPO_IDENTITY. Preserve them and reconcile the duplicate state before continuing."
+	if [[ "$match_count" -eq 1 ]]; then
+		REGISTRY_PATH="$match"
+		REGISTRY_DIR="$(dirname "$match")"
+	else
+		repo_fingerprint="$(printf '%s' "$REPO_ROOT" | shasum -a 256 | awk '{print $1}')"
+		[[ -n "$repo_fingerprint" ]] || die "$EXIT_FILESYSTEM" 'could not derive repository state key.'
+		REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
+		REGISTRY_PATH="$REGISTRY_DIR/registry.json"
+	fi
+	LOCK_DIR="$REGISTRY_DIR/.lock"
+	validate_registry_dir
+}
+
+publish_repository_root_update() {
+	local temp_path
+	temp_path="$(mktemp "$REGISTRY_DIR/.registry.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create temporary registry in $REGISTRY_DIR."
+	if ! jq --arg root "$REPO_ROOT" --arg timestamp "$(now_utc)" '.repository_root = $root | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
+		rm -f "$temp_path"
+		die "$EXIT_FILESYSTEM" 'could not update moved repository root in external state.'
+	fi
+	jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" 'moved repository root update failed schema validation.'
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry permissions: $temp_path."
+	mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish moved repository root: $REGISTRY_PATH."
 }
 
 canonical_path_without_creation() {
@@ -323,14 +377,6 @@ require_project_skills() {
 	[[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing project-local skill(s): $missing. Init is non-mutating. Install explicitly with '-a universal', review Skills CLI changes, then retry. code-reviewer: npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -a universal -y ; caveman: npx -y skills add https://github.com/juliusbrussee/caveman --skill caveman -a universal -y"
 }
 
-release_lock() {
-	if [[ "$LOCK_HELD" -eq 1 ]]; then
-		rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-		rmdir "$LOCK_DIR" 2>/dev/null || true
-		LOCK_HELD=0
-	fi
-}
-
 pid_is_confirmed_nonexistent() {
 	local owner_pid="$1"
 	local kill_error=''
@@ -357,80 +403,8 @@ pid_is_confirmed_nonexistent() {
 	esac
 }
 
-remove_stale_reclaim_marker() {
-	local marker="$1"
-	local attempt="$2"
-	local marker_pid=''
-	local witness="$REGISTRY_DIR/.reclaim-observed.$$.$attempt"
-
-	[[ -e "$marker" ]] || return 0
-	[[ -f "$marker" && ! -L "$marker" ]] || return 1
-	IFS= read -r marker_pid <"$marker" || marker_pid=''
-	case "$marker_pid" in '' | 0 | *[!0-9]*) return 1 ;; esac
-	pid_is_confirmed_nonexistent "$marker_pid" || return 1
-	rm -f "$witness"
-	if ln "$marker" "$witness" 2>/dev/null; then
-		if [[ "$marker" -ef "$witness" ]]; then
-			rm -f "$marker" 2>/dev/null || true
-		fi
-		rm -f "$witness" 2>/dev/null || true
-	fi
-}
-
-acquire_lock() {
-	local attempt=0
-	local owner_pid=''
-	local current_pid=''
-	local reclaim_candidate=''
-	local reclaim_marker=''
-	local quarantine=''
-
-	if ! mkdir "$REGISTRY_DIR" 2>/dev/null; then
-		validate_registry_dir
-	fi
-	validate_registry_dir
-	chmod 0700 "$REGISTRY_DIR" 2>/dev/null || die "$EXIT_FILESYSTEM" "cannot restrict registry directory permissions: $REGISTRY_DIR."
-	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-		owner_pid=''
-		[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r owner_pid <"$LOCK_DIR/pid" || owner_pid=''
-		case "$owner_pid" in
-		'' | 0 | *[!0-9]*) ;;
-		*)
-			if pid_is_confirmed_nonexistent "$owner_pid"; then
-				reclaim_marker="$LOCK_DIR/.reclaim"
-				reclaim_candidate="$REGISTRY_DIR/.reclaim-candidate.$$.$attempt"
-				printf '%s\n' "$$" >"$reclaim_candidate" || die "$EXIT_FILESYSTEM" "cannot create registry-lock reclaim candidate: $reclaim_candidate."
-				if ln "$reclaim_candidate" "$reclaim_marker" 2>/dev/null; then
-					rm -f "$reclaim_candidate" 2>/dev/null || true
-					current_pid=''
-					[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r current_pid <"$LOCK_DIR/pid" || current_pid=''
-					if [[ "$current_pid" == "$owner_pid" ]] && pid_is_confirmed_nonexistent "$current_pid"; then
-						quarantine="$REGISTRY_DIR/.lock.reclaimed.$$.$attempt"
-						if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
-							rm -f "$quarantine/pid" 2>/dev/null || true
-							rm -f "$quarantine/.reclaim" 2>/dev/null || true
-							rmdir "$quarantine" 2>/dev/null || true
-							continue
-						fi
-					fi
-					rm -f "$reclaim_marker" 2>/dev/null || true
-				else
-					rm -f "$reclaim_candidate" 2>/dev/null || true
-					remove_stale_reclaim_marker "$reclaim_marker" "$attempt" || true
-				fi
-			fi
-			;;
-		esac
-		attempt=$((attempt + 1))
-		[[ "$attempt" -lt 50 ]] || die "$EXIT_LOCK" "registry lock is busy: $LOCK_DIR. Inspect its owner and remove only a confirmed-stale lock."
-		sleep 0.1
-	done
-	LOCK_HELD=1
-	printf '%s\n' "$$" >"$LOCK_DIR/pid" || die "$EXIT_FILESYSTEM" "cannot record registry lock owner: $LOCK_DIR/pid."
-	trap release_lock EXIT
-	trap 'exit 130' INT
-	trap 'exit 143' TERM
-}
+# shellcheck source=registry-lock.sh
+source "$SCRIPT_DIR/registry-lock.sh"
 
 write_new_registry() {
 	local timestamp
@@ -478,15 +452,27 @@ done
 require_commands
 resolve_paths
 if [[ "$EXISTING_ONLY" -eq 0 ]]; then
+	ALLOW_INSTANCE_MARKER_CREATE=1
 	require_project_skills
 fi
 REPO_IDENTITY="$(repository_instance_identity "$ALLOW_INSTANCE_MARKER_CREATE")" || die "$EXIT_REPOSITORY" "cannot read or safely create the Git-directory instance marker for $REPO_ROOT. This may be a different Git repository instance at the same path; preserve external state and inspect the repository before retrying."
+resolve_registry_location
+if [[ "$EXISTING_ONLY" -eq 0 && ! -e "$REGISTRY_PATH" ]]; then
+	refuse_live_legacy_registry
+fi
+if ! mkdir "$REGISTRY_DIR" 2>/dev/null; then
+	validate_registry_dir
+fi
+validate_registry_dir
+chmod 0700 "$REGISTRY_DIR" 2>/dev/null || die "$EXIT_FILESYSTEM" "cannot restrict registry directory permissions: $REGISTRY_DIR."
 acquire_lock
 if [[ -e "$REGISTRY_PATH" ]]; then
 	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "registry is not a regular file: $REGISTRY_PATH."
 	jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 2 validation: $REGISTRY_PATH. Preserve it for investigation."
-	[[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" == "$REPO_ROOT" ]] || die "$EXIT_SCHEMA" "registry repository root does not match $REPO_ROOT: $REGISTRY_PATH."
 	[[ "$(jq -r '.repository_identity' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_SCHEMA" "registry belongs to a different Git repository instance at $REPO_ROOT: $REGISTRY_PATH. Preserve live state and recover it only with the original checkout; after proving no live workers remain, remove or archive this external registry before initializing the replacement checkout."
+	if [[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" != "$REPO_ROOT" ]]; then
+		publish_repository_root_update
+	fi
 else
 	[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_FILESYSTEM" "registry does not exist: $REGISTRY_PATH. Run init before launch."
 	write_new_registry

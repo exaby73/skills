@@ -29,7 +29,14 @@ process_group_has_live_non_zombie() {
 
 TEST_ROOT="$(mktemp -d)"
 readonly TEST_ROOT
-trap 'rm -rf "$TEST_ROOT"' EXIT
+cleanup_test_root() {
+	if [[ "${KEEP_TEST_ROOT:-0}" == '1' ]]; then
+		printf 'Preserved test root: %s\n' "$TEST_ROOT" >&2
+	else
+		rm -rf "$TEST_ROOT"
+	fi
+}
+trap cleanup_test_root EXIT
 readonly REPO_ROOT="$TEST_ROOT/repo"
 readonly STATE_ROOT="$TEST_ROOT/state"
 readonly BIN_DIR="$TEST_ROOT/bin"
@@ -40,6 +47,7 @@ readonly CODEX_CALLS="$TEST_ROOT/codex-calls.log"
 readonly CODEX_COUNTER="$TEST_ROOT/codex-counter"
 readonly CODEX_CHILD_PID_FILE="$TEST_ROOT/codex-child.pid"
 readonly CODEX_DESCENDANT_PID_FILE="$TEST_ROOT/codex-descendant.pid"
+readonly CODEX_DETACHED_PID_FILE="$TEST_ROOT/codex-detached.pid"
 
 mkdir -p "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman" "$BIN_DIR" "$CODEX_STATE"
 printf '%s\n' '# code reviewer' >"$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
@@ -64,6 +72,21 @@ if [[ " $* " == *' exec resume '* ]]; then
     previous="$argument"
   done
   prompt="$(cat)"
+  if [[ "${FAKE_DETACH_RESUME:-0}" == '1' ]]; then
+    set -m
+    (
+      set -m
+      nohup sleep 300 >/dev/null 2>&1 &
+      detached_pid=$!
+      disown "$detached_pid"
+      printf '%s\n' "$detached_pid" > "$CODEX_DETACHED_PID_FILE"
+      sleep 0.2
+    ) &
+    detacher_pid=$!
+    disown "$detacher_pid"
+    set +m
+    sleep 0.3
+  fi
   if [[ "${FAKE_BLOCK_RESUME:-0}" == '1' ]]; then
     printf '%s\n' "$$" > "$CODEX_CHILD_PID_FILE"
 		sleep 300 &
@@ -103,6 +126,7 @@ export CODEX_CALLS
 export CODEX_COUNTER
 export CODEX_CHILD_PID_FILE
 export CODEX_DESCENDANT_PID_FILE
+export CODEX_DETACHED_PID_FILE
 export CODEX_HOME="$CODEX_STATE"
 
 before_status="$(git -C "$REPO_ROOT" status --short)"
@@ -169,6 +193,42 @@ if "$INIT_SCRIPT" --existing-path --repo "$duplicate_scope_repo" --state-root "$
 	fail 'schema accepted duplicate live worker scopes'
 fi
 
+pid_schema_repo="$TEST_ROOT/pid-schema-repo"
+pid_schema_state="$TEST_ROOT/pid-schema-state"
+mkdir -p "$pid_schema_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$pid_schema_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$pid_schema_repo/.agents/skills/caveman"
+git -C "$pid_schema_repo" init -q
+pid_schema_registry="$($INIT_SCRIPT --repo "$pid_schema_repo" --state-root "$pid_schema_state" --print-path)"
+"$REGISTRY_SCRIPT" reserve --repo "$pid_schema_repo" --state-root "$pid_schema_state" --task-id malformed-process-id --scope 'reject malformed persisted process identifiers' >/dev/null
+cp "$pid_schema_registry" "$pid_schema_registry.clean"
+jq '.workers[0].invocation_pid = "not-a-pid" | .workers[0].invocation_token = "owner"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-invocation-pid.out" 2>&1; then
+	fail 'schema accepted a nonnumeric invocation PID'
+fi
+cp "$pid_schema_registry.clean" "$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].active_child_pgid = "not-a-pgid"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-child-pgid.out" 2>&1; then
+	fail 'schema accepted a nonnumeric child process-group ID'
+fi
+cp "$pid_schema_registry.clean" "$pid_schema_registry"
+
+moved_repo="$TEST_ROOT/moved-repo"
+moved_repo_new="$TEST_ROOT/moved-repo-renamed"
+moved_state="$TEST_ROOT/moved-state"
+mkdir -p "$moved_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$moved_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$moved_repo/.agents/skills/caveman"
+git -C "$moved_repo" init -q
+moved_registry="$($INIT_SCRIPT --repo "$moved_repo" --state-root "$moved_state" --print-path)"
+"$REGISTRY_SCRIPT" reserve --repo "$moved_repo" --state-root "$moved_state" --task-id moved-checkout-worker --scope 'preserve live state across repository move' >/dev/null
+mv "$moved_repo" "$moved_repo_new"
+moved_registry_after="$($INIT_SCRIPT --existing-path --repo "$moved_repo_new" --state-root "$moved_state")"
+[[ "$moved_registry_after" == "$moved_registry" ]] || fail 'repository move selected a new external registry'
+moved_repo_new_real="$(cd -P "$moved_repo_new" && pwd -P)"
+jq -e --arg root "$moved_repo_new_real" '.repository_root == $root and any(.workers[]; .task_id == "moved-checkout-worker")' "$moved_registry" >/dev/null || fail 'repository move did not preserve live state and update its canonical root'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$moved_repo_new" --state-root "$moved_state" --task-id moved-checkout-worker --status interrupted --evidence 'repository move test complete' >/dev/null
+
 identity_repo="$TEST_ROOT/identity-repo"
 identity_state="$TEST_ROOT/identity-state"
 mkdir -p "$identity_repo/.agents/skills"
@@ -185,7 +245,7 @@ git -C "$identity_repo" init -q
 if "$INIT_SCRIPT" --existing-path --repo "$identity_repo" --state-root "$identity_state" >"$TEST_ROOT/replaced-repository.out" 2>&1; then
 	fail 'init attached live state to a replacement repository at the same path'
 fi
-rg -F 'different Git repository instance' "$TEST_ROOT/replaced-repository.out" >/dev/null || fail 'repository replacement refusal lacked identity evidence'
+rg -e 'instance marker is missing|cannot read or safely create the Git-directory instance marker' "$TEST_ROOT/replaced-repository.out" >/dev/null || fail 'repository replacement refusal lacked identity evidence'
 
 if CODEX_BIN="$TEST_ROOT/missing-codex" "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/missing-codex.out" 2>&1; then
 	fail 'normal init accepted a missing Codex CLI'
@@ -221,15 +281,25 @@ rm -f "$fingerprint_state/$repo_fingerprint"
 rm -rf "$fingerprint_target"
 
 registry_dir="$(dirname "$registry_path")"
+lock_symlink_target="$REPO_ROOT/.lock-symlink-target"
+mkdir "$lock_symlink_target"
+printf '%s\n' 'do not mutate' >"$lock_symlink_target/sentinel"
+ln -s "$lock_symlink_target" "$registry_dir/.lock"
+if "$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/lock-symlink.out" 2>&1; then
+	fail 'registry accepted a symlinked mutation lock'
+fi
+[[ "$(cat "$lock_symlink_target/sentinel")" == 'do not mutate' ]] || fail 'symlinked mutation-lock target was modified'
+rm -f "$registry_dir/.lock"
+rm -rf "$lock_symlink_target"
+
+: >"$registry_dir/.lock"
+"$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'registry could not reclaim an ownerless atomic lock file'
+[[ ! -e "$registry_dir/.lock" ]] || fail 'ownerless atomic lock remained after recovery'
+
 sleep 0.01 &
 stale_lock_pid=$!
 wait "$stale_lock_pid"
-mkdir "$registry_dir/.lock"
-printf '%s\n' "$stale_lock_pid" >"$registry_dir/.lock/pid"
-sleep 0.01 &
-stale_reclaimer_pid=$!
-wait "$stale_reclaimer_pid"
-printf '%s\n' "$stale_reclaimer_pid" >"$registry_dir/.lock/.reclaim"
+printf '%s\n' "$stale_lock_pid" >"$registry_dir/.lock"
 lock_status_a=0
 lock_status_b=0
 "$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/lock-a.out" 2>&1 &
@@ -240,7 +310,7 @@ wait "$lock_command_a" || lock_status_a=$?
 wait "$lock_command_b" || lock_status_b=$?
 [[ "$lock_status_a" -eq 0 && "$lock_status_b" -eq 0 ]] || fail 'registry commands could not serialize stale-lock reclamation'
 jq -e '.schema_version == 2' "$registry_path" >/dev/null || fail 'stale-lock contention corrupted the registry'
-[[ ! -e "$registry_dir/.lock" ]] || fail 'registry lock or crashed reclaim marker remained after stale-lock contention'
+[[ ! -e "$registry_dir/.lock" ]] || fail 'registry lock remained after stale-lock contention'
 
 artifact_target="$REPO_ROOT/.artifact-target"
 mkdir -p "$artifact_target"
@@ -263,6 +333,26 @@ fi
 [[ -z "$(ls -A "$task_artifact_target")" ]] || fail 'runner wrote through a symlinked task artifact directory'
 rm -f "$registry_dir/artifacts/symlinked-task-artifact"
 rm -rf "$task_artifact_target"
+
+artifact_file_target="$REPO_ROOT/.artifact-file-target"
+printf '%s\n' 'preserve artifact target' >"$artifact_file_target"
+mkdir "$registry_dir/artifacts/symlinked-artifact-file"
+ln -s "$artifact_file_target" "$registry_dir/artifacts/symlinked-artifact-file/launch.jsonl"
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id symlinked-artifact-file --scope 'reject symlinked artifact file' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/artifact-file.out" 2>&1; then
+	fail 'runner accepted a symlinked handshake artifact file'
+fi
+[[ "$(cat "$artifact_file_target")" == 'preserve artifact target' ]] || fail 'runner wrote through a symlinked handshake artifact file'
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id symlinked-continuation-file --scope 'reject symlinked continuation artifact file' >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id symlinked-continuation-file --session-id 01symlinked-continuation >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id symlinked-continuation-file --session-id 01symlinked-continuation >/dev/null
+mkdir "$registry_dir/artifacts/symlinked-continuation-file"
+ln -s "$artifact_file_target" "$registry_dir/artifacts/symlinked-continuation-file/stream-1.jsonl"
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id symlinked-continuation-file --prompt-file "$CONTINUE_FILE" >"$TEST_ROOT/continuation-artifact-file.out" 2>&1; then
+	fail 'runner accepted a symlinked continuation artifact file'
+fi
+[[ "$(cat "$artifact_file_target")" == 'preserve artifact target' ]] || fail 'runner wrote through a symlinked continuation artifact file'
+rm -f "$artifact_file_target"
 
 mkdir "$registry_dir/artifacts/reserved-continuation"
 chmod 0700 "$registry_dir/artifacts/reserved-continuation"
@@ -446,6 +536,16 @@ if rg -F 'irrelevant connector warning' "$(dirname "$registry_path")/artifacts/f
 fi
 rg -F 'irrelevant connector warning' "$(dirname "$registry_path")/artifacts/fast-worker/launch.stderr.log" >/dev/null || fail 'handshake stderr was not preserved separately'
 [[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'worker lifecycle modified repository tooling state'
+
+printf '%s\n' 'drain detached descendant' >"$PROMPT_FILE"
+rm -f "$CODEX_DETACHED_PID_FILE"
+detached_output="$(FAKE_DETACH_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id detached-worker --scope 'drain detached worker descendant' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/detached.err")"
+jq -e '.outcome == "completed"' <<<"$detached_output" >/dev/null || fail 'worker with detached descendant did not complete'
+[[ -s "$CODEX_DETACHED_PID_FILE" ]] || fail 'detached descendant fixture did not publish its PID'
+detached_pid="$(cat "$CODEX_DETACHED_PID_FILE")"
+if process_is_live_non_zombie "$detached_pid"; then
+	fail 'detached worker descendant survived registry retirement'
+fi
 
 printf '%s\n' 'terminate child safely' >"$PROMPT_FILE"
 rm -f "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE"

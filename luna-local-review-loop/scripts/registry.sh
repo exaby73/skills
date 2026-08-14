@@ -24,6 +24,7 @@ PARSE_SHIFT=0
 
 readonly TRANSITION_SCHEMA_FILTER='
   def nonempty: type == "string" and length > 0;
+  def positive_pid: type == "string" and test("^[1-9][0-9]*$");
   . as $root
   | (.schema_version == 2 and .registry == "luna-local-review-loop")
   and (.identity_ledger | type == "array")
@@ -45,9 +46,9 @@ readonly TRANSITION_SCHEMA_FILTER='
       and ($worker.sandbox == "read-only" or $worker.sandbox == "workspace-write")
       and (.status == "reserved" or .status == "bound" or .status == "active")
       and (($worker.invocation_pid == null and $worker.invocation_token == null)
-           or (($worker.invocation_pid | nonempty) and ($worker.invocation_token | nonempty)))
+           or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty)))
       and (($worker.active_child_pgid == null)
-           or (($worker.active_child_pgid | nonempty) and ($worker.invocation_pid | nonempty) and ($worker.invocation_token | nonempty)))
+           or (($worker.active_child_pgid | positive_pid) and ($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty)))
       and any($root.identity_ledger[];
         .task_id == $worker.task_id
         and .scope == $worker.scope
@@ -109,14 +110,6 @@ now_utc() {
 	date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
-release_lock() {
-	if [[ "$LOCK_HELD" -eq 1 ]]; then
-		rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-		rmdir "$LOCK_DIR" 2>/dev/null || true
-		LOCK_HELD=0
-	fi
-}
-
 pid_is_confirmed_nonexistent() {
 	local owner_pid="$1"
 	local kill_error=''
@@ -151,74 +144,28 @@ process_group_is_confirmed_empty() {
 	[[ "$live_count" -eq 0 ]]
 }
 
-remove_stale_reclaim_marker() {
-	local marker="$1"
-	local attempt="$2"
-	local marker_pid=''
-	local witness="$REGISTRY_DIR/.reclaim-observed.$$.$attempt"
-
-	[[ -e "$marker" ]] || return 0
-	[[ -f "$marker" && ! -L "$marker" ]] || return 1
-	IFS= read -r marker_pid <"$marker" || marker_pid=''
-	case "$marker_pid" in '' | 0 | *[!0-9]*) return 1 ;; esac
-	pid_is_confirmed_nonexistent "$marker_pid" || return 1
-	rm -f "$witness"
-	if ln "$marker" "$witness" 2>/dev/null; then
-		if [[ "$marker" -ef "$witness" ]]; then
-			rm -f "$marker" 2>/dev/null || true
-		fi
-		rm -f "$witness" 2>/dev/null || true
-	fi
+descendant_state_path() {
+	local task_id="$1"
+	local token="$2"
+	printf '%s/artifacts/%s/.descendants-%s.json\n' "$REGISTRY_DIR" "$task_id" "$token"
 }
 
-acquire_lock() {
-	local attempt=0
-	local owner_pid=''
-	local current_pid=''
-	local reclaim_candidate=''
-	local reclaim_marker=''
-	local quarantine=''
-	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-		owner_pid=''
-		[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r owner_pid <"$LOCK_DIR/pid" || owner_pid=''
-		case "$owner_pid" in
-		'' | 0 | *[!0-9]*) ;;
-		*)
-			if pid_is_confirmed_nonexistent "$owner_pid"; then
-				reclaim_marker="$LOCK_DIR/.reclaim"
-				reclaim_candidate="$REGISTRY_DIR/.reclaim-candidate.$$.$attempt"
-				printf '%s\n' "$$" >"$reclaim_candidate" || die "$EXIT_FILESYSTEM" "cannot create registry-lock reclaim candidate: $reclaim_candidate."
-				if ln "$reclaim_candidate" "$reclaim_marker" 2>/dev/null; then
-					rm -f "$reclaim_candidate" 2>/dev/null || true
-					current_pid=''
-					[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r current_pid <"$LOCK_DIR/pid" || current_pid=''
-					if [[ "$current_pid" == "$owner_pid" ]] && pid_is_confirmed_nonexistent "$current_pid"; then
-						quarantine="$REGISTRY_DIR/.lock.reclaimed.$$.$attempt"
-						if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
-							rm -f "$quarantine/pid" 2>/dev/null || true
-							rm -f "$quarantine/.reclaim" 2>/dev/null || true
-							rmdir "$quarantine" 2>/dev/null || true
-							continue
-						fi
-					fi
-					rm -f "$reclaim_marker" 2>/dev/null || true
-				else
-					rm -f "$reclaim_candidate" 2>/dev/null || true
-					remove_stale_reclaim_marker "$reclaim_marker" "$attempt" || true
-				fi
-			fi
-			;;
-		esac
-		attempt=$((attempt + 1))
-		[[ "$attempt" -lt 50 ]] || die "$EXIT_LOCK" "registry lock is busy: $LOCK_DIR. Inspect its owner and remove only a confirmed-stale lock."
-		sleep 0.1
-	done
-	LOCK_HELD=1
-	printf '%s\n' "$$" >"$LOCK_DIR/pid" || die "$EXIT_FILESYSTEM" "cannot record registry lock owner: $LOCK_DIR/pid."
-	trap release_lock EXIT
-	trap 'exit 130' INT
-	trap 'exit 143' TERM
+descendant_state_is_confirmed_clean() {
+	local task_id="$1"
+	local token="$2"
+	local state_path
+	state_path="$(descendant_state_path "$task_id" "$token")"
+	[[ -f "$state_path" && ! -L "$state_path" ]] || return 1
+	jq -e '
+    .status == "clean"
+    and (.root_pid | type == "number" and . > 0 and floor == .)
+    and (.pids | type == "array")
+    and all(.pids[]; type == "number" and . > 0 and floor == .)
+  ' "$state_path" >/dev/null 2>&1
 }
+
+# shellcheck source=registry-lock.sh
+source "$SCRIPT_DIR/registry-lock.sh"
 
 resolve_registry() {
 	REGISTRY_PATH="$($INIT_SCRIPT --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" --existing-path)" || exit $?
@@ -575,6 +522,7 @@ command_child_registration() {
 		;;
 	clear-child)
 		process_group_is_confirmed_empty "$child_pgid" || die "$EXIT_CONFLICT" "Codex process group $child_pgid is not confirmed empty for task $task_id."
+		descendant_state_is_confirmed_clean "$task_id" "$token" || die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the full process tree stopped for task $task_id."
 		jq -e --arg task_id "$task_id" --arg token "$token" --arg child_pgid "$child_pgid" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token and .active_child_pgid == $child_pgid)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own child process group $child_pgid for task $task_id."
 		atomic_write '.workers |= map(if .task_id == $task_id then .active_child_pgid = null else . end)' --arg task_id "$task_id"
 		;;
@@ -668,9 +616,14 @@ command_complete_and_retire() {
 		fi
 	fi
 	local active_child_pgid
+	local stored_invocation_token
 	active_child_pgid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .active_child_pgid // empty' "$REGISTRY_PATH")"
 	if [[ -n "$active_child_pgid" ]] && ! process_group_is_confirmed_empty "$active_child_pgid"; then
 		die "$EXIT_CONFLICT" "Codex process group $active_child_pgid remains live for task $task_id; stop and verify that group before retirement."
+	fi
+	stored_invocation_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
+	if [[ -n "$stored_invocation_token" && -e "$(descendant_state_path "$task_id" "$stored_invocation_token")" ]] && ! descendant_state_is_confirmed_clean "$task_id" "$stored_invocation_token"; then
+		die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the full process tree stopped for task $task_id; stop and verify it before retirement."
 	fi
 	local timestamp
 	timestamp="$(now_utc)"
