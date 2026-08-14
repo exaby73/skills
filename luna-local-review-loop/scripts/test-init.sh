@@ -17,7 +17,18 @@ fail() {
 }
 
 file_mode() {
-  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+  local file_path="$1"
+  local mode
+
+  if mode="$(stat -f '%Lp' "$file_path" 2>/dev/null)"; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  if mode="$(stat -c '%a' "$file_path" 2>/dev/null)"; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  return 1
 }
 
 readonly REPO_ROOT="$TEMP_ROOT/repository"
@@ -72,5 +83,47 @@ for expected_mode in 444 600 640 755; do
   [[ "$(awk '$0 == ".agents/agent-registry/" { count += 1 } END { print count + 0 }' "$REPO_ROOT/.gitignore")" == '1' ]] || fail 'idempotent init did not deduplicate the registry ignore entry'
 done
 [[ "$(wc -l < "$NPM_LOG" | tr -d ' ')" == '2' ]] || fail 'idempotent init reinstalled existing dependencies'
+
+cat > "$FAKE_BIN/stat" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  -f)
+    printf '%s\n' 'Filesystem report from failed GNU-style BSD probe' 'blocks available'
+    exit 1
+    ;;
+  -c)
+    [[ "${2:-}" == '%a' ]] || exit 64
+    printf '%s\n' "${FAKE_STAT_MODE:?}"
+    ;;
+  *)
+    printf 'unexpected stat argv: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+EOF
+chmod 0755 "$FAKE_BIN/stat"
+chmod 0640 "$REPO_ROOT/.gitignore"
+printf '%s\n' 'existing-entry' '.agents/agent-registry/' > "$REPO_ROOT/.gitignore"
+FAKE_STAT_MODE=640 PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" >/dev/null || fail 'init failed after failed BSD stat probe output'
+[[ "$(FAKE_STAT_MODE=640 PATH="$FAKE_BIN:$PATH" file_mode "$REPO_ROOT/.gitignore")" == '640' ]] || fail 'failed BSD stat probe output leaked into captured mode'
+[[ "$(file_mode "$REPO_ROOT/.gitignore")" == '640' ]] || fail 'existing .gitignore mode was not preserved after failed BSD stat probe'
+
+readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
+readonly UPDATE_TASK_ID='test-init-bound-active'
+readonly UPDATE_TASK_SCOPE='test-init bound to active transition'
+readonly UPDATE_SESSION_ID='test-init-session'
+readonly UPDATE_HANDLE='test-init-handle'
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --scope "$UPDATE_TASK_SCOPE" >/dev/null || fail 'could not reserve update regression worker'
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" >/dev/null || fail 'could not bind update regression worker'
+"$REGISTRY_SCRIPT" update --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --status active >/dev/null || fail 'bound to active update failed'
+
+activated_at="$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .activated_at' "$REPO_ROOT/.agents/agent-registry/registry.json")"
+[[ -n "$activated_at" && "$activated_at" != 'null' ]] || fail 'bound to active update did not set activated_at'
+"$REGISTRY_SCRIPT" update --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --status active >/dev/null || fail 'active to active update failed'
+[[ "$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .activated_at' "$REPO_ROOT/.agents/agent-registry/registry.json")" == "$activated_at" ]] || fail 'active update overwrote activated_at'
+"$REGISTRY_SCRIPT" retire --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --evidence 'test cleanup' >/dev/null || fail 'could not retire update regression worker'
 
 printf 'test-init: PASS\n'

@@ -237,6 +237,21 @@ now_utc() {
   printf '%s' "$timestamp"
 }
 
+file_mode() {
+  local file_path="$1"
+  local mode
+
+  if mode="$(stat -f '%Lp' "$file_path" 2>/dev/null)"; then
+    printf '%s\n' "$mode"
+    return "$EXIT_OK"
+  fi
+  if mode="$(stat -c '%a' "$file_path" 2>/dev/null)"; then
+    printf '%s\n' "$mode"
+    return "$EXIT_OK"
+  fi
+  return 1
+}
+
 release_lock() {
   if [[ "$LOCK_HELD" -eq 1 ]]; then
     rm -f "$LOCK_DIR/pid" 2>/dev/null || true
@@ -300,7 +315,7 @@ ensure_gitignore_entry() {
   fi
 
   if [[ -f "$gitignore_path" ]]; then
-    gitignore_mode="$(stat -f '%Lp' "$gitignore_path" 2>/dev/null || stat -c '%a' "$gitignore_path" 2>/dev/null)" || die "$EXIT_FILESYSTEM" "cannot read repository .gitignore mode: $gitignore_path. Check permissions and rerun init."
+    gitignore_mode="$(file_mode "$gitignore_path")" || die "$EXIT_FILESYSTEM" "cannot read repository .gitignore mode: $gitignore_path. Check permissions and rerun init."
     [[ -n "$gitignore_mode" ]] || die "$EXIT_FILESYSTEM" "repository .gitignore mode is empty: $gitignore_path. Check the filesystem and rerun init."
   fi
 
