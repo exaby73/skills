@@ -46,8 +46,8 @@ readonly TRANSITION_SCHEMA_FILTER='
       and (.status == "reserved" or .status == "bound" or .status == "active")
       and (($worker.invocation_pid == null and $worker.invocation_token == null)
            or (($worker.invocation_pid | nonempty) and ($worker.invocation_token | nonempty)))
-      and (($worker.active_child_pid == null)
-           or (($worker.active_child_pid | nonempty) and ($worker.invocation_pid | nonempty) and ($worker.invocation_token | nonempty)))
+      and (($worker.active_child_pgid == null)
+           or (($worker.active_child_pgid | nonempty) and ($worker.invocation_pid | nonempty) and ($worker.invocation_token | nonempty)))
       and any($root.identity_ledger[];
         .task_id == $worker.task_id
         and .scope == $worker.scope
@@ -69,6 +69,7 @@ readonly TRANSITION_SCHEMA_FILTER='
       end
   )
   and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
+  and (([$root.workers[].scope] | length) == ([$root.workers[].scope] | unique | length))
   and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
   and (([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | length) == ([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | unique | length))
 '
@@ -84,8 +85,8 @@ Usage:
   registry.sh checkpoint --task-id ID --evidence TEXT [--repo PATH] [--state-root PATH]
   registry.sh claim-invocation --task-id ID --pid PID --token TOKEN [--require-status active] [--repo PATH] [--state-root PATH]
   registry.sh release-invocation --task-id ID --token TOKEN [--repo PATH] [--state-root PATH]
-  registry.sh record-child --task-id ID --pid PID --token TOKEN [--repo PATH] [--state-root PATH]
-  registry.sh clear-child --task-id ID --pid PID --token TOKEN [--repo PATH] [--state-root PATH]
+  registry.sh record-child --task-id ID --pgid PGID --token TOKEN [--repo PATH] [--state-root PATH]
+  registry.sh clear-child --task-id ID --pgid PGID --token TOKEN [--repo PATH] [--state-root PATH]
   registry.sh complete-and-retire --task-id ID --status completed|failed|blocked|interrupted --evidence TEXT [--invocation-token TOKEN] [--repo PATH] [--state-root PATH]
   registry.sh query --task-id ID [--repo PATH] [--state-root PATH]
   registry.sh active [--repo PATH] [--state-root PATH]
@@ -142,10 +143,39 @@ pid_is_confirmed_nonexistent() {
 	esac
 }
 
+process_group_is_confirmed_empty() {
+	local pgid="$1"
+	local live_count=''
+	case "$pgid" in '' | 0 | *[!0-9]*) return 1 ;; esac
+	live_count="$(ps -ax -o pgid=,stat= 2>/dev/null | awk -v target="$pgid" '$1 == target && $2 !~ /^Z/ {count++} END {print count + 0}')" || return 1
+	[[ "$live_count" -eq 0 ]]
+}
+
+remove_stale_reclaim_marker() {
+	local marker="$1"
+	local attempt="$2"
+	local marker_pid=''
+	local witness="$REGISTRY_DIR/.reclaim-observed.$$.$attempt"
+
+	[[ -e "$marker" ]] || return 0
+	[[ -f "$marker" && ! -L "$marker" ]] || return 1
+	IFS= read -r marker_pid <"$marker" || marker_pid=''
+	case "$marker_pid" in '' | 0 | *[!0-9]*) return 1 ;; esac
+	pid_is_confirmed_nonexistent "$marker_pid" || return 1
+	rm -f "$witness"
+	if ln "$marker" "$witness" 2>/dev/null; then
+		if [[ "$marker" -ef "$witness" ]]; then
+			rm -f "$marker" 2>/dev/null || true
+		fi
+		rm -f "$witness" 2>/dev/null || true
+	fi
+}
+
 acquire_lock() {
 	local attempt=0
 	local owner_pid=''
 	local current_pid=''
+	local reclaim_candidate=''
 	local reclaim_marker=''
 	local quarantine=''
 	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
@@ -156,19 +186,25 @@ acquire_lock() {
 		*)
 			if pid_is_confirmed_nonexistent "$owner_pid"; then
 				reclaim_marker="$LOCK_DIR/.reclaim"
-				if mkdir "$reclaim_marker" 2>/dev/null; then
+				reclaim_candidate="$REGISTRY_DIR/.reclaim-candidate.$$.$attempt"
+				printf '%s\n' "$$" >"$reclaim_candidate" || die "$EXIT_FILESYSTEM" "cannot create registry-lock reclaim candidate: $reclaim_candidate."
+				if ln "$reclaim_candidate" "$reclaim_marker" 2>/dev/null; then
+					rm -f "$reclaim_candidate" 2>/dev/null || true
 					current_pid=''
 					[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r current_pid <"$LOCK_DIR/pid" || current_pid=''
 					if [[ "$current_pid" == "$owner_pid" ]] && pid_is_confirmed_nonexistent "$current_pid"; then
 						quarantine="$REGISTRY_DIR/.lock.reclaimed.$$.$attempt"
 						if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
 							rm -f "$quarantine/pid" 2>/dev/null || true
-							rmdir "$quarantine/.reclaim" 2>/dev/null || true
+							rm -f "$quarantine/.reclaim" 2>/dev/null || true
 							rmdir "$quarantine" 2>/dev/null || true
 							continue
 						fi
 					fi
-					rmdir "$reclaim_marker" 2>/dev/null || true
+					rm -f "$reclaim_marker" 2>/dev/null || true
+				else
+					rm -f "$reclaim_candidate" 2>/dev/null || true
+					remove_stale_reclaim_marker "$reclaim_marker" "$attempt" || true
 				fi
 			fi
 			;;
@@ -324,7 +360,7 @@ command_reserve() {
 	atomic_write '
     .updated_at = $timestamp
     | .identity_ledger += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", reserved_at: $timestamp, bound_at: null, activated_at: null, terminal_at: null, retired_at: null, terminal_status: null, terminal_evidence: ""}]
-    | .workers += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: (($owner_pid | select(length > 0)) // null), invocation_token: (($token | select(length > 0)) // null), active_child_pid: null}]
+    | .workers += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: (($owner_pid | select(length > 0)) // null), invocation_token: (($token | select(length > 0)) // null), active_child_pgid: null}]
   ' --arg task_id "$task_id" --arg scope "$scope" --arg sandbox "$sandbox" --arg retry_of "${retry_of:-}" --arg owner_pid "${owner_pid:-}" --arg token "${token:-}" --arg timestamp "$timestamp"
 	printf 'Reserved task=%s\n' "$task_id"
 }
@@ -479,22 +515,22 @@ command_claim_invocation() {
 	fi
 	current_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_pid // empty' "$REGISTRY_PATH")"
 	current_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
-	current_child_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .active_child_pid // empty' "$REGISTRY_PATH")"
+	current_child_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .active_child_pgid // empty' "$REGISTRY_PATH")"
 	if [[ -n "$current_pid" ]]; then
 		if [[ "$current_pid" == "$owner_pid" && "$current_token" == "$token" ]]; then
 			printf 'Invocation already claimed task=%s token=%s\n' "$task_id" "$token"
 			return "$EXIT_OK"
 		fi
 		pid_is_confirmed_nonexistent "$current_pid" || die "$EXIT_CONFLICT" "another invocation already owns task $task_id with live PID $current_pid."
-		if [[ -n "$current_child_pid" ]] && ! pid_is_confirmed_nonexistent "$current_child_pid"; then
-			die "$EXIT_CONFLICT" "Codex child PID $current_child_pid remains live for task $task_id; stop and verify that child before reclaiming the invocation."
+		if [[ -n "$current_child_pid" ]] && ! process_group_is_confirmed_empty "$current_child_pid"; then
+			die "$EXIT_CONFLICT" "Codex process group $current_child_pid remains live for task $task_id; stop and verify that group before reclaiming the invocation."
 		fi
 	fi
 	local timestamp
 	timestamp="$(now_utc)"
 	atomic_write '
     .updated_at = $timestamp
-    | .workers |= map(if .task_id == $task_id then .invocation_pid = $owner_pid | .invocation_token = $token | .active_child_pid = null | .updated_at = $timestamp else . end)
+    | .workers |= map(if .task_id == $task_id then .invocation_pid = $owner_pid | .invocation_token = $token | .active_child_pgid = null | .updated_at = $timestamp else . end)
   ' --arg task_id "$task_id" --arg owner_pid "$owner_pid" --arg token "$token" --arg timestamp "$timestamp"
 	printf 'Claimed invocation task=%s token=%s\n' "$task_id" "$token"
 }
@@ -503,7 +539,7 @@ command_child_registration() {
 	local mode="$1"
 	shift
 	local task_id=''
-	local child_pid=''
+	local child_pgid=''
 	local token=''
 	while [[ $# -gt 0 ]]; do
 		if parse_common "$@"; then
@@ -515,8 +551,8 @@ command_child_registration() {
 			task_id="${2:-}"
 			shift 2
 			;;
-		--pid)
-			child_pid="${2:-}"
+		--pgid)
+			child_pgid="${2:-}"
 			shift 2
 			;;
 		--token)
@@ -526,23 +562,24 @@ command_child_registration() {
 		*) die "$EXIT_USAGE" "unknown $mode argument: $1." ;;
 		esac
 	done
-	[[ -n "$task_id" && -n "$child_pid" && -n "$token" ]] || die "$EXIT_USAGE" "$mode requires --task-id, --pid, and --token."
+	[[ -n "$task_id" && -n "$child_pgid" && -n "$token" ]] || die "$EXIT_USAGE" "$mode requires --task-id, --pgid, and --token."
 	validate_identity 'task-id' "$task_id"
 	validate_identity 'invocation-token' "$token"
-	case "$child_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "child PID must be a positive integer: $child_pid." ;; esac
+	case "$child_pgid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "child process-group ID must be a positive integer: $child_pgid." ;; esac
 	resolve_registry
 	acquire_lock
 	case "$mode" in
 	record-child)
-		jq -e --arg task_id "$task_id" --arg token "$token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token and .active_child_pid == null)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token cannot register a child for task $task_id."
-		atomic_write '.workers |= map(if .task_id == $task_id then .active_child_pid = $child_pid else . end)' --arg task_id "$task_id" --arg child_pid "$child_pid"
+		jq -e --arg task_id "$task_id" --arg token "$token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token and .active_child_pgid == null)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token cannot register a child process group for task $task_id."
+		atomic_write '.workers |= map(if .task_id == $task_id then .active_child_pgid = $child_pgid else . end)' --arg task_id "$task_id" --arg child_pgid "$child_pgid"
 		;;
 	clear-child)
-		jq -e --arg task_id "$task_id" --arg token "$token" --arg child_pid "$child_pid" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token and .active_child_pid == $child_pid)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own child PID $child_pid for task $task_id."
-		atomic_write '.workers |= map(if .task_id == $task_id then .active_child_pid = null else . end)' --arg task_id "$task_id"
+		process_group_is_confirmed_empty "$child_pgid" || die "$EXIT_CONFLICT" "Codex process group $child_pgid is not confirmed empty for task $task_id."
+		jq -e --arg task_id "$task_id" --arg token "$token" --arg child_pgid "$child_pgid" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token and .active_child_pgid == $child_pgid)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own child process group $child_pgid for task $task_id."
+		atomic_write '.workers |= map(if .task_id == $task_id then .active_child_pgid = null else . end)' --arg task_id "$task_id"
 		;;
 	esac
-	printf '%s task=%s child=%s\n' "$mode" "$task_id" "$child_pid"
+	printf '%s task=%s process-group=%s\n' "$mode" "$task_id" "$child_pgid"
 }
 
 command_release_invocation() {
@@ -570,7 +607,7 @@ command_release_invocation() {
 	validate_identity 'invocation-token' "$token"
 	resolve_registry
 	acquire_lock
-	jq -e --arg task_id "$task_id" --arg token "$token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token and .active_child_pid == null)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own an idle live task $task_id."
+	jq -e --arg task_id "$task_id" --arg token "$token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token and .active_child_pgid == null)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own an idle live task $task_id."
 	local timestamp
 	timestamp="$(now_utc)"
 	atomic_write '
@@ -616,6 +653,10 @@ command_complete_and_retire() {
 	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
 	acquire_lock
+	if [[ "$status" == completed ]]; then
+		[[ -n "$invocation_token" ]] || die "$EXIT_CONFLICT" 'completed retirement requires the token-owning active runner and a validated structured result.'
+		jq -e --arg task_id "$task_id" --arg token "$invocation_token" 'any(.workers[]; .task_id == $task_id and .status == "active" and .invocation_token == $token)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "completed retirement requires the token-owning active runner for task $task_id."
+	fi
 	if [[ -n "$invocation_token" ]]; then
 		jq -e --arg task_id "$task_id" --arg token "$invocation_token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own live task $task_id."
 	else
@@ -626,10 +667,10 @@ command_complete_and_retire() {
 			die "$EXIT_CONFLICT" "invocation PID $invocation_pid remains live for task $task_id; use its invocation token or stop and verify that owner before retirement."
 		fi
 	fi
-	local active_child_pid
-	active_child_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .active_child_pid // empty' "$REGISTRY_PATH")"
-	if [[ -n "$active_child_pid" ]] && ! pid_is_confirmed_nonexistent "$active_child_pid"; then
-		die "$EXIT_CONFLICT" "Codex child PID $active_child_pid remains live for task $task_id; stop and verify that child before retirement."
+	local active_child_pgid
+	active_child_pgid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .active_child_pgid // empty' "$REGISTRY_PATH")"
+	if [[ -n "$active_child_pgid" ]] && ! process_group_is_confirmed_empty "$active_child_pgid"; then
+		die "$EXIT_CONFLICT" "Codex process group $active_child_pgid remains live for task $task_id; stop and verify that group before retirement."
 	fi
 	local timestamp
 	timestamp="$(now_utc)"

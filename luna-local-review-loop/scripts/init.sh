@@ -22,6 +22,7 @@ REGISTRY_PATH=''
 LOCK_DIR=''
 LEGACY_REGISTRY_PATH=''
 LOCK_HELD=0
+ALLOW_INSTANCE_MARKER_CREATE=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
@@ -73,13 +74,14 @@ readonly SCHEMA_FILTER='
         and (.checkpoint_evidence | type == "string")
         and ((.invocation_pid == null and .invocation_token == null)
              or ((.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
-        and ((.active_child_pid == null)
-             or ((.active_child_pid | nonempty_string) and (.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
+        and ((.active_child_pgid == null)
+             or ((.active_child_pgid | nonempty_string) and (.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
       and (([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | length) == ([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | unique | length))
       and (([$root.workers[].task_id] | length) == ([$root.workers[].task_id] | unique | length))
+      and (([$root.workers[].scope] | length) == ([$root.workers[].scope] | unique | length))
       and (([$root.workers[] | select(.session_id != null) | .session_id] | length) == ([$root.workers[] | select(.session_id != null) | .session_id] | unique | length))
       and all($root.identity_ledger[];
         . as $row
@@ -147,9 +149,9 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq mkdir rm rmdir mv kill ps sleep awk shasum stat cat)
+	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
-		required_commands+=(mktemp date chmod)
+		required_commands+=(mktemp date chmod od tr)
 	fi
 
 	for command_name in "${required_commands[@]}"; do
@@ -175,7 +177,6 @@ resolve_paths() {
 	candidate="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate."
 	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
-	REPO_IDENTITY="$(repository_instance_identity)" || die "$EXIT_REPOSITORY" "cannot derive repository instance identity: $REPO_ROOT."
 	LEGACY_REGISTRY_PATH="$REPO_ROOT/.agents/agent-registry/registry.json"
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
 	case "$state_candidate/" in
@@ -186,6 +187,7 @@ resolve_paths() {
 	registry_candidate="$state_candidate/$repo_fingerprint/registry.json"
 	if [[ "$EXISTING_ONLY" -eq 0 && ! -e "$registry_candidate" ]]; then
 		refuse_live_legacy_registry
+		ALLOW_INSTANCE_MARKER_CREATE=1
 	fi
 	if [[ "$EXISTING_ONLY" -eq 1 ]]; then
 		[[ -d "$STATE_ROOT_INPUT" ]] || die "$EXIT_FILESYSTEM" "state root does not exist: $STATE_ROOT_INPUT."
@@ -203,20 +205,27 @@ resolve_paths() {
 }
 
 repository_instance_identity() {
+	local allow_create="$1"
 	local git_dir
 	local git_dir_real
-	local filesystem_identity=''
+	local marker_path
+	local nonce=''
 	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
 	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
-	if filesystem_identity="$(stat -f '%d:%i:%B' "$git_dir_real" 2>/dev/null)"; then
-		:
-	elif filesystem_identity="$(stat -c '%d:%i:%W' "$git_dir_real" 2>/dev/null)"; then
-		:
-	else
-		return 1
+	marker_path="$git_dir_real/luna-local-review-loop.instance"
+	[[ ! -L "$marker_path" ]] || return 1
+	if [[ ! -e "$marker_path" ]]; then
+		[[ "$allow_create" -eq 1 ]] || return 1
+		nonce="$(od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
+		[[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
+		if ! (set -o noclobber; printf '%s\n' "$nonce" >"$marker_path") 2>/dev/null; then
+			[[ -f "$marker_path" && ! -L "$marker_path" ]] || return 1
+		fi
 	fi
-	[[ -n "$filesystem_identity" ]] || return 1
-	printf '%s' "$git_dir_real:$filesystem_identity" | shasum -a 256 | awk '{print $1}'
+	[[ -f "$marker_path" && ! -L "$marker_path" ]] || return 1
+	IFS= read -r nonce <"$marker_path" || return 1
+	[[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s' "$git_dir_real:$nonce" | shasum -a 256 | awk '{print $1}'
 }
 
 refuse_live_legacy_registry() {
@@ -348,10 +357,31 @@ pid_is_confirmed_nonexistent() {
 	esac
 }
 
+remove_stale_reclaim_marker() {
+	local marker="$1"
+	local attempt="$2"
+	local marker_pid=''
+	local witness="$REGISTRY_DIR/.reclaim-observed.$$.$attempt"
+
+	[[ -e "$marker" ]] || return 0
+	[[ -f "$marker" && ! -L "$marker" ]] || return 1
+	IFS= read -r marker_pid <"$marker" || marker_pid=''
+	case "$marker_pid" in '' | 0 | *[!0-9]*) return 1 ;; esac
+	pid_is_confirmed_nonexistent "$marker_pid" || return 1
+	rm -f "$witness"
+	if ln "$marker" "$witness" 2>/dev/null; then
+		if [[ "$marker" -ef "$witness" ]]; then
+			rm -f "$marker" 2>/dev/null || true
+		fi
+		rm -f "$witness" 2>/dev/null || true
+	fi
+}
+
 acquire_lock() {
 	local attempt=0
 	local owner_pid=''
 	local current_pid=''
+	local reclaim_candidate=''
 	local reclaim_marker=''
 	local quarantine=''
 
@@ -368,19 +398,25 @@ acquire_lock() {
 		*)
 			if pid_is_confirmed_nonexistent "$owner_pid"; then
 				reclaim_marker="$LOCK_DIR/.reclaim"
-				if mkdir "$reclaim_marker" 2>/dev/null; then
+				reclaim_candidate="$REGISTRY_DIR/.reclaim-candidate.$$.$attempt"
+				printf '%s\n' "$$" >"$reclaim_candidate" || die "$EXIT_FILESYSTEM" "cannot create registry-lock reclaim candidate: $reclaim_candidate."
+				if ln "$reclaim_candidate" "$reclaim_marker" 2>/dev/null; then
+					rm -f "$reclaim_candidate" 2>/dev/null || true
 					current_pid=''
 					[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r current_pid <"$LOCK_DIR/pid" || current_pid=''
 					if [[ "$current_pid" == "$owner_pid" ]] && pid_is_confirmed_nonexistent "$current_pid"; then
 						quarantine="$REGISTRY_DIR/.lock.reclaimed.$$.$attempt"
 						if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
 							rm -f "$quarantine/pid" 2>/dev/null || true
-							rmdir "$quarantine/.reclaim" 2>/dev/null || true
+							rm -f "$quarantine/.reclaim" 2>/dev/null || true
 							rmdir "$quarantine" 2>/dev/null || true
 							continue
 						fi
 					fi
-					rmdir "$reclaim_marker" 2>/dev/null || true
+					rm -f "$reclaim_marker" 2>/dev/null || true
+				else
+					rm -f "$reclaim_candidate" 2>/dev/null || true
+					remove_stale_reclaim_marker "$reclaim_marker" "$attempt" || true
 				fi
 			fi
 			;;
@@ -444,6 +480,7 @@ resolve_paths
 if [[ "$EXISTING_ONLY" -eq 0 ]]; then
 	require_project_skills
 fi
+REPO_IDENTITY="$(repository_instance_identity "$ALLOW_INSTANCE_MARKER_CREATE")" || die "$EXIT_REPOSITORY" "cannot read or safely create the Git-directory instance marker for $REPO_ROOT. This may be a different Git repository instance at the same path; preserve external state and inspect the repository before retrying."
 acquire_lock
 if [[ -e "$REGISTRY_PATH" ]]; then
 	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "registry is not a regular file: $REGISTRY_PATH."

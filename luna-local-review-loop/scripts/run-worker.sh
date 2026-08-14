@@ -29,6 +29,7 @@ SESSION_ID=''
 INVOCATION_TOKEN=''
 INVOCATION_CLAIMED=0
 ACTIVE_CODEX_PID=''
+ACTIVE_CODEX_PGID=''
 ACTIVE_HELPER_PID=''
 
 usage() {
@@ -102,16 +103,50 @@ release_invocation() {
 stop_active_child_and_exit() {
 	local signal_name="$1"
 	local exit_code="$2"
-	local child_pid
-	for child_pid in "$ACTIVE_HELPER_PID" "$ACTIVE_CODEX_PID"; do
-		if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
-			kill -s "$signal_name" "$child_pid" 2>/dev/null || true
-			wait "$child_pid" 2>/dev/null || true
-		fi
-	done
+	if [[ -n "$ACTIVE_HELPER_PID" ]] && kill -0 "$ACTIVE_HELPER_PID" 2>/dev/null; then
+		kill -s "$signal_name" "$ACTIVE_HELPER_PID" 2>/dev/null || true
+		wait "$ACTIVE_HELPER_PID" 2>/dev/null || true
+	fi
+	stop_codex_process_group "$signal_name" || true
 	ACTIVE_HELPER_PID=''
 	ACTIVE_CODEX_PID=''
+	ACTIVE_CODEX_PGID=''
 	exit "$exit_code"
+}
+
+process_group_is_empty() {
+	local pgid="$1"
+	local live_count=''
+	case "$pgid" in '' | 0 | *[!0-9]*) return 1 ;; esac
+	live_count="$(ps -ax -o pgid=,stat= 2>/dev/null | awk -v target="$pgid" '$1 == target && $2 !~ /^Z/ {count++} END {print count + 0}')" || return 1
+	[[ "$live_count" -eq 0 ]]
+}
+
+wait_for_process_group_exit() {
+	local pgid="$1"
+	local attempt=0
+	while ! process_group_is_empty "$pgid" && [[ "$attempt" -lt 50 ]]; do
+		sleep 0.05
+		attempt=$((attempt + 1))
+	done
+	process_group_is_empty "$pgid"
+}
+
+stop_codex_process_group() {
+	local signal_name="$1"
+	local pgid="$ACTIVE_CODEX_PGID"
+	local leader_pid="$ACTIVE_CODEX_PID"
+	[[ -n "$pgid" ]] || return 0
+	if ! process_group_is_empty "$pgid"; then
+		kill -s "$signal_name" -- "-$pgid" 2>/dev/null || true
+		if ! wait_for_process_group_exit "$pgid"; then
+			kill -KILL -- "-$pgid" 2>/dev/null || true
+			wait_for_process_group_exit "$pgid" || return 1
+		fi
+	fi
+	[[ -z "$leader_pid" ]] || wait "$leader_pid" 2>/dev/null || true
+	ACTIVE_CODEX_PID=''
+	ACTIVE_CODEX_PGID=''
 }
 
 wait_for_helper() {
@@ -174,7 +209,9 @@ run_gated_codex() {
 	local parent_pid="$$"
 	local child_status=0
 	local child_pid
+	local child_pgid
 	rm -f "$gate_path"
+	set -m
 	(
 		while [[ ! -f "$gate_path" ]]; do
 			kill -0 "$parent_pid" 2>/dev/null || exit 125
@@ -183,30 +220,41 @@ run_gated_codex() {
 		if [[ -n "$stdin_path" ]]; then
 			exec "$@" <"$stdin_path"
 		else
-			exec "$@"
+			exec "$@" </dev/null
 		fi
 	) >"$stream_log" 2>"$stream_stderr" &
+	set +m
 	ACTIVE_CODEX_PID=$!
 	child_pid="$ACTIVE_CODEX_PID"
-	if ! run_registry_quiet record-child --task-id "$TASK_ID" --pid "$child_pid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
+	child_pgid="$(ps -p "$child_pid" -o pgid= 2>/dev/null | awk 'NF {print $1; exit}')"
+	ACTIVE_CODEX_PGID="$child_pgid"
+	if [[ "$child_pgid" != "$child_pid" ]]; then
 		kill -TERM "$child_pid" 2>/dev/null || true
 		wait "$child_pid" 2>/dev/null || true
 		ACTIVE_CODEX_PID=''
+		ACTIVE_CODEX_PGID=''
+		return 1
+	fi
+	if ! run_registry_quiet record-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
+		stop_codex_process_group TERM || true
 		return 1
 	fi
 	if ! : >"$gate_path"; then
-		kill -TERM "$child_pid" 2>/dev/null || true
-		wait "$child_pid" 2>/dev/null || true
-		ACTIVE_CODEX_PID=''
+		stop_codex_process_group TERM || true
 		return 1
 	fi
 	wait "$child_pid" || child_status=$?
+	ACTIVE_CODEX_PID=''
 	rm -f "$gate_path"
-	if ! run_registry_quiet clear-child --task-id "$TASK_ID" --pid "$child_pid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
-		ACTIVE_CODEX_PID=''
+	if ! process_group_is_empty "$child_pgid"; then
+		ACTIVE_CODEX_PGID="$child_pgid"
+		stop_codex_process_group TERM || return 1
+	fi
+	if ! run_registry_quiet clear-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
+		ACTIVE_CODEX_PGID=''
 		return 1
 	fi
-	ACTIVE_CODEX_PID=''
+	ACTIVE_CODEX_PGID=''
 	return "$child_status"
 }
 
