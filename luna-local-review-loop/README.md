@@ -42,7 +42,7 @@ Print it with:
 ./luna-local-review-loop/scripts/registry.sh path --repo /absolute/path/to/repository
 ```
 
-Init is validation-only and idempotent. It does not edit the target repository. When required project skills are missing, it prints the explicit universal-target install commands. Run those only as a separate, intentional project change.
+Init is validation-only and idempotent. It physically resolves existing path components before normalizing missing suffixes, rejects repository-local state before creation, and rejects a symlinked repository-fingerprint directory before chmod or write. It does not edit the target repository. When required project skills are missing, it prints the explicit universal-target install commands. Run those only as a separate, intentional project change.
 
 Before creating external state, init checks the previous project-local schema-v1 registry path. If that registry still contains a reserved, bound, active, or stopping worker, init refuses to continue and prints recovery instructions. Recover and retire those workers with the previous skill version first; the new version never silently abandons live legacy state.
 
@@ -84,7 +84,7 @@ scripts/run-worker.sh launch \
 
 This single command performs:
 
-1. reserve immutable task and scope;
+1. atomically reserve immutable task/scope and claim the initial invocation;
 2. non-ephemeral handshake with Luna Max;
 3. extract and bind `thread.started.thread_id`;
 4. activate exact task/session;
@@ -111,6 +111,8 @@ scripts/run-worker.sh finish \
   --evidence 'parent terminated failed invocation'
 ```
 
+Explicit finish accepts only `failed`, `blocked`, or `interrupted`; a completed task must come from a validated structured result. Because finish mutates only registry state, it remains usable when the worker never created artifacts or external artifacts were removed.
+
 Retry a failed/interrupted exact scope:
 
 ```sh
@@ -133,14 +135,14 @@ scripts/run-worker.sh launch \
 - `unresolved`: remaining limitations;
 - `parentAction`: a non-empty exact action for `needs_parent_action`; `null` for terminal outcomes.
 
-Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, separate stderr logs, and each final result. A registry-backed invocation claim serializes the first resume, later continuations, and explicit retirement; stale claims are reclaimed under the registry's atomic mutation lock. Runner termination first signals and waits for its Codex child, then retires the task and releases ownership. This prevents concurrent or orphaned session resumes and keeps long streams, repeated diffs, reconnect noise, or unrelated warnings from burying or corrupting the final report.
+Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, separate stderr logs, and each final result. A registry-backed invocation claim serializes the first resume, later continuations, and explicit retirement; the initial claim is stored in the same mutation as reservation. Stale claims are reclaimed under the registry mutation lock, while stale mutation locks are claimed with an in-directory recovery marker and atomically renamed aside so a contender cannot delete a new owner. Runner termination first signals and waits for whichever registry or Codex child is active, then retires the task using its invocation token. This prevents concurrent or orphaned registry transitions and session resumes while keeping long streams, repeated diffs, reconnect noise, or unrelated warnings from burying or corrupting the final report.
 
 ## Low-level registry commands
 
 | Command | Purpose |
 |---|---|
 | `init` / `path` | Validate prerequisites and initialize/print external registry path |
-| `reserve` | Append a fresh immutable task, optionally linked with `--retry-of` |
+| `reserve` | Append a fresh immutable task, optionally linked with `--retry-of` and an atomic initial invocation claim |
 | `bind` | Bind one globally unique Codex session to one reserved task |
 | `activate` | Activate the exact bound task/session |
 | `checkpoint` | Save evidence while keeping a task active |
@@ -176,4 +178,4 @@ Run without network access:
 ./luna-local-review-loop/scripts/test-init.sh
 ```
 
-The test covers non-mutating init, live legacy-registry refusal, external persistent state, single-child retry chains, a fast handshake with no invocation handle, portable artifact counting, atomic stale-claim recovery, serialized exact-session continuation without PTY/EOF, child termination before retirement, strict structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.
+The test covers non-mutating init, symlink-safe external state paths, live legacy-registry refusal, external persistent state, stale mutation-lock contention, single-child retry chains, atomic initial reservation ownership, a fast handshake with no invocation handle, portable artifact counting, atomic stale-claim recovery, serialized exact-session continuation without PTY/EOF, child termination before retirement, strict finish statuses, artifact-independent recovery, structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.

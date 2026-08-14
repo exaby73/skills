@@ -61,13 +61,13 @@ usage() {
 	cat <<'EOF'
 Usage:
   registry.sh init|path [--repo PATH] [--state-root PATH]
-  registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--repo PATH] [--state-root PATH]
+  registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--pid PID --token TOKEN] [--repo PATH] [--state-root PATH]
   registry.sh bind --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
   registry.sh activate --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
   registry.sh checkpoint --task-id ID --evidence TEXT [--repo PATH] [--state-root PATH]
   registry.sh claim-invocation --task-id ID --pid PID --token TOKEN [--repo PATH] [--state-root PATH]
   registry.sh release-invocation --task-id ID --token TOKEN [--repo PATH] [--state-root PATH]
-  registry.sh complete-and-retire --task-id ID --status completed|failed|blocked|interrupted --evidence TEXT [--repo PATH] [--state-root PATH]
+  registry.sh complete-and-retire --task-id ID --status completed|failed|blocked|interrupted --evidence TEXT [--invocation-token TOKEN] [--repo PATH] [--state-root PATH]
   registry.sh query --task-id ID [--repo PATH] [--state-root PATH]
   registry.sh active [--repo PATH] [--state-root PATH]
   registry.sh assert-no-active|assert-empty [--repo PATH] [--state-root PATH]
@@ -117,6 +117,9 @@ pid_is_confirmed_nonexistent() {
 acquire_lock() {
 	local attempt=0
 	local owner_pid=''
+	local current_pid=''
+	local reclaim_marker=''
+	local quarantine=''
 	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
 		owner_pid=''
 		[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r owner_pid <"$LOCK_DIR/pid" || owner_pid=''
@@ -124,9 +127,20 @@ acquire_lock() {
 		'' | 0 | *[!0-9]*) ;;
 		*)
 			if pid_is_confirmed_nonexistent "$owner_pid"; then
-				rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-				if rmdir "$LOCK_DIR" 2>/dev/null; then
-					continue
+				reclaim_marker="$LOCK_DIR/.reclaim"
+				if mkdir "$reclaim_marker" 2>/dev/null; then
+					current_pid=''
+					[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r current_pid <"$LOCK_DIR/pid" || current_pid=''
+					if [[ "$current_pid" == "$owner_pid" ]] && pid_is_confirmed_nonexistent "$current_pid"; then
+						quarantine="$REGISTRY_DIR/.lock.reclaimed.$$.$attempt"
+						if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
+							rm -f "$quarantine/pid" 2>/dev/null || true
+							rmdir "$quarantine/.reclaim" 2>/dev/null || true
+							rmdir "$quarantine" 2>/dev/null || true
+							continue
+						fi
+					fi
+					rmdir "$reclaim_marker" 2>/dev/null || true
 				fi
 			fi
 			;;
@@ -206,6 +220,8 @@ command_reserve() {
 	local task_id=''
 	local scope=''
 	local retry_of=''
+	local owner_pid=''
+	local token=''
 	while [[ $# -gt 0 ]]; do
 		if parse_common "$@"; then
 			shift "$PARSE_SHIFT"
@@ -227,6 +243,14 @@ command_reserve() {
 			retry_of="$2"
 			shift 2
 			;;
+		--pid)
+			owner_pid="${2:-}"
+			shift 2
+			;;
+		--token)
+			token="${2:-}"
+			shift 2
+			;;
 		*) die "$EXIT_USAGE" "unknown reserve argument: $1." ;;
 		esac
 	done
@@ -234,6 +258,11 @@ command_reserve() {
 	validate_identity 'task-id' "$task_id"
 	validate_scope "$scope"
 	[[ -z "$retry_of" ]] || validate_identity 'retry-of' "$retry_of"
+	if [[ -n "$owner_pid" || -n "$token" ]]; then
+		[[ -n "$owner_pid" && -n "$token" ]] || die "$EXIT_USAGE" 'reserve requires both --pid and --token when claiming the initial invocation.'
+		case "$owner_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "invocation PID must be a positive integer: $owner_pid." ;; esac
+		validate_identity 'invocation-token' "$token"
+	fi
 	resolve_registry
 	acquire_lock
 	jq -e --arg task_id "$task_id" 'all(.identity_ledger[]; .task_id != $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "task-id is permanently reserved: $task_id."
@@ -251,8 +280,8 @@ command_reserve() {
 	atomic_write '
     .updated_at = $timestamp
     | .identity_ledger += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", reserved_at: $timestamp, bound_at: null, activated_at: null, terminal_at: null, retired_at: null, terminal_status: null, terminal_evidence: ""}]
-    | .workers += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: null, invocation_token: null}]
-  ' --arg task_id "$task_id" --arg scope "$scope" --arg retry_of "${retry_of:-}" --arg timestamp "$timestamp"
+    | .workers += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: (($owner_pid | select(length > 0)) // null), invocation_token: (($token | select(length > 0)) // null)}]
+  ' --arg task_id "$task_id" --arg scope "$scope" --arg retry_of "${retry_of:-}" --arg owner_pid "${owner_pid:-}" --arg token "${token:-}" --arg timestamp "$timestamp"
 	printf 'Reserved task=%s\n' "$task_id"
 }
 
@@ -451,6 +480,7 @@ command_complete_and_retire() {
 	local task_id=''
 	local status=''
 	local evidence=''
+	local invocation_token=''
 	while [[ $# -gt 0 ]]; do
 		if parse_common "$@"; then
 			shift "$PARSE_SHIFT"
@@ -469,15 +499,24 @@ command_complete_and_retire() {
 			evidence="${2:-}"
 			shift 2
 			;;
+		--invocation-token)
+			invocation_token="${2:-}"
+			shift 2
+			;;
 		*) die "$EXIT_USAGE" "unknown complete-and-retire argument: $1." ;;
 		esac
 	done
 	case "$status" in completed | failed | blocked | interrupted) ;; *) die "$EXIT_USAGE" 'terminal status must be completed, failed, blocked, or interrupted.' ;; esac
 	[[ -n "$task_id" && -n "$evidence" ]] || die "$EXIT_USAGE" 'complete-and-retire requires --task-id, --status, and non-empty --evidence.'
 	validate_identity 'task-id' "$task_id"
+	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
 	acquire_lock
-	jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_NOT_FOUND" "live task not found: $task_id."
+	if [[ -n "$invocation_token" ]]; then
+		jq -e --arg task_id "$task_id" --arg token "$invocation_token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own live task $task_id."
+	else
+		jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_NOT_FOUND" "live task not found: $task_id."
+	fi
 	local timestamp
 	timestamp="$(now_utc)"
 	atomic_write '

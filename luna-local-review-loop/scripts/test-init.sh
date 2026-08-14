@@ -115,6 +115,46 @@ if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$REPO_ROOT/.runtime/luna" >"
 fi
 [[ ! -e "$REPO_ROOT/.runtime" ]] || fail 'init mutated the repository before rejecting an in-project state root'
 
+mkdir -p "$REPO_ROOT/.state-link-target/child"
+ln -s "$REPO_ROOT/.state-link-target/child" "$TEST_ROOT/state-link"
+if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$TEST_ROOT/state-link/../escaped-state" >"$TEST_ROOT/symlink-dotdot.out" 2>&1; then
+	fail 'init accepted a symlink-plus-dotdot state root inside the repository'
+fi
+[[ ! -e "$REPO_ROOT/.state-link-target/escaped-state" ]] || fail 'state-root validation mutated the repository through a symlink-plus-dotdot path'
+rm -f "$TEST_ROOT/state-link"
+rm -rf "$REPO_ROOT/.state-link-target"
+
+fingerprint_state="$TEST_ROOT/fingerprint-state"
+fingerprint_target="$REPO_ROOT/.fingerprint-target"
+repo_real="$(cd -P "$REPO_ROOT" && pwd -P)"
+repo_fingerprint="$(printf '%s' "$repo_real" | shasum -a 256 | awk '{print $1}')"
+mkdir -p "$fingerprint_state" "$fingerprint_target"
+ln -s "$fingerprint_target" "$fingerprint_state/$repo_fingerprint"
+if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$fingerprint_state" >"$TEST_ROOT/fingerprint-symlink.out" 2>&1; then
+	fail 'init accepted a symlinked repository fingerprint directory'
+fi
+[[ ! -e "$fingerprint_target/registry.json" && ! -e "$fingerprint_target/.lock" ]] || fail 'init wrote registry state through a symlinked fingerprint directory'
+rm -f "$fingerprint_state/$repo_fingerprint"
+rm -rf "$fingerprint_target"
+
+registry_dir="$(dirname "$registry_path")"
+sleep 0.01 &
+stale_lock_pid=$!
+wait "$stale_lock_pid"
+mkdir "$registry_dir/.lock"
+printf '%s\n' "$stale_lock_pid" >"$registry_dir/.lock/pid"
+lock_status_a=0
+lock_status_b=0
+"$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/lock-a.out" 2>&1 &
+lock_command_a=$!
+"$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/lock-b.out" 2>&1 &
+lock_command_b=$!
+wait "$lock_command_a" || lock_status_a=$?
+wait "$lock_command_b" || lock_status_b=$?
+[[ "$lock_status_a" -eq 0 && "$lock_status_b" -eq 0 ]] || fail 'registry commands could not serialize stale-lock reclamation'
+jq -e '.schema_version == 2' "$registry_path" >/dev/null || fail 'stale-lock contention corrupted the registry'
+[[ ! -e "$registry_dir/.lock" ]] || fail 'registry lock remained after stale-lock contention'
+
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-launch --scope 'exact retry scope' >/dev/null
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-launch --status failed --evidence 'pre-bind launch failed' >/dev/null
 if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-retry --scope 'exact retry scope' >/dev/null 2>&1; then
@@ -129,6 +169,24 @@ if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --t
 	fail 'retired failed attempt accepted a second retry child'
 fi
 jq -e 'any(.identity_ledger[]; .task_id == "retry-launch" and .retry_of == "failed-launch" and .scope == "exact retry scope")' "$registry_path" >/dev/null || fail 'retry linkage was not recorded'
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --scope 'atomic initial reservation ownership' --pid "$$" --token initial-owner >/dev/null
+if "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --status failed --evidence 'wrong owner' --invocation-token wrong-owner >/dev/null 2>&1; then
+	fail 'a mismatched invocation token retired an owned reservation'
+fi
+jq -e 'any(.workers[]; .task_id == "owned-reservation" and .invocation_token == "initial-owner")' "$registry_path" >/dev/null || fail 'owned reservation was not retained after mismatched cleanup'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --status interrupted --evidence 'ownership test complete' --invocation-token initial-owner >/dev/null
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-finish-status --scope 'reject completed explicit finish' >/dev/null
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-finish-status --status completed --evidence 'must use structured result' >"$TEST_ROOT/invalid-finish.out" 2>&1; then
+	fail 'explicit finish accepted completed status'
+fi
+jq -e 'any(.workers[]; .task_id == "invalid-finish-status" and .status == "reserved" and .invocation_token == null)' "$registry_path" >/dev/null || fail 'invalid finish status mutated the live reservation'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-finish-status --status interrupted --evidence 'invalid finish test complete' >/dev/null
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-artifact-finish --scope 'recover without worker artifacts' >/dev/null
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-artifact-finish --status interrupted --evidence 'artifacts were unavailable' >"$TEST_ROOT/missing-artifact-finish.out"
+jq -e 'any(.identity_ledger[]; .task_id == "missing-artifact-finish" and .status == "retired" and .terminal_status == "interrupted")' "$registry_path" >/dev/null || fail 'registry-only finish could not retire a task without artifacts'
 
 readonly INVALID_CODEX_STATE="$TEST_ROOT/codex-home-file"
 printf '%s\n' 'not a directory' >"$INVALID_CODEX_STATE"

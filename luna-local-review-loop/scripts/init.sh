@@ -125,9 +125,9 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq mkdir rm rmdir kill ps sleep awk shasum cat)
+	local required_commands=(bash git jq mkdir rm rmdir mv kill ps sleep awk shasum cat)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
-		required_commands+=(mktemp mv date chmod)
+		required_commands+=(mktemp date chmod)
 	fi
 
 	for command_name in "${required_commands[@]}"; do
@@ -149,9 +149,9 @@ resolve_paths() {
 	local state_candidate
 
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_REPOSITORY" "repository path does not exist or is not a directory: $REPO_INPUT."
-	candidate="$(cd "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
+	candidate="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate."
-	REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
+	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
 	LEGACY_REGISTRY_PATH="$REPO_ROOT/.agents/agent-registry/registry.json"
 	refuse_live_legacy_registry
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
@@ -163,7 +163,7 @@ resolve_paths() {
 	else
 		mkdir -p "$STATE_ROOT_INPUT" || die "$EXIT_FILESYSTEM" "cannot create state root: $STATE_ROOT_INPUT."
 	fi
-	STATE_ROOT="$(cd "$STATE_ROOT_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot access state root: $STATE_ROOT_INPUT."
+	STATE_ROOT="$(cd -P "$STATE_ROOT_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot access state root: $STATE_ROOT_INPUT."
 	case "$STATE_ROOT/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $STATE_ROOT." ;;
 	esac
@@ -172,6 +172,7 @@ resolve_paths() {
 	REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
 	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
 	LOCK_DIR="$REGISTRY_DIR/.lock"
+	validate_registry_dir
 }
 
 refuse_live_legacy_registry() {
@@ -200,7 +201,6 @@ canonical_path_without_creation() {
 	/*) ;;
 	*) path="$PWD/$path" ;;
 	esac
-	path="$(normalize_absolute_path "$path")" || return 1
 	while [[ ! -e "$path" ]]; do
 		base="${path##*/}"
 		parent="${path%/*}"
@@ -209,8 +209,19 @@ canonical_path_without_creation() {
 		path="$parent"
 	done
 	[[ -d "$path" ]] || return 1
-	resolved="$(cd "$path" 2>/dev/null && pwd -P)" || return 1
-	printf '%s%s\n' "$resolved" "$suffix"
+	resolved="$(cd -P "$path" 2>/dev/null && pwd -P)" || return 1
+	normalize_absolute_path "$resolved$suffix"
+}
+
+validate_registry_dir() {
+	local resolved
+	[[ ! -e "$REGISTRY_DIR" && ! -L "$REGISTRY_DIR" ]] && return "$EXIT_OK"
+	[[ -d "$REGISTRY_DIR" && ! -L "$REGISTRY_DIR" ]] || die "$EXIT_FILESYSTEM" "repository fingerprint state path must be a real directory, not a symlink: $REGISTRY_DIR."
+	resolved="$(cd -P "$REGISTRY_DIR" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot resolve repository fingerprint state path: $REGISTRY_DIR."
+	[[ "$resolved" == "$REGISTRY_DIR" ]] || die "$EXIT_FILESYSTEM" "repository fingerprint state path resolved unexpectedly: $REGISTRY_DIR -> $resolved."
+	case "$resolved/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "repository fingerprint state path must be outside the repository: $resolved." ;;
+	esac
 }
 
 normalize_absolute_path() {
@@ -287,8 +298,14 @@ pid_is_confirmed_nonexistent() {
 acquire_lock() {
 	local attempt=0
 	local owner_pid=''
+	local current_pid=''
+	local reclaim_marker=''
+	local quarantine=''
 
-	mkdir -p "$REGISTRY_DIR" || die "$EXIT_FILESYSTEM" "cannot create registry directory: $REGISTRY_DIR."
+	if ! mkdir "$REGISTRY_DIR" 2>/dev/null; then
+		validate_registry_dir
+	fi
+	validate_registry_dir
 	chmod 0700 "$REGISTRY_DIR" 2>/dev/null || die "$EXIT_FILESYSTEM" "cannot restrict registry directory permissions: $REGISTRY_DIR."
 	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
 		owner_pid=''
@@ -297,9 +314,20 @@ acquire_lock() {
 		'' | 0 | *[!0-9]*) ;;
 		*)
 			if pid_is_confirmed_nonexistent "$owner_pid"; then
-				rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-				if rmdir "$LOCK_DIR" 2>/dev/null; then
-					continue
+				reclaim_marker="$LOCK_DIR/.reclaim"
+				if mkdir "$reclaim_marker" 2>/dev/null; then
+					current_pid=''
+					[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r current_pid <"$LOCK_DIR/pid" || current_pid=''
+					if [[ "$current_pid" == "$owner_pid" ]] && pid_is_confirmed_nonexistent "$current_pid"; then
+						quarantine="$REGISTRY_DIR/.lock.reclaimed.$$.$attempt"
+						if mv "$LOCK_DIR" "$quarantine" 2>/dev/null; then
+							rm -f "$quarantine/pid" 2>/dev/null || true
+							rmdir "$quarantine/.reclaim" 2>/dev/null || true
+							rmdir "$quarantine" 2>/dev/null || true
+							continue
+						fi
+					fi
+					rmdir "$reclaim_marker" 2>/dev/null || true
 				fi
 			fi
 			;;

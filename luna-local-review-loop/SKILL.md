@@ -49,13 +49,13 @@ task_scope='owned paths: src/a.ts; task: implement validator; validator: pnpm ch
   --prompt-file '/absolute/path/to/task-prompt.txt'
 ```
 
-The launcher atomically reserves the task, starts a non-ephemeral handshake, captures the Codex session ID from JSONL even when the command exits immediately, binds and activates that session, resumes it with prompt-file stdin, and writes streaming logs outside the project. It returns only the final structured result on stdout.
+The launcher atomically reserves the task together with its initial invocation claim, starts a non-ephemeral handshake, captures the Codex session ID from JSONL even when the command exits immediately, binds and activates that session, resumes it with prompt-file stdin, and writes streaming logs outside the project. It returns only the final structured result on stdout. A signal or failure after reservation can retire only the task carrying that invocation token.
 
 Never add `--ephemeral` to a resumable worker. The durable identity is the Codex session ID (`01...`). A live `exec_command.session_id` integer is only a transient inner process-control handle. A `functions.exec` cell ID and a shell PID are neither worker identities nor accepted registry handles. The registry intentionally stores none of those process handles.
 
 The launcher uses `--ignore-user-config` so unrelated MCP servers/connectors do not start. Add task-relevant context to the prompt or target repository configuration; do not re-enable the full user connector set merely for convenience.
 
-The registry atomically claims each live invocation. A stale claim may be replaced only while holding the registry mutation lock, so concurrent recovery attempts cannot resume the same session. If the runner receives `INT` or `TERM`, it signals and waits for its Codex child before registry retirement; never bypass this shutdown path by deleting registry state manually.
+The registry atomically claims each live invocation. A stale claim may be replaced only while holding the registry mutation lock, and stale mutation-lock recovery first claims an in-directory marker before atomically renaming the old lock aside. Concurrent recovery attempts therefore cannot delete a new owner or resume the same session. If the runner receives `INT` or `TERM`, it signals and waits for its active registry or Codex child before token-checked registry retirement; never bypass this shutdown path by deleting registry state manually.
 
 Use `read-only` for investigation/review and `workspace-write` for implementation. The parent shell must separately allow the owning Codex runtime-state directory (normally `$CODEX_HOME` or `~/.codex`) to be written. This runtime permission is distinct from the worker repository sandbox. If the launcher reports exit 11, stop and obtain that narrow outer permission; never broaden the repository sandbox as a workaround.
 
@@ -98,7 +98,7 @@ Each structured worker result contains outcome, concise summary, changed files, 
 
 ## Close every lifecycle
 
-The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
+The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. Explicit `finish` accepts only `failed`, `blocked`, or `interrupted`; `completed` requires a validated structured result. Finish is registry-only and remains available if worker artifacts are missing. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
 
 ```sh
 "$skill_root/scripts/run-worker.sh" finish \
