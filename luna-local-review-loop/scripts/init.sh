@@ -18,6 +18,7 @@ DEFAULT_SKILLS_ROOT="$(cd "$PACKAGE_ROOT/.." && pwd -P)"
 readonly DEFAULT_SKILLS_ROOT
 readonly GITIGNORE_ENTRY='.agents/agent-registry/'
 readonly CAVEMAN_SKILL_RELATIVE_PATH='.agents/skills/caveman/SKILL.md'
+readonly CODE_REVIEWER_SKILL_RELATIVE_PATH='.agents/skills/code-reviewer/SKILL.md'
 
 REPO_INPUT='.'
 SKILLS_ROOT="$DEFAULT_SKILLS_ROOT"
@@ -26,6 +27,7 @@ REGISTRY_DIR=''
 REGISTRY_PATH=''
 LOCK_DIR=''
 CAVEMAN_SKILL_PATH=''
+CODE_REVIEWER_SKILL_PATH=''
 LOCK_HELD=0
 
 readonly SCHEMA_FILTER='
@@ -124,7 +126,7 @@ Usage:
   init.sh [--repo PATH|-C PATH] [--skills-root PATH]
 
 Initialize the current Git repository's persistent Luna worker registry.
-The command is idempotent. If project-local Caveman skill is missing, init installs it from the repository root and may use the network.
+The command is idempotent. If project-local code-reviewer or Caveman is missing, init installs it from the repository root and may use the network.
 EOF
   exit "$exit_code"
 }
@@ -139,7 +141,7 @@ die() {
 require_commands() {
   local missing=''
   local command_name
-  local required_commands=(bash git jq codex mktemp mkdir mv rm rmdir date kill ps sleep head awk cmp)
+  local required_commands=(bash git jq codex mktemp mkdir mv rm rmdir date kill ps sleep head awk cmp chmod stat)
 
   for command_name in "${required_commands[@]}"; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -171,12 +173,33 @@ resolve_repo_root() {
   REGISTRY_PATH="$REGISTRY_DIR/registry.json"
   LOCK_DIR="$REGISTRY_DIR/.lock"
   CAVEMAN_SKILL_PATH="$REPO_ROOT/$CAVEMAN_SKILL_RELATIVE_PATH"
+  CODE_REVIEWER_SKILL_PATH="$REPO_ROOT/$CODE_REVIEWER_SKILL_RELATIVE_PATH"
 }
 
-check_dependent_skills() {
-  local reviewer_skill="$SKILLS_ROOT/code-reviewer/SKILL.md"
-  if [[ ! -f "$reviewer_skill" ]]; then
-    die "$EXIT_PREREQUISITE" "dependent skill missing: code-reviewer. Expected $reviewer_skill. Install or enable that skill through the approved local skill workflow, or rerun init with --skills-root PATH pointing at the active skills root. Code-reviewer is not auto-installed."
+is_project_local_code_reviewer_skill() {
+  [[ -f "$CODE_REVIEWER_SKILL_PATH" ]] || return 1
+  [[ ! -L "$REPO_ROOT/.agents" ]] || return 1
+  [[ ! -L "$REPO_ROOT/.agents/skills" ]] || return 1
+  [[ ! -L "$REPO_ROOT/.agents/skills/code-reviewer" ]] || return 1
+  [[ ! -L "$CODE_REVIEWER_SKILL_PATH" ]] || return 1
+  return "$EXIT_OK"
+}
+
+ensure_code_reviewer_skill() {
+  if is_project_local_code_reviewer_skill; then
+    return "$EXIT_OK"
+  fi
+
+  if ! command -v npx >/dev/null 2>&1; then
+    die "$EXIT_PREREQUISITE" "code-reviewer skill prerequisite/setup failed: npx is unavailable; expected project-local $CODE_REVIEWER_SKILL_PATH. Required command: npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -y. Install or enable npx, then rerun init. A global code-reviewer copy does not satisfy project setup."
+  fi
+
+  if ! (cd "$REPO_ROOT" && npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -y); then
+    die "$EXIT_PREREQUISITE" "code-reviewer skill prerequisite/setup failed: npx install command failed from repository root. Expected project-local $CODE_REVIEWER_SKILL_PATH. Fix npx or network access, then rerun init. A global code-reviewer copy does not satisfy project setup."
+  fi
+
+  if ! is_project_local_code_reviewer_skill; then
+    die "$EXIT_PREREQUISITE" "code-reviewer skill prerequisite/setup failed: npx returned success, but expected project-local $CODE_REVIEWER_SKILL_PATH is missing or not a regular project-local file. Inspect the install, then rerun init. A global code-reviewer copy does not satisfy project setup."
   fi
 }
 
@@ -269,10 +292,16 @@ validate_registry_file() {
 
 ensure_gitignore_entry() {
   local gitignore_path="$REPO_ROOT/.gitignore"
+  local gitignore_mode='0644'
   local temp_path
 
   if [[ -e "$gitignore_path" && ! -f "$gitignore_path" ]]; then
     die "$EXIT_FILESYSTEM" "repository .gitignore is not a regular file: $gitignore_path. Resolve that path and rerun init."
+  fi
+
+  if [[ -f "$gitignore_path" ]]; then
+    gitignore_mode="$(stat -f '%Lp' "$gitignore_path" 2>/dev/null || stat -c '%a' "$gitignore_path" 2>/dev/null)" || die "$EXIT_FILESYSTEM" "cannot read repository .gitignore mode: $gitignore_path. Check permissions and rerun init."
+    [[ -n "$gitignore_mode" ]] || die "$EXIT_FILESYSTEM" "repository .gitignore mode is empty: $gitignore_path. Check the filesystem and rerun init."
   fi
 
   temp_path="$(mktemp "$REPO_ROOT/.gitignore.luna.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create an atomic .gitignore temporary file under $REPO_ROOT. Check repository permissions."
@@ -295,6 +324,11 @@ ensure_gitignore_entry() {
     fi
   else
     printf '%s\n' "$GITIGNORE_ENTRY" > "$temp_path"
+  fi
+
+  if ! chmod "$gitignore_mode" "$temp_path"; then
+    rm -f "$temp_path"
+    die "$EXIT_FILESYSTEM" "cannot preserve repository .gitignore mode $gitignore_mode on the atomic temporary file. Check permissions and rerun init."
   fi
 
   if cmp -s "$temp_path" "$gitignore_path" 2>/dev/null; then
@@ -359,8 +393,8 @@ done
 require_commands
 [[ -d "$SKILLS_ROOT" ]] || die "$EXIT_PREREQUISITE" "skills root does not exist or is not a directory: $SKILLS_ROOT. Pass --skills-root PATH for the active skills directory."
 SKILLS_ROOT="$(cd "$SKILLS_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_PREREQUISITE" "cannot access skills root: $SKILLS_ROOT. Check permissions and rerun init."
-check_dependent_skills
 resolve_repo_root
+ensure_code_reviewer_skill
 ensure_caveman_skill
 mkdir -p "$REGISTRY_DIR" || die "$EXIT_FILESYSTEM" "cannot create registry directory: $REGISTRY_DIR. Check repository permissions."
 acquire_lock

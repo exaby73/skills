@@ -9,22 +9,23 @@ The registry records ownership and terminal evidence; it does not launch, resume
 `init` checks these local prerequisites before mutating the target repository:
 
 - Bash 3 or newer.
-- `git`, `jq`, `mktemp`, `mkdir`, `mv`, `rm`, `rmdir`, `date`, `kill`, `ps`, `sleep`, `head`, `awk`, and `cmp` on `PATH`.
+- `git`, `jq`, `mktemp`, `mkdir`, `mv`, `rm`, `rmdir`, `date`, `kill`, `ps`, `sleep`, `head`, `awk`, `cmp`, `chmod`, and `stat` on `PATH`.
 - `codex` on `PATH`; the launch and same-task resume contract depends on it.
-- The sibling `code-reviewer` skill with `code-reviewer/SKILL.md` in the active skills root. The parent review loop depends on it.
+- The target repository's project-local `.agents/skills/code-reviewer/SKILL.md`. If it is missing, `npx` must be available so init can install it.
 - The target repository's project-local `.agents/skills/caveman/SKILL.md`. If it is missing, `npx` must be available so init can install it.
 
 Parent and delegated workers must read and use the project-local Caveman skill for user-facing output. A global or active-skills-root Caveman copy does not satisfy target-repository setup.
 
-When the project-local Caveman skill is missing, init runs this exact command from the target repository root:
+When either project-local skill is missing, init runs its exact command from the target repository root:
 
 ```zsh
+npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -y
 npx -y skills add https://github.com/juliusbrussee/caveman --skill caveman -y
 ```
 
-The first `-y` suppresses npx's package-install prompt. The final `-y` skips Skills CLI confirmation prompts and lets `skills` auto-detect project scope from the repository root. Init never uses `-g`. Existing project-local Caveman setup skips `npx`, so repeated init stays idempotent. This conditional install is the one init operation that may use the network.
+The first `-y` suppresses npx's package-install prompt. The final `-y` skips Skills CLI confirmation prompts and lets `skills` auto-detect project scope from the repository root. Init never uses `-g`. Existing project-local skills skip their corresponding `npx` command, so repeated init stays idempotent. These conditional installs are the only init operations that may use the network.
 
-If a prerequisite or dependent skill is missing, or Caveman setup fails, init exits with code `3` and reports the exact command or path to check plus the next action. Code-reviewer remains a required local dependency and is never auto-installed.
+If a prerequisite is missing or either skill setup fails, init exits with code `3` and reports the exact command or path to check plus the next action. A global copy of either dependency does not satisfy project setup.
 
 The source checkout may not itself be the active skills root. In that case pass `--skills-root /absolute/path/to/skills` to init.
 
@@ -53,13 +54,15 @@ Without `--repo`, init resolves the current directory to its Git repository root
 Init is idempotent:
 
 1. It verifies the target Git root and every documented local prerequisite, including `codex`.
-2. It verifies `code-reviewer/SKILL.md` without changing that dependency.
+2. It verifies project-local code-reviewer setup, conditionally installing it from the repository root when absent.
 3. It verifies project-local Caveman setup, conditionally installing it from the repository root when absent.
 4. It creates `.agents/agent-registry/` and acquires a local atomic `mkdir` lock.
-5. It ensures the exact `.agents/agent-registry/` line occurs once in the repository-root `.gitignore`.
+5. It ensures the exact `.agents/agent-registry/` line occurs once in the repository-root `.gitignore`, preserving an existing file's mode and using `0644` for a new file.
 6. It atomically creates `.agents/agent-registry/registry.json` when absent, or validates the existing version-1 registry without overwriting it.
 
 If an existing registry has a different `repository_root` or fails validation, init stops and preserves it for investigation. Do not copy a registry from another checkout.
+
+Validate init without network access by running `scripts/test-init.sh`. Its temporary Git repository and fake `npx` verify both exact project-local install commands, idempotence, registry creation, a new `.gitignore` mode of `0644`, and preservation of an existing custom mode.
 
 ## Location, locking, and atomic writes
 
@@ -219,13 +222,15 @@ The parent owns this sequence for every launch:
 3. Reserve before launch. The reservation must be durable before `codex exec` starts:
 
    ```zsh
+   task_id='issue-123-worker-1'
+   task_scope='owned paths: src/a.ts; exact task: implement validator; validator: pnpm check; no staging or commits'
    "$skill_root/scripts/registry.sh" reserve \
      --repo "$repo_root" \
-     --task-id issue-123-worker-1 \
-     --scope 'owned paths: src/a.ts; exact task: implement validator; validator: pnpm check; no commits'
+     --task-id "$task_id" \
+     --scope "$task_scope"
    ```
 
-4. Launch a fresh, paused handshake without `--last` or any session-shortening mode. The prompt must forbid repository work until the parent confirms binding:
+4. Launch a fresh handshake without `--last` or any session-shortening mode. The prompt must forbid repository work and end the one-shot invocation after emitting the bind marker:
 
    ```zsh
    launch_argv=(codex exec \
@@ -233,29 +238,44 @@ The parent owns this sequence for every launch:
      -c 'model_reasoning_effort="max"' \
      -s 'workspace-write' \
      -C "$repo_root" \
-     'Handshake only. Do not read, write, test, or otherwise work in the repository. Wait for parent binding and activation for the reserved one-task scope.')
-   # Start launch_argv through supported orchestration and keep it at the handshake.
+     'Handshake only. Do not read, write, test, or otherwise work in the repository. Reply exactly READY_TO_BIND, then stop so the parent can bind this session and resume it with the reserved task.')
+   # Start launch_argv through supported orchestration and let it exit.
    # Capture Codex session ID and orchestration handle; never substitute shell $!.
    captured_session_id='<session ID emitted by codex exec>'
-   captured_handle='<process or agent handle returned by orchestration>'
+   launch_handle='<completed handshake process or agent handle returned by orchestration>'
    ```
 
-5. Bind the captured identity exactly once, before activation or repository work. A second bind and every cross-task session or handle reuse are refused:
+5. Bind the captured handshake identity exactly once. Then resume the exact session with stdin pending, record that fresh live handle, activate with it, and only then feed the exact reserved task prompt and EOF. A second bind and every cross-task session or handle reuse are refused:
 
    ```zsh
    "$skill_root/scripts/registry.sh" bind \
      --repo "$repo_root" \
-     --task-id issue-123-worker-1 \
+     --task-id "$task_id" \
+     --session-id "$captured_session_id" \
+     --handle "$launch_handle"
+   # Through supported orchestration, start with stdin pending:
+   # codex exec resume -m gpt-5.6-luna -c model_reasoning_effort=max "$captured_session_id" -
+   captured_handle='<fresh resume process or agent handle returned by orchestration>'
+   "$skill_root/scripts/registry.sh" record-resume-handle \
+     --repo "$repo_root" \
+     --task-id "$task_id" \
      --session-id "$captured_session_id" \
      --handle "$captured_handle"
    "$skill_root/scripts/registry.sh" activate \
      --repo "$repo_root" \
-     --task-id issue-123-worker-1 \
+     --task-id "$task_id" \
      --session-id "$captured_session_id" \
      --handle "$captured_handle"
+   task_prompt="$(printf '%s\n' \
+     "TASK ID: $task_id" \
+     "RESERVED SCOPE: $task_scope" \
+     'Execute only this reserved task. Read repository instructions and the project-local Caveman skill first. Report changed files, result, validator command/output, and limitations. Do not stage or commit.')"
+   # Only now, invoke the supported orchestration stdin-write operation for
+   # captured_handle with task_prompt, then close that stdin (EOF). Collect
+   # output until this exact resumed process exits.
    ```
 
-6. For every permission return, resume the exact same session with stdin pending. Capture the new outer orchestration process handle, record it before feeding the approved output, then feed the exact command, exit status, and captured output:
+6. For every later permission return, repeat the exact-session resume handshake: keep stdin pending, capture the new outer orchestration process handle, record it before feeding the approved output, then feed the exact command, exit status, and captured output:
 
    ```zsh
    # Through supported orchestration, start this exact argv with stdin pending:
@@ -332,9 +352,9 @@ Do not report cleanup complete while a worker entry remains. Do not delete Codex
 
 ## Troubleshooting
 
-- `ERROR [3] missing runtime prerequisite(s)`: run `command -v <name>` for each reported command, including `codex`, install it through the approved host/repository mechanism, and rerun init. If project-local Caveman is missing, also verify `npx` and network access for the documented conditional setup command.
+- `ERROR [3] missing runtime prerequisite(s)`: run `command -v <name>` for each reported command, including `codex`, install it through the approved host/repository mechanism, and rerun init. If either project-local dependent skill is missing, also verify `npx` and network access for the documented conditional setup commands.
+- `ERROR [3] code-reviewer skill prerequisite/setup failed`: fix `npx`, its install/network failure, or the missing project-local `.agents/skills/code-reviewer/SKILL.md`, then rerun init. Verify both `-y` flags and their order if using a fake `npx` in tests. A global copy does not satisfy this check.
 - `ERROR [3] Caveman skill prerequisite/setup failed`: fix `npx`, its install/network failure, or the missing project-local `.agents/skills/caveman/SKILL.md`, then rerun init. Verify both `-y` flags and their order if using a fake `npx` in tests. A global copy does not satisfy this check.
-- `ERROR [3] dependent skill missing: code-reviewer`: confirm the expected `.../code-reviewer/SKILL.md` path, then pass the active parent directory with `--skills-root PATH` or install/enable that skill locally. Do not bypass the parent review dependency.
 - `ERROR [4] path is not inside a Git repository`: pass `--repo PATH` to the repository root or a directory inside it.
 - `ERROR [4] worker registry is not initialized`: run init for that exact repository before reserve, query, or cleanup.
 - `ERROR [5] registry fails schema validation` or `repository_root` mismatch: preserve the JSON for evidence, do not copy another repository’s registry, and repair the target registry through the parent’s approved recovery process.
