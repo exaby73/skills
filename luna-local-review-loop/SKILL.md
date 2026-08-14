@@ -1,6 +1,6 @@
 ---
 name: luna-local-review-loop
-description: Route local repository implementation, documentation, testing, validation, and review fixes between the parent and ephemeral GPT-5.6 Luna Max workers, using parent-owned durable goal and plan state, least-privilege permission brokering, explicit task ownership, and repeated parent code-reviewer passes until local approval. Use when Codex must decide whether local changes remain parent-direct or run through subagents while keeping worker execution and validation evidence bounded.
+description: Route local repository implementation, documentation, testing, validation, and review fixes between the parent and GPT-5.6 Luna Max workers, using parent-owned durable goal and plan state, least-privilege permission brokering, explicit task ownership, and repeated parent code-reviewer passes until local approval. Use when Codex must decide whether local changes remain parent-direct or run through subagents while keeping worker execution and validation evidence bounded.
 ---
 
 # Luna Local Review Loop
@@ -32,11 +32,10 @@ Use this skill to route local repository work between the parent and Luna Max, t
 
 ## Launch Luna Max (parent only)
 
-Run every executable task routed to Luna Max with this command shape, using safe quoting:
+Run every executable task routed to Luna Max with this command shape, using safe quoting. Preserve the worker session so the parent can resume it when permission brokerage is needed:
 
 ```zsh
 codex exec \
-  --ephemeral \
   -m 'gpt-5.6-luna' \
   -c 'model_reasoning_effort="max"' \
   -s '<least-privilege-sandbox>' \
@@ -44,10 +43,13 @@ codex exec \
   '<task>'
 ```
 
+- Capture the session ID reported by `codex exec` and retain it with the worker task. The parent must use that exact session for every continuation; never use `--last` or launch a replacement worker to return brokered output.
 - Define least privilege as the minimum permission that still permits all required task actions: use read-only only for investigation, planning, or review tasks requiring no writes; use `workspace-write` for implementation, documentation, tests, or any other task that must modify repository files. Any broader access still goes through permission brokerage. Never use `danger-full-access` or bypass approvals.
 - Stop if Luna Max cannot run. Ask the user to explicitly choose Luna High, Terra High, or no subagents; never silently change the model or reasoning effort.
 
 ## Orchestrate work and close the loop (parent only)
+
+Before worker execution, read the applicable repository instructions and hand off every command class they reserve for the parent or require elevated execution. Apply this gate even when the worker sandbox would allow the command: for example, if repository rules require every pnpm test command to run elevated, including `pnpm test` and `pnpm run test:*`, the parent must own and run those tests through the required elevated path and the worker must not run them.
 
 1. Decompose the request into worker-sized tasks and attach a concrete validator to each task.
 2. Apply the routing gate to each task before execution. Launch Luna workers only in the target repository. Run workers in parallel only when scopes are independent, owned paths do not overlap, and each worker has an explicit validator. Otherwise, run tasks sequentially and collect each result before starting dependent work.
@@ -70,5 +72,12 @@ PERMISSION NEEDED: <specific permission>
 - Review the exact command for safety, scope, and least privilege. If it is safe and in scope, run only that exact command through the parent approval path and return its output to the worker for interpretation.
 - Do not substitute a command, broaden its scope, or ask the worker to work around the block. Stop and ask the user when the exact command is unsafe, out of scope, or its permission is ambiguous.
 - Apply this brokerage to tests, containers, Docker, network access, external-file operations, and any other command requiring an approval unavailable to a non-interactive worker.
+- After the parent runs the exact approved command, resume the recorded worker session with its captured result so the same worker can interpret it and continue:
+
+  ```zsh
+  codex exec resume '<captured-worker-session-id>' -
+  ```
+
+  Feed the resumed prompt the exact command, exit status, and captured output. Use the captured session ID, not `--last` or a new worker.
 
 Keep the loop local, evidence-based, and bounded by the stated task scopes and validators.
