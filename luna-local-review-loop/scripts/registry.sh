@@ -661,7 +661,7 @@ command_update() {
 
   timestamp="$(now_utc)"
   write_registry_with_filter \
-    '.workers |= map(if .task_id == $task_id then .status = $status | .updated_at = $timestamp | (if $terminal then .terminal_at = $timestamp | .terminal_status = $status | .terminal_evidence = $evidence | .terminal_notes = (if $notes_set == 1 then $notes else .terminal_notes end) else . end) | (if $notes_set == 1 then .notes = $notes else . end) else . end) | .updated_at = $timestamp' \
+    '.workers |= map(if .task_id == $task_id then .status = $status | .updated_at = $timestamp | (if $status == "active" then .activated_at = (.activated_at // $timestamp) else . end) | (if $terminal then .terminal_at = $timestamp | .terminal_status = $status | .terminal_evidence = $evidence | .terminal_notes = (if $notes_set == 1 then $notes else .terminal_notes end) else . end) | (if $notes_set == 1 then .notes = $notes else . end) else . end) | .updated_at = $timestamp' \
     --arg task_id "$task_id" \
     --arg status "$status" \
     --arg timestamp "$timestamp" \
