@@ -3,244 +3,138 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
-TEMP_ROOT="$(mktemp -d)"
-readonly TEMP_ROOT
-
-cleanup() {
-  rm -rf "$TEMP_ROOT"
-}
-trap cleanup EXIT
+readonly INIT_SCRIPT="$SCRIPT_DIR/init.sh"
+readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
+readonly RUNNER_SCRIPT="$SCRIPT_DIR/run-worker.sh"
 
 fail() {
-  printf 'test-init: FAIL: %s\n' "$*" >&2
-  exit 1
+	printf 'FAIL: %s\n' "$*" >&2
+	exit 1
 }
 
-file_mode() {
-  local file_path="$1"
-  local mode
+TEST_ROOT="$(mktemp -d)"
+readonly TEST_ROOT
+trap 'rm -rf "$TEST_ROOT"' EXIT
+readonly REPO_ROOT="$TEST_ROOT/repo"
+readonly STATE_ROOT="$TEST_ROOT/state"
+readonly BIN_DIR="$TEST_ROOT/bin"
+readonly CODEX_STATE="$TEST_ROOT/codex-home"
+readonly PROMPT_FILE="$TEST_ROOT/task.txt"
+readonly CONTINUE_FILE="$TEST_ROOT/continue.txt"
+readonly CODEX_CALLS="$TEST_ROOT/codex-calls.log"
+readonly CODEX_COUNTER="$TEST_ROOT/codex-counter"
 
-  if mode="$(stat -f '%Lp' "$file_path" 2>/dev/null)"; then
-    printf '%s\n' "$mode"
-    return 0
-  fi
-  if mode="$(stat -c '%a' "$file_path" 2>/dev/null)"; then
-    printf '%s\n' "$mode"
-    return 0
-  fi
-  return 1
-}
-
-readonly REPO_ROOT="$TEMP_ROOT/repository"
-readonly FAKE_BIN="$TEMP_ROOT/bin"
-readonly NPM_LOG="$TEMP_ROOT/npx.log"
-
-mkdir -p "$REPO_ROOT" "$FAKE_BIN"
+mkdir -p "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman" "$BIN_DIR" "$CODEX_STATE"
+printf '%s\n' '# code reviewer' >"$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
+printf '%s\n' '# caveman' >"$REPO_ROOT/.agents/skills/caveman/SKILL.md"
+printf '%s\n' 'task prompt' >"$PROMPT_FILE"
+printf '%s\n' 'continue and complete' >"$CONTINUE_FILE"
 git -C "$REPO_ROOT" init -q
+git -C "$REPO_ROOT" config user.email test@example.com
+git -C "$REPO_ROOT" config user.name Test
+git -C "$REPO_ROOT" add .agents
+git -C "$REPO_ROOT" commit -qm init
 
-printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_BIN/codex"
-chmod 0755 "$FAKE_BIN/codex"
-
-cat > "$FAKE_BIN/npx" <<'EOF'
+cat >"$BIN_DIR/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "$FAKE_NPX_LOG"
-case "$*" in
-  '-y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -y')
-    mkdir -p .agents/skills/code-reviewer
-    printf '%s\n' '# code-reviewer' > .agents/skills/code-reviewer/SKILL.md
-    ;;
-  '-y skills add https://github.com/juliusbrussee/caveman --skill caveman -y')
-    mkdir -p .agents/skills/caveman
-    printf '%s\n' '# caveman' > .agents/skills/caveman/SKILL.md
-    ;;
-  *)
-    printf 'unexpected npx argv: %s\n' "$*" >&2
-    exit 64
-    ;;
-esac
+printf '%s\n' "$*" >> "$CODEX_CALLS"
+if [[ " $* " == *' exec resume '* ]]; then
+  result_path=''
+  previous=''
+  for argument in "$@"; do
+    if [[ "$previous" == '--output-last-message' ]]; then result_path="$argument"; fi
+    previous="$argument"
+  done
+  prompt="$(cat)"
+  if [[ "$prompt" == *'needs parent'* ]]; then
+    outcome='needs_parent_action'
+    parent_action='"run approved validator"'
+  else
+    outcome='completed'
+    parent_action='null'
+  fi
+  printf '{"outcome":"%s","summary":"worker concise result","changedFiles":[],"validators":[],"unresolved":[],"parentAction":%s}\n' "$outcome" "$parent_action" > "$result_path"
+  printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"large stream stays in log"}}'
+else
+  if [[ "${FAKE_FAIL_HANDSHAKE:-0}" == '1' ]]; then exit 23; fi
+  count=0
+  [[ ! -f "$CODEX_COUNTER" ]] || count="$(cat "$CODEX_COUNTER")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$CODEX_COUNTER"
+  printf '{"type":"thread.started","thread_id":"01fake-session-%s"}\n' "$count"
+  printf '%s\n' '{"type":"turn.completed"}'
+fi
 EOF
-chmod 0755 "$FAKE_BIN/npx"
+chmod +x "$BIN_DIR/codex"
+export PATH="$BIN_DIR:$PATH"
+export CODEX_CALLS
+export CODEX_COUNTER
+export CODEX_HOME="$CODEX_STATE"
 
-PATH="$FAKE_BIN:$PATH" FAKE_NPX_LOG="$NPM_LOG" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" >/dev/null
+before_status="$(git -C "$REPO_ROOT" status --short)"
+registry_path="$($INIT_SCRIPT --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --print-path)"
+state_root_real="$(cd "$STATE_ROOT" && pwd -P)"
+[[ "$registry_path" == "$state_root_real/"*/registry.json ]] || fail "registry was not created below the external state root: $registry_path"
+[[ ! -e "$REPO_ROOT/.agents/agent-registry" ]] || fail 'init created project-local registry state'
+[[ ! -e "$REPO_ROOT/.gitignore" ]] || fail 'init modified repository ignore rules'
+[[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'init modified repository files'
+jq -e '.schema_version == 2 and .workers == [] and .identity_ledger == []' "$registry_path" >/dev/null || fail 'new registry schema is invalid'
 
-[[ -f "$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md" ]] || fail 'code-reviewer was not installed project-locally'
-[[ -f "$REPO_ROOT/.agents/skills/caveman/SKILL.md" ]] || fail 'Caveman was not installed project-locally'
-[[ -f "$REPO_ROOT/.agents/agent-registry/registry.json" ]] || fail 'registry was not initialized'
-[[ "$(file_mode "$REPO_ROOT/.gitignore")" == '644' ]] || fail 'new .gitignore mode is not 0644'
-[[ "$(awk '$0 == ".agents/agent-registry/" { count += 1 } END { print count + 0 }' "$REPO_ROOT/.gitignore")" == '1' ]] || fail 'registry ignore entry is not unique'
-[[ "$(wc -l < "$NPM_LOG" | tr -d ' ')" == '2' ]] || fail 'expected exactly two dependency install calls'
-grep -Fxq -- '-y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -y' "$NPM_LOG" || fail 'code-reviewer install argv changed'
-grep -Fxq -- '-y skills add https://github.com/juliusbrussee/caveman --skill caveman -y' "$NPM_LOG" || fail 'Caveman install argv changed'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-launch --scope 'exact retry scope' >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-launch --status failed --evidence 'pre-bind launch failed' >/dev/null
+if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-retry --scope 'exact retry scope' >/dev/null 2>&1; then
+	fail 'duplicate scope was accepted without retry-of'
+fi
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id retry-launch --scope 'exact retry scope' --retry-of failed-launch >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id retry-launch --status interrupted --evidence 'retry test complete' >/dev/null
+jq -e 'any(.identity_ledger[]; .task_id == "retry-launch" and .retry_of == "failed-launch" and .scope == "exact retry scope")' "$registry_path" >/dev/null || fail 'retry linkage was not recorded'
 
-for expected_mode in 444 600 640 755; do
-  chmod 0644 "$REPO_ROOT/.gitignore"
-  printf '%s\n' '.agents/agent-registry/' 'existing-entry' '.agents/agent-registry/' > "$REPO_ROOT/.gitignore"
-  chmod "$expected_mode" "$REPO_ROOT/.gitignore"
-  PATH="$FAKE_BIN:$PATH" FAKE_NPX_LOG="$NPM_LOG" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" >/dev/null
+readonly LOCKED_CODEX_STATE="$TEST_ROOT/locked-codex-home"
+mkdir -p "$LOCKED_CODEX_STATE"
+chmod 0500 "$LOCKED_CODEX_STATE"
+if CODEX_HOME="$LOCKED_CODEX_STATE" CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id denied-runtime --scope 'runtime permission probe' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/denied-runtime.out" 2>&1; then
+	fail 'runner accepted a non-writable Codex runtime directory'
+fi
+chmod 0700 "$LOCKED_CODEX_STATE"
+jq -e 'all(.identity_ledger[]; .task_id != "denied-runtime")' "$registry_path" >/dev/null || fail 'runtime permission failure burned a task reservation'
 
-  [[ "$(file_mode "$REPO_ROOT/.gitignore")" == "$expected_mode" ]] || fail "existing .gitignore mode $expected_mode was not preserved"
-  [[ "$(awk '$0 == ".agents/agent-registry/" { count += 1 } END { print count + 0 }' "$REPO_ROOT/.gitignore")" == '1' ]] || fail 'idempotent init did not deduplicate the registry ignore entry'
-done
-[[ "$(wc -l < "$NPM_LOG" | tr -d ' ')" == '2' ]] || fail 'idempotent init reinstalled existing dependencies'
+if FAKE_FAIL_HANDSHAKE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-runner --scope 'runner retry scope' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/failed-runner.out" 2>&1; then
+	fail 'failed handshake unexpectedly succeeded'
+fi
+jq -e 'any(.identity_ledger[]; .task_id == "failed-runner" and .session_id == null and .status == "retired" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'failed pre-bind launch was not atomically retired'
+retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-runner-retry --scope 'runner retry scope' --retry-of failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/retry.err")"
+jq -e '.outcome == "completed"' <<<"$retry_output" >/dev/null || fail 'runner retry did not complete'
 
-readonly GITIGNORE_TARGET="$TEMP_ROOT/gitignore-target"
-printf '%s\n' 'target-only' > "$GITIGNORE_TARGET"
-rm -f "$REPO_ROOT/.gitignore"
-ln -s "$GITIGNORE_TARGET" "$REPO_ROOT/.gitignore"
-set +e
-PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" > /dev/null 2> "$TEMP_ROOT/gitignore-symlink.err"
-symlink_status=$?
-set -e
-[[ "$symlink_status" == '10' ]] || fail "symlinked .gitignore init returned $symlink_status instead of filesystem error 10"
-grep -Fq -- 'repository .gitignore is a symbolic link' "$TEMP_ROOT/gitignore-symlink.err" || fail 'symlinked .gitignore error was not actionable'
-[[ -L "$REPO_ROOT/.gitignore" ]] || fail 'symlinked .gitignore was replaced'
-cmp -s "$GITIGNORE_TARGET" <(printf '%s\n' 'target-only') || fail 'symlink target changed after rejected init'
-rm -f "$REPO_ROOT/.gitignore"
-touch "$REPO_ROOT/.gitignore"
+runner_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-worker --scope 'one fast task' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/runner.err")"
+jq -e '.outcome == "completed" and .summary == "worker concise result"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output'
+"$REGISTRY_SCRIPT" assert-no-active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'completed worker was not atomically retired'
+jq -e 'any(.identity_ledger[]; .task_id == "fast-worker" and (.session_id | startswith("01fake-session-")) and .status == "retired" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'fast worker identity/result was not retained'
 
-cat > "$FAKE_BIN/stat" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+printf '%s\n' 'needs parent' >"$PROMPT_FILE"
+needs_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --scope 'one continued task' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/needs.err")"
+jq -e '.outcome == "needs_parent_action"' <<<"$needs_output" >/dev/null || fail 'parent-action result was not returned'
+jq -e 'any(.workers[]; .task_id == "continued-worker" and .status == "active" and (.session_id | startswith("01fake-session-")))' "$registry_path" >/dev/null || fail 'parent-action worker was not retained as active'
+continue_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --prompt-file "$CONTINUE_FILE" 2>"$TEST_ROOT/continue.err")"
+jq -e '.outcome == "completed"' <<<"$continue_output" >/dev/null || fail 'exact-session continuation did not complete'
+"$REGISTRY_SCRIPT" assert-empty --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'continued worker was not retired'
 
-case "${1:-}" in
-  -f)
-    printf '%s\n' 'Filesystem report from failed GNU-style BSD probe' 'blocks available'
-    exit 1
-    ;;
-  -c)
-    [[ "${2:-}" == '%a' ]] || exit 64
-    printf '%s\n' "${FAKE_STAT_MODE:?}"
-    ;;
-  *)
-    printf 'unexpected stat argv: %s\n' "$*" >&2
-    exit 64
-    ;;
-esac
-EOF
-chmod 0755 "$FAKE_BIN/stat"
-chmod 0640 "$REPO_ROOT/.gitignore"
-printf '%s\n' 'existing-entry' '.agents/agent-registry/' > "$REPO_ROOT/.gitignore"
-FAKE_STAT_MODE=640 PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" >/dev/null || fail 'init failed after failed BSD stat probe output'
-[[ "$(FAKE_STAT_MODE=640 PATH="$FAKE_BIN:$PATH" file_mode "$REPO_ROOT/.gitignore")" == '640' ]] || fail 'failed BSD stat probe output leaked into captured mode'
-[[ "$(file_mode "$REPO_ROOT/.gitignore")" == '640' ]] || fail 'existing .gitignore mode was not preserved after failed BSD stat probe'
-rm -f "$FAKE_BIN/stat"
+if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing --session-id nope --handle process-123 >/dev/null 2>&1; then
+	fail 'ambiguous process handle argument was accepted'
+fi
+if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
+resume_count="$(rg -c 'exec resume .*01fake-session-[0-9]+ -' "$CODEX_CALLS")"
+[[ "$resume_count" -eq 4 ]] || fail "expected four exact-session resumes, got $resume_count"
+ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
+[[ "$ignore_count" -eq 8 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'worker lifecycle modified repository tooling state'
 
-readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
-readonly LOCK_DIR="$REPO_ROOT/.agents/agent-registry/.lock"
-readonly UPDATE_TASK_ID='test-init-update-activation-bypass'
-readonly UPDATE_TASK_SCOPE='test-init update activation bypass rejection'
-readonly UPDATE_SESSION_ID='test-init-session'
-readonly UPDATE_HANDLE='test-init-handle'
+missing_repo="$TEST_ROOT/missing-skills"
+git init -q "$missing_repo"
+if "$INIT_SCRIPT" --repo "$missing_repo" --state-root "$STATE_ROOT" >"$TEST_ROOT/missing.out" 2>&1; then
+	fail 'init accepted missing project skills'
+fi
+rg -F -- '-a universal' "$TEST_ROOT/missing.out" >/dev/null || fail 'init did not explain universal-only installation'
+[[ ! -e "$missing_repo/.agents" ]] || fail 'init installed missing skills instead of remaining non-mutating'
 
-"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --scope "$UPDATE_TASK_SCOPE" >/dev/null || fail 'could not reserve update regression worker'
-"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" >/dev/null || fail 'could not bind update regression worker'
-set +e
-"$REGISTRY_SCRIPT" update --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --status active > /dev/null 2> "$TEMP_ROOT/update-activation-bypass.err"
-update_activation_status=$?
-set -e
-[[ "$update_activation_status" == '6' ]] || fail "bound-to-active update returned $update_activation_status instead of conflict error 6"
-grep -Fq -- 'cannot activate' "$TEMP_ROOT/update-activation-bypass.err" || fail 'bound-to-active update error was not actionable'
-[[ "$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'bound' ]] || fail 'bound-to-active update bypass changed worker state'
-[[ "$(jq -r --arg task_id "$UPDATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .activated_at' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'null' ]] || fail 'bound-to-active update bypass set activated_at'
-"$REGISTRY_SCRIPT" retire --repo "$REPO_ROOT" --task-id "$UPDATE_TASK_ID" --session-id "$UPDATE_SESSION_ID" --handle "$UPDATE_HANDLE" --evidence 'test cleanup' >/dev/null || fail 'could not retire update regression worker'
-
-readonly ACTIVATE_TASK_ID='test-init-resume-only-activation'
-readonly ACTIVATE_TASK_SCOPE='test-init resume-only activation'
-readonly ACTIVATE_SESSION_ID='test-init-resume-session'
-readonly ACTIVATE_LAUNCH_HANDLE='test-init-launch-handle'
-readonly ACTIVATE_RESUME_HANDLE='test-init-resume-handle'
-
-"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --scope "$ACTIVATE_TASK_SCOPE" >/dev/null || fail 'could not reserve activation regression worker'
-"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_LAUNCH_HANDLE" >/dev/null || fail 'could not bind activation regression worker'
-
-set +e
-"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" > /dev/null 2> "$TEMP_ROOT/activation-handleless.err"
-handleless_status=$?
-set -e
-[[ "$handleless_status" == '2' ]] || fail "handle-less activation returned $handleless_status instead of usage error 2"
-grep -Fq -- 'handle is required for activation' "$TEMP_ROOT/activation-handleless.err" || fail 'handle-less activation error was not actionable'
-[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'bound' ]] || fail 'handle-less activation changed worker state'
-
-set +e
-"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_LAUNCH_HANDLE" > /dev/null 2> "$TEMP_ROOT/activation-launch-handle.err"
-launch_handle_status=$?
-set -e
-[[ "$launch_handle_status" == '6' ]] || fail "launch-handle activation returned $launch_handle_status instead of conflict error 6"
-grep -Fq -- 'launch handle cannot activate' "$TEMP_ROOT/activation-launch-handle.err" || fail 'launch-handle activation error was not actionable'
-[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'bound' ]] || fail 'launch-handle activation changed worker state'
-
-"$REGISTRY_SCRIPT" record-resume-handle --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_RESUME_HANDLE" >/dev/null || fail 'could not record activation resume handle'
-"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_RESUME_HANDLE" >/dev/null || fail 'valid resume activation failed'
-[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.workers[] | select(.task_id == $task_id) | .status' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'active' ]] || fail 'valid resume activation did not make worker active'
-[[ "$(jq -r --arg task_id "$ACTIVATE_TASK_ID" '.identity_ledger[] | select(.task_id == $task_id) | .handle_history[-1].kind' "$REPO_ROOT/.agents/agent-registry/registry.json")" == 'resume' ]] || fail 'valid activation did not require a resume history entry'
-"$REGISTRY_SCRIPT" retire --repo "$REPO_ROOT" --task-id "$ACTIVATE_TASK_ID" --session-id "$ACTIVATE_SESSION_ID" --handle "$ACTIVATE_RESUME_HANDLE" --evidence 'test cleanup' >/dev/null || fail 'could not retire activation regression worker'
-
-cat > "$FAKE_BIN/ps" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-case "${FAKE_PS_MODE:?}" in
-  live)
-    printf '%s\n' "${2:-999999}"
-    ;;
-  missing)
-    exit 1
-    ;;
-  *)
-    printf 'unexpected fake ps mode: %s\n' "$FAKE_PS_MODE" >&2
-    exit 64
-    ;;
-esac
-EOF
-chmod 0755 "$FAKE_BIN/ps"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_BIN/sleep"
-chmod 0755 "$FAKE_BIN/sleep"
-readonly FAKE_BASH_ENV="$TEMP_ROOT/fake-bash-env"
-cat > "$FAKE_BASH_ENV" <<'EOF'
-kill() {
-  case "${FAKE_KILL_MODE:?}" in
-    eperm)
-      printf '%s\n' 'fake kill: Operation not permitted' >&2
-      ;;
-    missing)
-      printf '%s\n' 'fake kill: No such process' >&2
-      ;;
-    *)
-      printf 'unexpected fake kill mode: %s\n' "$FAKE_KILL_MODE" >&2
-      ;;
-  esac
-  return 1
-}
-EOF
-mkdir -p "$LOCK_DIR"
-printf '%s\n' '999999' > "$LOCK_DIR/pid"
-
-set +e
-BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=eperm FAKE_PS_MODE=live PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id 'test-init-live-lock-owner' --scope 'test-init live lock owner' > /dev/null 2> "$TEMP_ROOT/registry-live-lock.err"
-registry_live_lock_status=$?
-set -e
-[[ "$registry_live_lock_status" == '9' ]] || fail "registry retained-lock probe returned $registry_live_lock_status instead of lock timeout 9"
-[[ -d "$LOCK_DIR" && -f "$LOCK_DIR/pid" ]] || fail 'registry reclaimed a lock whose failed kill probe still had a visible owner'
-grep -Fq -- 'registry lock is busy' "$TEMP_ROOT/registry-live-lock.err" || fail 'registry retained-lock error was not actionable'
-
-set +e
-BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=eperm FAKE_PS_MODE=live PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" > /dev/null 2> "$TEMP_ROOT/init-live-lock.err"
-init_live_lock_status=$?
-set -e
-[[ "$init_live_lock_status" == '9' ]] || fail "init retained-lock probe returned $init_live_lock_status instead of lock timeout 9"
-[[ -d "$LOCK_DIR" && -f "$LOCK_DIR/pid" ]] || fail 'init reclaimed a lock whose failed kill probe still had a visible owner'
-
-readonly LOCK_TASK_ID='test-init-reclaim-stale-lock'
-readonly LOCK_TASK_SCOPE='test-init reclaim confirmed stale lock'
-BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$LOCK_TASK_ID" --scope "$LOCK_TASK_SCOPE" >/dev/null || fail 'registry did not reclaim a confirmed-stale lock'
-[[ ! -d "$LOCK_DIR" ]] || fail 'registry did not release lock after reclaiming confirmed-stale owner'
-
-mkdir -p "$LOCK_DIR"
-printf '%s\n' '999999' > "$LOCK_DIR/pid"
-BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$SCRIPT_DIR/init.sh" --repo "$REPO_ROOT" >/dev/null || fail 'init did not reclaim a confirmed-stale lock'
-[[ ! -d "$LOCK_DIR" ]] || fail 'init did not release lock after reclaiming confirmed-stale owner'
-BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" retire --repo "$REPO_ROOT" --task-id "$LOCK_TASK_ID" --evidence 'test cleanup' >/dev/null || fail 'could not retire lock regression worker'
-BASH_ENV="$FAKE_BASH_ENV" FAKE_KILL_MODE=missing FAKE_PS_MODE=missing PATH="$FAKE_BIN:$PATH" "$REGISTRY_SCRIPT" prune --repo "$REPO_ROOT" --task-id "$LOCK_TASK_ID" >/dev/null || fail 'could not prune lock regression worker'
-
-printf 'test-init: PASS\n'
+printf '%s\n' 'PASS: external registry, non-mutating init, retry linkage, fast launch, exact-session continuation, structured output, and atomic retirement'

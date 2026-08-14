@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016 # jq programs intentionally use single-quoted $variables.
 set -euo pipefail
+umask 077
 
 readonly EXIT_OK=0
 readonly EXIT_USAGE=2
@@ -10,35 +11,23 @@ readonly EXIT_SCHEMA=5
 readonly EXIT_LOCK=9
 readonly EXIT_FILESYSTEM=10
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly SCRIPT_DIR
-PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-readonly PACKAGE_ROOT
-DEFAULT_SKILLS_ROOT="$(cd "$PACKAGE_ROOT/.." && pwd -P)"
-readonly DEFAULT_SKILLS_ROOT
-readonly GITIGNORE_ENTRY='.agents/agent-registry/'
-readonly CAVEMAN_SKILL_RELATIVE_PATH='.agents/skills/caveman/SKILL.md'
-readonly CODE_REVIEWER_SKILL_RELATIVE_PATH='.agents/skills/code-reviewer/SKILL.md'
-
 REPO_INPUT='.'
-SKILLS_ROOT="$DEFAULT_SKILLS_ROOT"
+STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
 REPO_ROOT=''
+STATE_ROOT=''
 REGISTRY_DIR=''
 REGISTRY_PATH=''
 LOCK_DIR=''
-CAVEMAN_SKILL_PATH=''
-CODE_REVIEWER_SKILL_PATH=''
 LOCK_HELD=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
-  def valid_status($status): ["reserved", "bound", "active", "stopping", "completed", "failed", "blocked", "interrupted", "retired"] | index($status) != null;
-  def terminal_status($status): ["completed", "failed", "blocked", "interrupted", "retired"] | index($status) != null;
-  def valid_handle_kind($kind): ["launch", "resume"] | index($kind) != null;
   def nullable_string: . == null or (. | nonempty_string);
+  def valid_status($status): ["reserved", "bound", "active", "retired"] | index($status) != null;
+  def valid_terminal($status): ["completed", "failed", "blocked", "interrupted"] | index($status) != null;
   . as $root
   | try (
-      (.schema_version == 1)
+      (.schema_version == 2)
       and (.registry == "luna-local-review-loop")
       and (.repository_root | nonempty_string)
       and (.created_at | nonempty_string)
@@ -48,71 +37,55 @@ readonly SCHEMA_FILTER='
       and all($root.identity_ledger[];
         (.task_id | nonempty_string)
         and (.scope | nonempty_string)
+        and (.retry_of | nullable_string)
         and (.session_id | nullable_string)
-        and (.handle | nullable_string)
-        and (.handle_history | type == "array")
+        and (valid_status(.status))
         and (.reserved_at | nonempty_string)
         and ((.bound_at == null) or (.bound_at | nonempty_string))
-        and all(.handle_history[];
-          (.handle | nonempty_string)
-          and (.recorded_at | nonempty_string)
-          and (.kind | type == "string" and valid_handle_kind(.))
-        )
-        and ((.session_id == null) == (.handle == null))
-        and ((.session_id == null) == ((.handle_history | length) == 0))
-        and (if .session_id == null
-             then (.handle == null and .handle_history == [])
-             else (.handle != null
-                   and (.handle_history | length > 0)
-                   and (.handle_history[0].kind == "launch")
-                   and (.handle_history[-1].handle == .handle)
-                   and all(.handle_history[1:][]?; .kind == "resume"))
+        and ((.activated_at == null) or (.activated_at | nonempty_string))
+        and ((.terminal_at == null) or (.terminal_at | nonempty_string))
+        and ((.retired_at == null) or (.retired_at | nonempty_string))
+        and ((.terminal_status == null) or valid_terminal(.terminal_status))
+        and (.terminal_evidence | type == "string")
+        and (if .status == "reserved" then .session_id == null
+             elif .status == "bound" then (.session_id != null and .bound_at != null and .activated_at == null)
+             elif .status == "active" then (.session_id != null and .bound_at != null and .activated_at != null)
+             else (.status == "retired" and .terminal_status != null and .terminal_at != null and .retired_at != null and (.terminal_evidence | nonempty_string))
              end)
       )
       and all($root.workers[];
         (.task_id | nonempty_string)
         and (.scope | nonempty_string)
+        and (.retry_of | nullable_string)
         and (.session_id | nullable_string)
-        and (.handle | nullable_string)
         and (valid_status(.status))
+        and (.status != "retired")
         and (.created_at | nonempty_string)
         and (.updated_at | nonempty_string)
         and ((.bound_at == null) or (.bound_at | nonempty_string))
         and ((.activated_at == null) or (.activated_at | nonempty_string))
-        and ((.terminal_at == null) or (.terminal_at | nonempty_string))
-        and ((.retired_at == null) or (.retired_at | nonempty_string))
-        and ((.terminal_evidence | type) == "string")
-        and ((.terminal_notes | type) == "string")
-        and ((.notes | type) == "string")
-        and ((.session_id == null) == (.handle == null))
-        and ((.session_id == null) == (.bound_at == null))
-        and (if .status == "reserved" then (.session_id == null and .bound_at == null and .activated_at == null)
-             elif .status == "bound" then (.session_id != null and .bound_at != null and .activated_at == null)
-             elif .status == "active" then (.session_id != null and .bound_at != null and .activated_at != null)
-             elif .status == "stopping" then (.session_id != null and .bound_at != null)
-             else true end)
-        and (if terminal_status(.status)
-             then (.terminal_at | nonempty_string) and (.terminal_evidence | nonempty_string)
-             else (.terminal_at == null and .terminal_status == null and .terminal_evidence == "") end)
-        and (if .status == "retired" then (.retired_at | nonempty_string) else .retired_at == null end)
-        and (if terminal_status(.status) then (terminal_status(.terminal_status)) else .terminal_status == null end)
+        and (.checkpoint_evidence | type == "string")
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
-      and (([$root.identity_ledger[].scope] | length) == ([$root.identity_ledger[].scope] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
-      and (([$root.identity_ledger[] | .handle_history[] | .handle] | length) == ([$root.identity_ledger[] | .handle_history[] | .handle] | unique | length))
       and (([$root.workers[].task_id] | length) == ([$root.workers[].task_id] | unique | length))
-      and (([$root.workers[].scope] | length) == ([$root.workers[].scope] | unique | length))
       and (([$root.workers[] | select(.session_id != null) | .session_id] | length) == ([$root.workers[] | select(.session_id != null) | .session_id] | unique | length))
-      and (([$root.workers[] | select(.handle != null) | .handle] | length) == ([$root.workers[] | select(.handle != null) | .handle] | unique | length))
+      and all($root.identity_ledger[];
+        . as $row
+        | if .retry_of == null then true
+          else any($root.identity_ledger[]; .task_id == $row.retry_of and .scope == $row.scope)
+          end
+      )
       and all($root.workers[];
         . as $worker
         | any($root.identity_ledger[];
           .task_id == $worker.task_id
           and .scope == $worker.scope
+          and .retry_of == $worker.retry_of
           and .session_id == $worker.session_id
-          and .handle == $worker.handle
+          and .status == $worker.status
           and .bound_at == $worker.bound_at
+          and .activated_at == $worker.activated_at
         )
       )
     ) catch false
@@ -120,333 +93,176 @@ readonly SCHEMA_FILTER='
 '
 
 usage() {
-  local exit_code="${1:-0}"
-  cat <<'EOF'
+	local exit_code="${1:-0}"
+	cat <<'EOF'
 Usage:
-  init.sh [--repo PATH|-C PATH] [--skills-root PATH]
+  init.sh [--repo PATH|-C PATH] [--state-root PATH] [--print-path]
 
-Initialize the current Git repository's persistent Luna worker registry.
-The command is idempotent. If project-local code-reviewer or Caveman is missing, init installs it from the repository root and may use the network.
+Validate project prerequisites and initialize a non-project worker registry.
+Init never installs skills and never changes repository files.
 EOF
-  exit "$exit_code"
+	exit "$exit_code"
 }
 
 die() {
-  local exit_code="$1"
-  shift
-  printf 'luna-local-review-loop: ERROR [%s] %s\n' "$exit_code" "$*" >&2
-  exit "$exit_code"
-}
-
-require_commands() {
-  local missing=''
-  local command_name
-  local required_commands=(bash git jq codex mktemp mkdir mv rm rmdir date kill ps sleep head awk cmp chmod stat)
-
-  for command_name in "${required_commands[@]}"; do
-    if ! command -v "$command_name" >/dev/null 2>&1; then
-      missing="${missing}${missing:+, }${command_name}"
-    fi
-  done
-
-  if [[ -n "$missing" ]]; then
-    die "$EXIT_PREREQUISITE" "missing runtime prerequisite(s): $missing. Check with 'command -v <name>'; install them through the repository/host-approved mechanism, then rerun init."
-  fi
-
-  if [[ "${BASH_VERSINFO[0]}" -lt 3 ]]; then
-    die "$EXIT_PREREQUISITE" "Bash 3 or newer is required (detected ${BASH_VERSION}). Run this script with a supported Bash executable; init does not install one."
-  fi
-}
-
-resolve_repo_root() {
-  local candidate
-  if [[ ! -d "$REPO_INPUT" ]]; then
-    die "$EXIT_REPOSITORY" "repository path does not exist or is not a directory: $REPO_INPUT. Pass --repo PATH for an existing Git repository."
-  fi
-
-  candidate="$(cd "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT. Check its permissions or pass a readable Git repository with --repo PATH."
-  if ! REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)"; then
-    die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate. Change to a repository or pass --repo PATH."
-  fi
-  REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve the Git repository root for: $candidate."
-  REGISTRY_DIR="$REPO_ROOT/.agents/agent-registry"
-  REGISTRY_PATH="$REGISTRY_DIR/registry.json"
-  LOCK_DIR="$REGISTRY_DIR/.lock"
-  CAVEMAN_SKILL_PATH="$REPO_ROOT/$CAVEMAN_SKILL_RELATIVE_PATH"
-  CODE_REVIEWER_SKILL_PATH="$REPO_ROOT/$CODE_REVIEWER_SKILL_RELATIVE_PATH"
-}
-
-is_project_local_code_reviewer_skill() {
-  [[ -f "$CODE_REVIEWER_SKILL_PATH" ]] || return 1
-  [[ ! -L "$REPO_ROOT/.agents" ]] || return 1
-  [[ ! -L "$REPO_ROOT/.agents/skills" ]] || return 1
-  [[ ! -L "$REPO_ROOT/.agents/skills/code-reviewer" ]] || return 1
-  [[ ! -L "$CODE_REVIEWER_SKILL_PATH" ]] || return 1
-  return "$EXIT_OK"
-}
-
-ensure_code_reviewer_skill() {
-  if is_project_local_code_reviewer_skill; then
-    return "$EXIT_OK"
-  fi
-
-  if ! command -v npx >/dev/null 2>&1; then
-    die "$EXIT_PREREQUISITE" "code-reviewer skill prerequisite/setup failed: npx is unavailable; expected project-local $CODE_REVIEWER_SKILL_PATH. Required command: npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -y. Install or enable npx, then rerun init. A global code-reviewer copy does not satisfy project setup."
-  fi
-
-  if ! (cd "$REPO_ROOT" && npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -y); then
-    die "$EXIT_PREREQUISITE" "code-reviewer skill prerequisite/setup failed: npx install command failed from repository root. Expected project-local $CODE_REVIEWER_SKILL_PATH. Fix npx or network access, then rerun init. A global code-reviewer copy does not satisfy project setup."
-  fi
-
-  if ! is_project_local_code_reviewer_skill; then
-    die "$EXIT_PREREQUISITE" "code-reviewer skill prerequisite/setup failed: npx returned success, but expected project-local $CODE_REVIEWER_SKILL_PATH is missing or not a regular project-local file. Inspect the install, then rerun init. A global code-reviewer copy does not satisfy project setup."
-  fi
-}
-
-is_project_local_caveman_skill() {
-  [[ -f "$CAVEMAN_SKILL_PATH" ]] || return 1
-  [[ ! -L "$REPO_ROOT/.agents" ]] || return 1
-  [[ ! -L "$REPO_ROOT/.agents/skills" ]] || return 1
-  [[ ! -L "$REPO_ROOT/.agents/skills/caveman" ]] || return 1
-  [[ ! -L "$CAVEMAN_SKILL_PATH" ]] || return 1
-  return "$EXIT_OK"
-}
-
-ensure_caveman_skill() {
-  if is_project_local_caveman_skill; then
-    return "$EXIT_OK"
-  fi
-
-  if ! command -v npx >/dev/null 2>&1; then
-    die "$EXIT_PREREQUISITE" "Caveman skill prerequisite/setup failed: npx is unavailable; expected project-local $CAVEMAN_SKILL_PATH. Required command: npx -y skills add https://github.com/juliusbrussee/caveman --skill caveman -y. Install or enable npx, then rerun init. A global Caveman copy does not satisfy project setup."
-  fi
-
-  if ! (cd "$REPO_ROOT" && npx -y skills add https://github.com/juliusbrussee/caveman --skill caveman -y); then
-    die "$EXIT_PREREQUISITE" "Caveman skill prerequisite/setup failed: npx install command failed from repository root. Expected project-local $CAVEMAN_SKILL_PATH. Fix npx or network access, then rerun init. A global Caveman copy does not satisfy project setup."
-  fi
-
-  if ! is_project_local_caveman_skill; then
-    die "$EXIT_PREREQUISITE" "Caveman skill prerequisite/setup failed: npx returned success, but expected project-local $CAVEMAN_SKILL_PATH is missing or not a regular project-local file. Inspect the install, then rerun init. A global Caveman copy does not satisfy project setup."
-  fi
+	local exit_code="$1"
+	shift
+	printf 'luna-local-review-loop: ERROR [%s] %s\n' "$exit_code" "$*" >&2
+	exit "$exit_code"
 }
 
 now_utc() {
-  local timestamp
-  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || die "$EXIT_FILESYSTEM" 'could not produce a UTC timestamp.'
-  [[ -n "$timestamp" ]] || die "$EXIT_FILESYSTEM" 'the date command returned an empty UTC timestamp.'
-  printf '%s' "$timestamp"
+	date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
-file_mode() {
-  local file_path="$1"
-  local mode
+require_commands() {
+	local missing=''
+	local command_name
+	local required_commands=(bash git jq codex mktemp mkdir mv rm rmdir date kill ps sleep awk chmod shasum dirname find wc tr head cat)
 
-  if mode="$(stat -f '%Lp' "$file_path" 2>/dev/null)"; then
-    printf '%s\n' "$mode"
-    return "$EXIT_OK"
-  fi
-  if mode="$(stat -c '%a' "$file_path" 2>/dev/null)"; then
-    printf '%s\n' "$mode"
-    return "$EXIT_OK"
-  fi
-  return 1
+	for command_name in "${required_commands[@]}"; do
+		if ! command -v "$command_name" >/dev/null 2>&1; then
+			missing="${missing}${missing:+, }${command_name}"
+		fi
+	done
+
+	[[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing runtime prerequisite(s): $missing. Install them through the approved host mechanism, then retry."
+	[[ "${BASH_VERSINFO[0]}" -ge 3 ]] || die "$EXIT_PREREQUISITE" "Bash 3 or newer is required (detected ${BASH_VERSION})."
+}
+
+resolve_paths() {
+	local candidate
+	local repo_fingerprint
+
+	[[ -d "$REPO_INPUT" ]] || die "$EXIT_REPOSITORY" "repository path does not exist or is not a directory: $REPO_INPUT."
+	candidate="$(cd "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
+	REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate."
+	REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
+	mkdir -p "$STATE_ROOT_INPUT" || die "$EXIT_FILESYSTEM" "cannot create state root: $STATE_ROOT_INPUT."
+	STATE_ROOT="$(cd "$STATE_ROOT_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot access state root: $STATE_ROOT_INPUT."
+	repo_fingerprint="$(printf '%s' "$REPO_ROOT" | shasum -a 256 | awk '{print $1}')"
+	[[ -n "$repo_fingerprint" ]] || die "$EXIT_FILESYSTEM" 'could not derive repository state key.'
+	REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
+	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
+	LOCK_DIR="$REGISTRY_DIR/.lock"
+}
+
+require_project_skills() {
+	local code_reviewer="$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
+	local caveman="$REPO_ROOT/.agents/skills/caveman/SKILL.md"
+	local missing=''
+
+	[[ -f "$code_reviewer" && ! -L "$code_reviewer" ]] || missing="${missing}${missing:+, }code-reviewer"
+	[[ -f "$caveman" && ! -L "$caveman" ]] || missing="${missing}${missing:+, }caveman"
+	[[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing project-local skill(s): $missing. Init is non-mutating. Install explicitly with '-a universal', review Skills CLI changes, then retry. code-reviewer: npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -a universal -y ; caveman: npx -y skills add https://github.com/juliusbrussee/caveman --skill caveman -a universal -y"
 }
 
 release_lock() {
-  if [[ "$LOCK_HELD" -eq 1 ]]; then
-    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-    LOCK_HELD=0
-  fi
-}
-
-acquire_lock() {
-  local attempt=0
-  local owner_pid=''
-
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    owner_pid=''
-    if [[ -f "$LOCK_DIR/pid" ]]; then
-      IFS= read -r owner_pid < "$LOCK_DIR/pid" || owner_pid=''
-      case "$owner_pid" in
-        ''|0|*[!0-9]*) ;;
-        *)
-          if pid_is_confirmed_nonexistent "$owner_pid"; then
-            rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-            if rmdir "$LOCK_DIR" 2>/dev/null; then
-              continue
-            fi
-          fi
-          ;;
-      esac
-    fi
-
-    attempt=$((attempt + 1))
-    if [[ "$attempt" -ge 300 ]]; then
-      die "$EXIT_LOCK" "registry lock is busy: $LOCK_DIR. Wait for the other registry command; if no command is running, inspect the lock owner and remove only the stale .lock directory before retrying."
-    fi
-    sleep 0.1
-  done
-
-  if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-    die "$EXIT_LOCK" "cannot record the registry lock owner at $LOCK_DIR/pid. Check permissions and retry."
-  fi
-  LOCK_HELD=1
-  trap release_lock EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+	if [[ "$LOCK_HELD" -eq 1 ]]; then
+		rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+		rmdir "$LOCK_DIR" 2>/dev/null || true
+		LOCK_HELD=0
+	fi
 }
 
 pid_is_confirmed_nonexistent() {
-  local owner_pid="$1"
-  local kill_error=''
-  local ps_output=''
+	local owner_pid="$1"
+	local kill_error=''
+	local ps_output=''
 
-  if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
-    return 1
-  fi
-
-  # kill -0 has no portable EPERM-versus-ESRCH exit status. A visible PID is
-  # live or inaccessible, so retain the lock. The ps probe is only a second
-  # presence check; an explicit no-process diagnostic is the stale proof.
-  if ps_output="$(ps -p "$owner_pid" -o pid= 2>/dev/null)"; then
-    if [[ "$ps_output" == *[![:space:]]* ]]; then
-      return 1
-    fi
-  fi
-
-  case "$kill_error" in
-    *[Nn]o\ such\ process*|*[Nn]o\ such\ file*|*[Nn]o\ process*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
+		return 1
+	fi
+	if ps_output="$(ps -p "$owner_pid" -o pid= 2>/dev/null)" && [[ "$ps_output" == *[![:space:]]* ]]; then
+		return 1
+	fi
+	case "$kill_error" in
+	*[Nn]o\ such\ process* | *[Nn]o\ such\ file* | *[Nn]o\ process*) return 0 ;;
+	*) return 1 ;;
+	esac
 }
 
-validate_registry_file() {
-  local registry_file="$1"
-  if [[ ! -s "$registry_file" ]] || ! jq -e "$SCHEMA_FILTER" "$registry_file" >/dev/null 2>&1; then
-    die "$EXIT_SCHEMA" "registry is missing or fails schema version 1 validation: $registry_file. Preserve it for investigation, then repair it with a valid registry or restore the repository's known-good registry before retrying."
-  fi
+acquire_lock() {
+	local attempt=0
+	local owner_pid=''
+
+	mkdir -p "$REGISTRY_DIR" || die "$EXIT_FILESYSTEM" "cannot create registry directory: $REGISTRY_DIR."
+	chmod 0700 "$REGISTRY_DIR" 2>/dev/null || die "$EXIT_FILESYSTEM" "cannot restrict registry directory permissions: $REGISTRY_DIR."
+	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+		owner_pid=''
+		[[ ! -f "$LOCK_DIR/pid" ]] || IFS= read -r owner_pid <"$LOCK_DIR/pid" || owner_pid=''
+		case "$owner_pid" in
+		'' | 0 | *[!0-9]*) ;;
+		*)
+			if pid_is_confirmed_nonexistent "$owner_pid"; then
+				rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+				if rmdir "$LOCK_DIR" 2>/dev/null; then
+					continue
+				fi
+			fi
+			;;
+		esac
+		attempt=$((attempt + 1))
+		[[ "$attempt" -lt 50 ]] || die "$EXIT_LOCK" "registry lock is busy: $LOCK_DIR. Inspect its owner and remove only a confirmed-stale lock."
+		sleep 0.1
+	done
+	LOCK_HELD=1
+	printf '%s\n' "$$" >"$LOCK_DIR/pid" || die "$EXIT_FILESYSTEM" "cannot record registry lock owner: $LOCK_DIR/pid."
+	trap release_lock EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
 }
 
-ensure_gitignore_entry() {
-  local gitignore_path="$REPO_ROOT/.gitignore"
-  local gitignore_mode='0644'
-  local temp_path
-
-  if [[ -L "$gitignore_path" ]]; then
-    die "$EXIT_FILESYSTEM" "repository .gitignore is a symbolic link: $gitignore_path. Init refuses to replace symlinks; replace it with a regular file or update the resolved target manually, then rerun init."
-  fi
-
-  if [[ -e "$gitignore_path" && ! -f "$gitignore_path" ]]; then
-    die "$EXIT_FILESYSTEM" "repository .gitignore is not a regular file: $gitignore_path. Resolve that path and rerun init."
-  fi
-
-  if [[ -f "$gitignore_path" ]]; then
-    gitignore_mode="$(file_mode "$gitignore_path")" || die "$EXIT_FILESYSTEM" "cannot read repository .gitignore mode: $gitignore_path. Check permissions and rerun init."
-    [[ -n "$gitignore_mode" ]] || die "$EXIT_FILESYSTEM" "repository .gitignore mode is empty: $gitignore_path. Check the filesystem and rerun init."
-  fi
-
-  temp_path="$(mktemp "$REPO_ROOT/.gitignore.luna.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create an atomic .gitignore temporary file under $REPO_ROOT. Check repository permissions."
-  if [[ -f "$gitignore_path" ]]; then
-    if ! awk -v entry="$GITIGNORE_ENTRY" '
-      $0 == entry {
-        if (!seen) {
-          print
-          seen = 1
-        }
-        next
-      }
-      { print }
-      END {
-        if (!seen) print entry
-      }
-    ' "$gitignore_path" > "$temp_path"; then
-      rm -f "$temp_path"
-      die "$EXIT_FILESYSTEM" "cannot read repository .gitignore: $gitignore_path. Check permissions and rerun init."
-    fi
-  else
-    printf '%s\n' "$GITIGNORE_ENTRY" > "$temp_path"
-  fi
-
-  if ! chmod "$gitignore_mode" "$temp_path"; then
-    rm -f "$temp_path"
-    die "$EXIT_FILESYSTEM" "cannot preserve repository .gitignore mode $gitignore_mode on the atomic temporary file. Check permissions and rerun init."
-  fi
-
-  if cmp -s "$temp_path" "$gitignore_path" 2>/dev/null; then
-    rm -f "$temp_path"
-  elif ! mv -f "$temp_path" "$gitignore_path"; then
-    rm -f "$temp_path"
-    die "$EXIT_FILESYSTEM" "cannot atomically update repository .gitignore: $gitignore_path. Check permissions and rerun init."
-  fi
+write_new_registry() {
+	local timestamp
+	local temp_path
+	timestamp="$(now_utc)"
+	temp_path="$(mktemp "$REGISTRY_DIR/.registry.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create temporary registry in $REGISTRY_DIR."
+	jq -n \
+		--arg root "$REPO_ROOT" \
+		--arg timestamp "$timestamp" \
+		'{schema_version: 2, registry: "luna-local-review-loop", repository_root: $root, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' >"$temp_path"
+	jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" 'new registry failed schema validation.'
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry permissions: $temp_path."
+	mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish registry: $REGISTRY_PATH."
 }
 
-ensure_registry() {
-  local temp_path
-  local timestamp
-
-  if [[ -e "$REGISTRY_PATH" ]]; then
-    [[ -f "$REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "registry path is not a regular file: $REGISTRY_PATH. Preserve it and repair the path before retrying."
-    validate_registry_file "$REGISTRY_PATH"
-    if [[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" != "$REPO_ROOT" ]]; then
-      die "$EXIT_SCHEMA" "registry repository_root does not match the target Git root $REPO_ROOT: $REGISTRY_PATH. Do not reuse a registry from another repository; inspect or remove only the target repository's registry after preserving evidence."
-    fi
-    return "$EXIT_OK"
-  fi
-
-  timestamp="$(now_utc)"
-  temp_path="$(mktemp "$REGISTRY_DIR/registry.json.tmp.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create an atomic registry temporary file under $REGISTRY_DIR. Check repository permissions."
-  if ! jq -n \
-    --arg repo_root "$REPO_ROOT" \
-    --arg timestamp "$timestamp" \
-    '{schema_version: 1, registry: "luna-local-review-loop", repository_root: $repo_root, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' \
-    > "$temp_path"; then
-    rm -f "$temp_path"
-    die "$EXIT_FILESYSTEM" "jq could not create the initial registry JSON at $REGISTRY_PATH. Verify jq and filesystem permissions."
-  fi
-  validate_registry_file "$temp_path"
-  if ! mv -f "$temp_path" "$REGISTRY_PATH"; then
-    rm -f "$temp_path"
-    die "$EXIT_FILESYSTEM" "cannot atomically install the registry at $REGISTRY_PATH. Check repository permissions and retry."
-  fi
-}
-
+PRINT_PATH=0
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --repo|-C)
-      [[ $# -ge 2 ]] || usage "$EXIT_USAGE"
-      REPO_INPUT="$2"
-      shift 2
-      ;;
-    --skills-root)
-      [[ $# -ge 2 ]] || usage "$EXIT_USAGE"
-      SKILLS_ROOT="$2"
-      shift 2
-      ;;
-    --help|-h)
-      usage "$EXIT_OK"
-      ;;
-    *)
-      die "$EXIT_USAGE" "unknown argument: $1. Use --help for usage."
-      ;;
-  esac
+	case "$1" in
+	--repo | -C)
+		[[ $# -ge 2 ]] || die "$EXIT_USAGE" "missing value for $1."
+		REPO_INPUT="$2"
+		shift 2
+		;;
+	--state-root)
+		[[ $# -ge 2 ]] || die "$EXIT_USAGE" 'missing value for --state-root.'
+		STATE_ROOT_INPUT="$2"
+		shift 2
+		;;
+	--print-path)
+		PRINT_PATH=1
+		shift
+		;;
+	--help | -h) usage "$EXIT_OK" ;;
+	*) die "$EXIT_USAGE" "unknown argument: $1. Use --help for usage." ;;
+	esac
 done
 
 require_commands
-[[ -d "$SKILLS_ROOT" ]] || die "$EXIT_PREREQUISITE" "skills root does not exist or is not a directory: $SKILLS_ROOT. Pass --skills-root PATH for the active skills directory."
-SKILLS_ROOT="$(cd "$SKILLS_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_PREREQUISITE" "cannot access skills root: $SKILLS_ROOT. Check permissions and rerun init."
-resolve_repo_root
-ensure_code_reviewer_skill
-ensure_caveman_skill
-mkdir -p "$REGISTRY_DIR" || die "$EXIT_FILESYSTEM" "cannot create registry directory: $REGISTRY_DIR. Check repository permissions."
+resolve_paths
+require_project_skills
 acquire_lock
-ensure_gitignore_entry
-ensure_registry
+if [[ -e "$REGISTRY_PATH" ]]; then
+	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "registry is not a regular file: $REGISTRY_PATH."
+	jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 2 validation: $REGISTRY_PATH. Preserve it for investigation."
+	[[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" == "$REPO_ROOT" ]] || die "$EXIT_SCHEMA" "registry repository root does not match $REPO_ROOT: $REGISTRY_PATH."
+else
+	write_new_registry
+fi
 
-printf 'Initialized Luna worker registry: %s\n' "$REGISTRY_PATH"
-printf 'Schema: version 1; identity ledger is append-only and terminal entries are prunable.\n'
+if [[ "$PRINT_PATH" -eq 1 ]]; then
+	printf '%s\n' "$REGISTRY_PATH"
+else
+	printf 'Initialized Luna worker registry outside project: %s\n' "$REGISTRY_PATH"
+fi

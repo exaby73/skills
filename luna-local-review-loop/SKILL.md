@@ -1,165 +1,116 @@
 ---
 name: luna-local-review-loop
-description: Route local repository implementation, documentation, testing, validation, and review fixes between the parent and fresh GPT-5.6 Luna Max workers, using parent-owned durable goal and plan state, least-privilege permission brokerage, explicit one-task ownership, a persistent worker registry, and repeated parent code-reviewer passes until local approval. Use when Codex must decide whether local changes remain parent-direct or run through subagents while keeping worker execution and validation evidence bounded.
+description: Route local repository implementation, documentation, testing, validation, and review fixes between a parent and fresh GPT-5.6 Luna Max workers. Use for non-trivial local work requiring one-task worker isolation, resumable registered sessions, least-privilege permission brokerage, structured results, mandatory cleanup, and parent-owned code review and delivery.
 ---
 
 # Luna Local Review Loop
 
-Use this skill to route local repository work between the parent and Luna Max, then finish with an approved parent review. Read [README.md](README.md) for the operator contract and use the bundled scripts as the registry source of truth.
-
-The registry requires `activate` to receive the current handle and a latest
-identity-ledger history entry with `kind: "resume"`; the launch handle and an
-omitted handle are rejected. `init` rejects a symbolic-link `.gitignore`
-instead of replacing it. Lock reclamation treats a failed `kill -0` as
-ambiguous and removes a lock only after a confirmed-nonexistent PID probe.
+Route local work to fresh Luna Max workers, then have the parent validate and review the combined result. Read [README.md](README.md) before first use. Treat the bundled scripts as the worker-registry source of truth.
 
 ## Identify the role
 
-- Determine whether this invocation is the parent or a delegated worker before acting. Only the parent may decompose work, reserve or bind worker identities, launch, collect, retire, or coordinate workers, and only the parent runs the parent-owned review and delivery loop.
-- A delegated worker executes its assigned task directly. It must never spawn, delegate to, or coordinate another worker. It skips parent-only routing, launch, orchestration, delivery, and review-monitor steps; it validates the exact scope and reports evidence to the parent.
-- Both parent and delegated workers must read and use the target repository's project-local `.agents/skills/caveman/SKILL.md` for user-facing output before repository work. The parent ensures this dependency through `init`; each delegated worker verifies the same project-local path before acting. Never substitute a global or active-skills-root copy.
+- The parent owns decomposition, launch, permissions, durable goals/plans, validation judgment, review, commits, delivery, CI, and GitHub state.
+- A worker owns exactly one immutable task. It never delegates, stages, commits, pushes, reviews the combined change, or manages GitHub/CI state.
+- Both roles read the target repository's `AGENTS.md` hierarchy and project-local `.agents/skills/caveman/SKILL.md` before work. Both use Caveman for user-facing output. Never substitute a global Caveman copy.
+- The parent alone invokes the project-local `code-reviewer` skill. Never delegate parent review to Luna. Obey any project rule that fixes the parent reviewer model/reasoning configuration.
 
-## Own durable state
+## Initialize without repository mutation
 
-- When the user request or repository rules require a goal, have the parent define or retrieve it. The parent owns and manages the durable goal and plan state, including scope, acceptance criteria, validators, evidence, status, completion, and blocking decisions. Workers may report evidence against that state, but never own durable goal or plan state. When no goal is requested or required, do not create one merely to delegate work.
-- Keep the parent responsible for decomposition, worker launch and collection, cross-worker decisions, permission brokerage, and final local review with `code-reviewer`.
-- Define an explicit scope, owned paths, expected result, and validator for every worker task. Have the worker execute the task, run the validator, interpret its result, and report the changed-file summary, result, validator command and output, and unresolved limitations; have the parent judge completion from that evidence.
-- Require workers to leave staging and commits untouched. Workers must never stage or commit.
+Run once per repository or after runtime cleanup:
 
-## Parent-owned delivery state
-
-- The parent exclusively owns commits, pushes, CI collection and remediation, pull-request lifecycle, review replies and resolution, and review-monitor/automation management.
-- Workers only report GitHub/CI evidence made available to them and never mutate delivery state. They do not perform delivery operations, manage CI, or change pull-request or review state.
-
-## Route work (parent only)
-
-- Let the parent execute directly only when the task is clearly trivial: expected to take no more than 2 minutes, normally touch no more than 1 file, have no meaningful external side effect or long validation, and cost less to do directly than to start and coordinate a worker. Examples include generating a commit message or making a single targeted file edit.
-- Use Luna Max for everything else. Luna Max is mandatory when a task may touch 3 or more files or may exceed 5 minutes. In the grey zone, bias toward Luna.
-- Treat the approximately 95% Luna / 5% parent-direct split as operating intent, not a quota. Parent-direct work still obeys repository rules and required validation.
-
-## Launch Luna Max (parent only)
-
-The worker identity is not known before `codex exec` starts. Reserve the task and exact scope first, launch a handshake that does no repository work, capture the emitted session ID and process/agent handle, and bind them exactly once. The handshake invocation then ends. Resume that exact session with stdin pending, record its fresh resume handle, activate with that current handle, and only then feed the reserved task prompt and EOF. A one-shot `codex exec` prompt cannot wait for a later parent message.
-
-```zsh
+```sh
 skill_root='/absolute/path/to/luna-local-review-loop'
 repo_root='/absolute/path/to/repository'
-task_id='issue-123-worker-1'
-task_sandbox='workspace-write' # use read-only for investigation, planning, or review; workspace-write for repository changes
-readonly task_sandbox
-task_scope="owned paths: src/a.ts; exact task: implement validator; sandbox: $task_sandbox; validator: pnpm check; no staging or commits"
-
-"$skill_root/scripts/registry.sh" reserve \
-  --repo "$repo_root" \
-  --task-id "$task_id" \
-  --scope "$task_scope"
-
-launch_argv=(codex exec \
-  -m 'gpt-5.6-luna' \
-  -c 'model_reasoning_effort="max"' \
-  -s "$task_sandbox" \
-  -C "$repo_root" \
-  'Handshake only. Do not read, write, test, or otherwise work in the repository. Reply exactly READY_TO_BIND, then stop so the parent can bind this session and resume it with the reserved task.')
-
-# Start launch_argv through supported orchestration and let the handshake exit.
-# Capture identifiers returned by Codex and the orchestration layer.
-# Do not substitute a background-shell PID from $!.
-captured_session_id='<session ID emitted by codex exec>'
-launch_handle='<completed handshake process or agent handle returned by orchestration>'
-"$skill_root/scripts/registry.sh" bind \
-  --repo "$repo_root" \
-  --task-id "$task_id" \
-  --session-id "$captured_session_id" \
-  --handle "$launch_handle"
-
-# Through supported orchestration, start this exact argv with stdin pending:
-# codex exec resume -m gpt-5.6-luna -c model_reasoning_effort=max "$captured_session_id" -
-# Capture the fresh live process/agent handle before writing stdin.
-captured_handle='<fresh resume process or agent handle returned by orchestration>'
-"$skill_root/scripts/registry.sh" record-resume-handle \
-  --repo "$repo_root" \
-  --task-id "$task_id" \
-  --session-id "$captured_session_id" \
-  --handle "$captured_handle"
-"$skill_root/scripts/registry.sh" activate \
-  --repo "$repo_root" \
-  --task-id "$task_id" \
-  --session-id "$captured_session_id" \
-  --handle "$captured_handle"
-
-task_prompt="$(printf '%s\n' \
-  "TASK ID: $task_id" \
-  "RESERVED SCOPE: $task_scope" \
-  'Execute only this reserved task. Read repository instructions and the project-local Caveman skill first. Report changed files, result, validator command/output, and limitations. Do not stage or commit.')"
-# Only after activation succeeds, invoke the supported orchestration stdin-write
-# operation for captured_handle with task_prompt, then close that stdin (EOF).
-# Collect output until this exact resumed process exits.
+"$skill_root/scripts/init.sh" --repo "$repo_root"
 ```
 
-Choose `task_sandbox` before reservation and the handshake, include it in the immutable task scope, and launch the session with that value. Same-session resume inherits the session sandbox; `codex exec resume` does not accept `-s`, so do not retry it with a sandbox override. Use the minimum sandbox that permits the scoped task: `read-only` for investigation, planning, or review tasks requiring no writes; `workspace-write` for implementation, documentation, tests, or other repository changes. The resumed worker prompt must release only the reserved one-task scope after activation. Never treat the handshake prompt as the task prompt. Any broader access still goes through permission brokerage. Never use a replacement identity, `--last`, or an unrecorded session. Stop if Luna Max cannot run and ask the user to choose Luna High, Terra High, or no subagents rather than silently changing the model or reasoning effort.
+Init validates `codex`, `jq`, Git, project-local Caveman, and project-local code-reviewer. It stores the registry below `${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}` using a deterministic repository key. It never edits `.gitignore`, `skills-lock.json`, `.agents/skills`, or another repository file, and never installs from the network. If a skill is missing, init prints explicit universal-target install commands; the parent decides whether to run them and reviews the resulting project changes.
 
-Every worker session is fresh and owns exactly one task. Once terminal, its session and handle are permanently retired; start later work or a new finding with a fresh task and fresh identity.
+## Route work
 
-## Resume the same task after permission brokerage (parent only)
+- Parent-direct only when clearly trivial: normally at most two minutes, one file, no meaningful external side effect, and cheaper than worker coordination.
+- Use Luna Max for everything else. Luna is mandatory when work may touch three or more files or exceed five minutes. Bias toward Luna in the grey zone.
+- Decompose independent tasks into non-overlapping owned paths, one expected result, one validator, one sandbox, and explicit exclusions. Each worker receives one task only and is retired at terminal state. Never reuse a worker for another task.
+- Apply repository command gates before launch. Commands reserved for the parent, including elevated tests, stay parent-owned even if the worker sandbox could run them.
 
-Same-session `codex exec resume` can return a new outer orchestration process or agent handle. Preserve the bound session and immutable task, but record each fresh handle before sending the approved command result:
+## Launch an atomic registered worker
 
-```zsh
-captured_session_id='<exact bound session ID>'
+Write the full task to a temporary prompt file outside the repository diff. Include task ID, immutable scope, owned paths, validator, repository rules, Caveman requirement, no-stage/no-commit rule, and structured evidence expectations.
 
-# Through supported orchestration, start this exact argv with stdin pending:
-# codex exec resume -m gpt-5.6-luna -c model_reasoning_effort=max "$captured_session_id" -
-# Capture the fresh process/agent handle returned by that orchestration.
-# Do not substitute a background-shell PID from $!.
-captured_handle='<fresh process or agent handle returned by orchestration>'
+```sh
+task_id='issue-123-validator'
+task_scope='owned paths: src/a.ts; task: implement validator; validator: pnpm check; sandbox: workspace-write; no staging or commits'
 
-"$skill_root/scripts/registry.sh" record-resume-handle \
+"$skill_root/scripts/run-worker.sh" launch \
   --repo "$repo_root" \
   --task-id "$task_id" \
-  --session-id "$captured_session_id" \
-  --handle "$captured_handle"
-
-# Only after record-resume-handle succeeds, feed the exact approved command,
-# exit status, and captured output to the still-pending stdin.
+  --scope "$task_scope" \
+  --sandbox workspace-write \
+  --prompt-file '/absolute/path/to/task-prompt.txt'
 ```
 
-Use `record-resume-handle` only for the exact task ID and exact bound session ID, with the globally unused process/agent handle returned by supported orchestration. A shell PID is not an orchestration handle. Never use `--last`, a replacement session, or a different model. After recording, pass the current handle to later `update` and `retire`; old handles must fail exact validation. Handle history remains in the append-only identity ledger after worker pruning.
+The launcher atomically reserves the task, starts a non-ephemeral handshake, captures the Codex session ID from JSONL even when the command exits immediately, binds and activates that session, resumes it with prompt-file stdin, and writes streaming logs outside the project. It returns only the final structured result on stdout.
 
-## Orchestrate work and close the loop (parent only)
+Never add `--ephemeral` to a resumable worker. The durable identity is the Codex session ID (`01...`). A live `exec_command.session_id` integer is only a transient inner process-control handle. A `functions.exec` cell ID and a shell PID are neither worker identities nor accepted registry handles. The registry intentionally stores none of those process handles.
 
-Before reserve or worker execution, read the applicable repository instructions, including `AGENTS.md` and any local instruction files. Hand off every command class those instructions reserve for the parent or require elevated execution. Apply this gate even when the worker sandbox would allow the command: if a repository requires every pnpm test command to run elevated, including `pnpm test` and `pnpm run test:*`, the parent owns and runs all of those tests through the required elevated path and the worker must not run them.
+The launcher uses `--ignore-user-config` so unrelated MCP servers/connectors do not start. Add task-relevant context to the prompt or target repository configuration; do not re-enable the full user connector set merely for convenience.
 
-1. Decompose the request into worker-sized tasks and attach a concrete validator to each task.
-2. Apply the repository-instruction gate, reserve the exact scope, and launch only after the reserve succeeds. Run independent workers in parallel only when their scopes are independent, owned paths do not overlap, and each has an explicit validator. Otherwise, run tasks sequentially and collect each result before starting dependent work.
-3. Bind the handshake session ID and launch handle exactly once. Resume that exact session with stdin pending, record the fresh resume handle, activate with that handle, and then feed the exact reserved task and EOF. Collect the worker’s changed-file summary, result, validator command and output, and any unresolved limitation. Treat a failed or unrun validator as unresolved work.
-4. Invoke the parent `code-reviewer` skill against the complete local change and relevant repository context.
-5. Route every local review finding and remote CI failure through the same threshold. After a push, the parent watches and collects CI evidence, then routes each failure and its fix as a fresh Luna Max task; let the parent handle it directly only when it independently qualifies as a clearly trivial parent-direct task. Include the finding or failure evidence, exact owned scope, and validator; do not silently fold a worker-routed issue into another task.
-6. Re-run the parent `code-reviewer` review after each finding or CI failure fix and validation. Repeat the routed-fix/review cycle until the parent review explicitly approves the local change. When remote delivery/CI applies, re-check CI on the latest head after fixes and require success before reporting pull-request readiness.
+Use `read-only` for investigation/review and `workspace-write` for implementation. The parent shell must separately allow the owning Codex runtime-state directory (normally `$CODEX_HOME` or `~/.codex`) to be written. This runtime permission is distinct from the worker repository sandbox. If the launcher reports exit 11, stop and obtain that narrow outer permission; never broaden the repository sandbox as a workaround.
 
-## Broker blocked permissions
+## Continue the exact task after parent action
 
-Require a non-interactive worker that cannot proceed to stop and return all four items:
+If the structured result is `needs_parent_action`, the registry keeps that task active. The parent reviews and, if safe and authorized, performs only the exact requested action. Put the command, exit status, and captured output in a new temporary prompt file, then resume the exact registered session:
 
-```text
-BLOCKED COMMAND: <exact command>
-REASON: <why it is blocked>
-EXPECTED SIDE EFFECTS: <what the command may change>
-PERMISSION NEEDED: <specific permission>
+```sh
+"$skill_root/scripts/run-worker.sh" continue \
+  --repo "$repo_root" \
+  --task-id "$task_id" \
+  --prompt-file '/absolute/path/to/parent-result.txt'
 ```
 
-- Review the exact command for safety, scope, and least privilege. If it is safe and in scope, run only that exact command through the parent approval path and return its output to the worker for interpretation.
-- Do not substitute a command, broaden permissions, or ask the worker to work around the block. Stop and ask the user when the exact command is unsafe, out of scope, or its permission is ambiguous.
-- Apply this brokerage to tests, containers, Docker, network access, external-file operations, and any other command requiring an approval unavailable to a non-interactive worker.
-- After the parent runs the exact approved command, use the resume handshake above. Start the exact same session with stdin pending, capture the new outer handle, record it, then feed the captured result so the same worker can interpret it and continue that same task:
+No PTY, manual EOF, `--last`, replacement session, or process handle is used. Continue may only resume an active registered task. Repeat only for the same immutable scope.
 
-  ```zsh
-  codex exec resume -m gpt-5.6-luna -c model_reasoning_effort=max '<captured-session-id>' -
-  ```
+If a launch failed or was interrupted, retire it with evidence, then retry the exact scope using a fresh task ID linked to the failed attempt:
 
-  Keep stdin pending until `record-resume-handle` succeeds. Then feed the exact command, exit status, and captured output. Use the captured session ID and newly recorded current handle, not `--last`, a new worker, or a different model; this continuation is only for the same task and exact scope. If the repository instruction gate requires an elevated pnpm test, the parent runs that exact command and returns its result before resuming.
+```sh
+"$skill_root/scripts/run-worker.sh" launch \
+  --repo "$repo_root" \
+  --task-id 'issue-123-validator-retry-1' \
+  --scope "$task_scope" \
+  --retry-of "$task_id" \
+  --prompt-file '/absolute/path/to/task-prompt.txt'
+```
 
-## Close every worker lifecycle
+Only retired `failed` or `interrupted` attempts permit exact-scope retry. The ledger keeps both identities and their link.
 
-Before the parent marks a goal complete or blocked, it must collect evidence, interrupt or terminate real workers only through supported orchestration, wait for shutdown, record terminal state and evidence with `registry.sh update` using the current handle, permanently retire every exact bound session with `registry.sh retire` using the current handle, prune terminal entries with `registry.sh prune`/`clear`, and run both `assert-no-active` and `assert-empty`. A reserved launch that never bound an identity is retired by task ID with launch-failure evidence. If cleanup cannot be completed, the goal is not complete or safely blocked; report the concrete blocker and preserve the registry for recovery. The registry never kills arbitrary processes and never deletes Codex history.
+## Judge evidence and review
 
-Keep the loop local, evidence-based, and bounded by the stated task scopes and validators.
+Each structured worker result contains outcome, concise summary, changed files, validator commands/status/evidence, unresolved items, and any required parent action. Streaming JSONL and repeated diffs stay in the external artifact directory shown on stderr.
+
+1. Collect all worker results and inspect the actual repository diff.
+2. Run every parent-owned or still-required validator under repository rules. A missing or failed validator remains unresolved.
+3. Invoke the parent `code-reviewer` skill over the complete change and applicable `AGENTS.md` guidance.
+4. Route each real finding as a fresh one-task worker unless it independently qualifies as trivial parent-direct work.
+5. Validate fixes and repeat parent review until explicitly approved.
+6. The parent alone stages, commits, pushes, manages CI/PRs, replies to reviews, and resolves threads.
+
+## Close every lifecycle
+
+The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
+
+```sh
+"$skill_root/scripts/run-worker.sh" finish \
+  --repo "$repo_root" \
+  --task-id "$task_id" \
+  --status interrupted \
+  --evidence 'parent stopped the task after process failure'
+```
+
+Before completing or blocking any parent goal, terminate any real live invocation through supported orchestration, retire every reserved/bound/active registry entry with evidence, then run both checks:
+
+```sh
+"$skill_root/scripts/registry.sh" assert-no-active --repo "$repo_root"
+"$skill_root/scripts/registry.sh" assert-empty --repo "$repo_root"
+```
+
+If cleanup cannot be proven, the parent goal is not safely terminal. Preserve the external registry/artifacts and report the blocker. The registry never kills arbitrary processes and never deletes Codex history.
