@@ -26,8 +26,9 @@ REASONING_EFFORT='max'
 CODEX_BIN="${CODEX_BIN:-codex}"
 FINISHED=0
 SESSION_ID=''
-INVOCATION_LOCK=''
-INVOCATION_LOCK_HELD=0
+INVOCATION_TOKEN=''
+INVOCATION_CLAIMED=0
+CODEX_CHILD_PID=''
 
 usage() {
 	local exit_code="${1:-0}"
@@ -71,61 +72,47 @@ validate_common() {
 
 finish_on_error() {
 	local exit_code=$?
-	release_invocation_lock
 	if [[ "$FINISHED" -eq 0 && -n "$TASK_ID" ]]; then
 		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status failed --evidence "worker launcher exited $exit_code before a structured terminal result" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null 2>&1 || true
 	fi
+	INVOCATION_CLAIMED=0
 	exit "$exit_code"
 }
 
-release_invocation_lock() {
-	if [[ "$INVOCATION_LOCK_HELD" -eq 1 ]]; then
-		rm -f "$INVOCATION_LOCK/pid" 2>/dev/null || true
-		rmdir "$INVOCATION_LOCK" 2>/dev/null || true
-		INVOCATION_LOCK_HELD=0
+claim_invocation() {
+	INVOCATION_TOKEN="invocation-$$-${RANDOM:-0}-$(date -u '+%Y%m%dT%H%M%S')"
+	"$REGISTRY_SCRIPT" claim-invocation --task-id "$TASK_ID" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null
+	INVOCATION_CLAIMED=1
+}
+
+release_invocation() {
+	if [[ "$INVOCATION_CLAIMED" -eq 1 ]]; then
+		"$REGISTRY_SCRIPT" release-invocation --task-id "$TASK_ID" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null
+		INVOCATION_CLAIMED=0
 	fi
 }
 
-invocation_owner_is_gone() {
-	local owner_pid="$1"
-	local kill_error=''
-	local ps_output=''
-
-	if kill_error="$(kill -0 "$owner_pid" 2>&1)"; then
-		return 1
+stop_codex_child_and_exit() {
+	local signal_name="$1"
+	local exit_code="$2"
+	local child_pid="$CODEX_CHILD_PID"
+	if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+		kill -s "$signal_name" "$child_pid" 2>/dev/null || true
+		wait "$child_pid" 2>/dev/null || true
 	fi
-	if ps_output="$(ps -p "$owner_pid" -o pid= 2>/dev/null)" && [[ "$ps_output" == *[![:space:]]* ]]; then
-		return 1
-	fi
-	case "$kill_error" in
-	*[Nn]o\ such\ process* | *[Nn]o\ such\ file* | *[Nn]o\ process*) return 0 ;;
-	*) return 1 ;;
-	esac
+	CODEX_CHILD_PID=''
+	exit "$exit_code"
 }
 
-acquire_invocation_lock() {
-	local artifact_dir="$1"
-	local owner_pid=''
-	INVOCATION_LOCK="$artifact_dir/.invocation-lock"
-	if ! mkdir "$INVOCATION_LOCK" 2>/dev/null; then
-		[[ ! -f "$INVOCATION_LOCK/pid" ]] || IFS= read -r owner_pid <"$INVOCATION_LOCK/pid" || owner_pid=''
-		case "$owner_pid" in
-		'' | 0 | *[!0-9]*) ;;
-		*)
-			if invocation_owner_is_gone "$owner_pid"; then
-				rm -f "$INVOCATION_LOCK/pid" 2>/dev/null || true
-				rmdir "$INVOCATION_LOCK" 2>/dev/null || true
-			fi
-			;;
-		esac
-		mkdir "$INVOCATION_LOCK" 2>/dev/null || die "$EXIT_WORKER" "another invocation already owns task $TASK_ID: $INVOCATION_LOCK."
-	fi
-	INVOCATION_LOCK_HELD=1
-	if ! printf '%s\n' "$$" >"$INVOCATION_LOCK/pid"; then
-		release_invocation_lock
-		die "$EXIT_WORKER" "cannot record invocation lock owner: $INVOCATION_LOCK/pid."
-	fi
+wait_for_codex_child() {
+	local child_status=0
+	wait "$CODEX_CHILD_PID" || child_status=$?
+	CODEX_CHILD_PID=''
+	return "$child_status"
 }
+
+trap 'stop_codex_child_and_exit INT 130' INT
+trap 'stop_codex_child_and_exit TERM 143' TERM
 
 extract_session_id() {
 	local log_path="$1"
@@ -154,20 +141,27 @@ resume_task() {
 	local stream_log
 	local stream_stderr
 	local result_path
-	attempt="$(find "$artifact_dir" -maxdepth 1 -type f -name 'stream-*.jsonl' 2>/dev/null | wc -l | tr -d ' ')"
+	local existing_stream
+	attempt=0
+	for existing_stream in "$artifact_dir"/stream-*.jsonl; do
+		[[ -f "$existing_stream" ]] || continue
+		attempt=$((attempt + 1))
+	done
 	attempt=$((attempt + 1))
 	stream_log="$artifact_dir/stream-$attempt.jsonl"
 	stream_stderr="$artifact_dir/stream-$attempt.stderr.log"
 	result_path="$artifact_dir/result-$attempt.json"
 
-	if ! "$CODEX_BIN" exec resume \
+	"$CODEX_BIN" exec resume \
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		--json \
 		--output-schema "$RESULT_SCHEMA" \
 		--output-last-message "$result_path" \
-		"$SESSION_ID" - <"$PROMPT_FILE" >"$stream_log" 2>"$stream_stderr"; then
+		"$SESSION_ID" - <"$PROMPT_FILE" >"$stream_log" 2>"$stream_stderr" &
+	CODEX_CHILD_PID=$!
+	if ! wait_for_codex_child; then
 		die "$EXIT_WORKER" "Codex resume failed for task $TASK_ID. Logs: $stream_log and $stream_stderr"
 	fi
 	validate_result "$result_path" || die "$EXIT_WORKER" "worker returned invalid structured output: $result_path."
@@ -180,19 +174,21 @@ resume_task() {
 	completed)
 		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status completed --evidence "$evidence" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null
 		FINISHED=1
+		INVOCATION_CLAIMED=0
 		;;
 	blocked)
 		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status blocked --evidence "$evidence" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null
 		FINISHED=1
+		INVOCATION_CLAIMED=0
 		;;
 	needs_parent_action)
 		"$REGISTRY_SCRIPT" checkpoint --task-id "$TASK_ID" --evidence "$evidence" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null
+		release_invocation
 		FINISHED=1
 		;;
 	esac
 	cat "$result_path"
 	printf '\nWorker artifacts: %s\n' "$artifact_dir" >&2
-	release_invocation_lock
 }
 
 launch_worker() {
@@ -213,18 +209,20 @@ launch_worker() {
 	artifact_dir="$registry_dir/artifacts/$TASK_ID"
 	mkdir -p "$artifact_dir"
 	chmod 0700 "$registry_dir/artifacts" "$artifact_dir" 2>/dev/null || true
-	acquire_invocation_lock "$artifact_dir"
+	claim_invocation
 	launch_log="$artifact_dir/launch.jsonl"
 	launch_stderr="$artifact_dir/launch.stderr.log"
 
-	if ! "$CODEX_BIN" exec \
+	"$CODEX_BIN" exec \
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		-s "$TASK_SANDBOX" \
 		-C "$REPO_INPUT" \
 		--json \
-		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' >"$launch_log" 2>"$launch_stderr"; then
+		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' >"$launch_log" 2>"$launch_stderr" &
+	CODEX_CHILD_PID=$!
+	if ! wait_for_codex_child; then
 		SESSION_ID="$(extract_session_id "$launch_log")"
 		[[ -z "$SESSION_ID" ]] || "$REGISTRY_SCRIPT" bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null
 		die "$EXIT_WORKER" "Codex handshake failed for task $TASK_ID. Logs: $launch_log and $launch_stderr"
@@ -246,7 +244,7 @@ continue_worker() {
 	registry_dir="$(dirname "$registry_path")"
 	artifact_dir="$registry_dir/artifacts/$TASK_ID"
 	[[ -d "$artifact_dir" ]] || die "$EXIT_WORKER" "worker artifact directory is missing: $artifact_dir."
-	acquire_invocation_lock "$artifact_dir"
+	claim_invocation
 	trap finish_on_error EXIT
 	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")"
 	[[ "$(jq -r '.status' <<<"$worker")" == active ]] || die "$EXIT_WORKER" "continue requires an active registered task: $TASK_ID."
@@ -261,10 +259,11 @@ finish_worker() {
 	registry_path="$($REGISTRY_SCRIPT path --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")"
 	artifact_dir="$(dirname "$registry_path")/artifacts/$TASK_ID"
 	[[ -d "$artifact_dir" ]] || die "$EXIT_WORKER" "worker artifact directory is missing: $artifact_dir."
-	acquire_invocation_lock "$artifact_dir"
-	trap release_invocation_lock EXIT
+	claim_invocation
+	trap finish_on_error EXIT
 	"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status "$FINISH_STATUS" --evidence "$FINISH_EVIDENCE" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
-	release_invocation_lock
+	FINISHED=1
+	INVOCATION_CLAIMED=0
 }
 
 [[ $# -gt 0 ]] || usage "$EXIT_USAGE"

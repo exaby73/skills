@@ -13,11 +13,13 @@ readonly EXIT_FILESYSTEM=10
 
 REPO_INPUT='.'
 STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
+CODEX_BIN="${CODEX_BIN:-codex}"
 REPO_ROOT=''
 STATE_ROOT=''
 REGISTRY_DIR=''
 REGISTRY_PATH=''
 LOCK_DIR=''
+LEGACY_REGISTRY_PATH=''
 LOCK_HELD=0
 
 readonly SCHEMA_FILTER='
@@ -65,6 +67,8 @@ readonly SCHEMA_FILTER='
         and ((.bound_at == null) or (.bound_at | nonempty_string))
         and ((.activated_at == null) or (.activated_at | nonempty_string))
         and (.checkpoint_evidence | type == "string")
+        and ((.invocation_pid == null and .invocation_token == null)
+             or ((.invocation_pid | nonempty_string) and (.invocation_token | nonempty_string)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
@@ -133,6 +137,9 @@ require_commands() {
 	done
 
 	[[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing runtime prerequisite(s): $missing. Install them through the approved host mechanism, then retry."
+	if [[ "$EXISTING_ONLY" -eq 0 ]] && ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
+		die "$EXIT_PREREQUISITE" "Codex CLI not found: $CODEX_BIN. Normal initialization validates launch prerequisites; use --existing-path only for recovery of an already initialized external registry."
+	fi
 	[[ "${BASH_VERSINFO[0]}" -ge 3 ]] || die "$EXIT_PREREQUISITE" "Bash 3 or newer is required (detected ${BASH_VERSION})."
 }
 
@@ -145,6 +152,8 @@ resolve_paths() {
 	candidate="$(cd "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate."
 	REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
+	LEGACY_REGISTRY_PATH="$REPO_ROOT/.agents/agent-registry/registry.json"
+	refuse_live_legacy_registry
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
 	case "$state_candidate/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $state_candidate." ;;
@@ -163,6 +172,20 @@ resolve_paths() {
 	REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
 	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
 	LOCK_DIR="$REGISTRY_DIR/.lock"
+}
+
+refuse_live_legacy_registry() {
+	local live_count
+	[[ -e "$LEGACY_REGISTRY_PATH" ]] || return "$EXIT_OK"
+	[[ -f "$LEGACY_REGISTRY_PATH" && ! -L "$LEGACY_REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "legacy project registry is not a regular file: $LEGACY_REGISTRY_PATH. Preserve it for recovery before initializing external state."
+	jq -e '
+    (.schema_version == 1)
+    and (.registry == "luna-local-review-loop")
+    and (.workers | type == "array")
+    and all(.workers[]; .status as $status | (["reserved", "bound", "active", "stopping", "completed", "failed", "blocked", "interrupted", "retired"] | index($status) != null))
+  ' "$LEGACY_REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "legacy project registry cannot be validated safely: $LEGACY_REGISTRY_PATH. Preserve it and recover with the previous skill version before initializing external state."
+	live_count="$(jq '[.workers[] | select(.status == "reserved" or .status == "bound" or .status == "active" or .status == "stopping")] | length' "$LEGACY_REGISTRY_PATH")"
+	[[ "$live_count" -eq 0 ]] || die "$EXIT_SCHEMA" "legacy project registry contains $live_count live worker(s): $LEGACY_REGISTRY_PATH. Reinstall the previous skill version, retire or recover every live worker, verify its registry is empty, then rerun this version. The legacy registry was not changed."
 }
 
 canonical_path_without_creation() {

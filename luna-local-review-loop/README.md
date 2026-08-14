@@ -44,6 +44,8 @@ Print it with:
 
 Init is validation-only and idempotent. It does not edit the target repository. When required project skills are missing, it prints the explicit universal-target install commands. Run those only as a separate, intentional project change.
 
+Before creating external state, init checks the previous project-local schema-v1 registry path. If that registry still contains a reserved, bound, active, or stopping worker, init refuses to continue and prints recovery instructions. Recover and retire those workers with the previous skill version first; the new version never silently abandons live legacy state.
+
 ## Registry schema
 
 Schema version 2 has two arrays:
@@ -131,7 +133,7 @@ scripts/run-worker.sh launch \
 - `unresolved`: remaining limitations;
 - `parentAction`: a non-empty exact action for `needs_parent_action`; `null` for terminal outcomes.
 
-Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, separate stderr logs, and each final result. A per-task invocation lock serializes the first resume, later continuations, and explicit retirement. This prevents concurrent session resumes and keeps long streams, repeated diffs, reconnect noise, or unrelated warnings from burying or corrupting the final report.
+Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, separate stderr logs, and each final result. A registry-backed invocation claim serializes the first resume, later continuations, and explicit retirement; stale claims are reclaimed under the registry's atomic mutation lock. Runner termination first signals and waits for its Codex child, then retires the task and releases ownership. This prevents concurrent or orphaned session resumes and keeps long streams, repeated diffs, reconnect noise, or unrelated warnings from burying or corrupting the final report.
 
 ## Low-level registry commands
 
@@ -142,6 +144,7 @@ Only that JSON result is emitted on stdout. The external artifact directory prin
 | `bind` | Bind one globally unique Codex session to one reserved task |
 | `activate` | Activate the exact bound task/session |
 | `checkpoint` | Save evidence while keeping a task active |
+| `claim-invocation` / `release-invocation` | Atomically serialize one live runner per task and reclaim a dead owner |
 | `complete-and-retire` | Atomically record terminal evidence and remove live worker entry |
 | `query` / `active` | Read ledger task or live workers |
 | `assert-no-active` / `assert-empty` | Prove no reserved, bound, or active workers remain |
@@ -173,4 +176,4 @@ Run without network access:
 ./luna-local-review-loop/scripts/test-init.sh
 ```
 
-The test covers non-mutating init, external persistent state, single-child retry chains, a fast handshake with no invocation handle, serialized exact-session continuation without PTY/EOF, strict structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.
+The test covers non-mutating init, live legacy-registry refusal, external persistent state, single-child retry chains, a fast handshake with no invocation handle, portable artifact counting, atomic stale-claim recovery, serialized exact-session continuation without PTY/EOF, child termination before retirement, strict structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.

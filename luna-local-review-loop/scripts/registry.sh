@@ -42,6 +42,8 @@ readonly TRANSITION_SCHEMA_FILTER='
     . as $worker
     | (.task_id | nonempty) and (.scope | nonempty)
       and (.status == "reserved" or .status == "bound" or .status == "active")
+      and (($worker.invocation_pid == null and $worker.invocation_token == null)
+           or (($worker.invocation_pid | nonempty) and ($worker.invocation_token | nonempty)))
       and any($root.identity_ledger[];
         .task_id == $worker.task_id
         and .scope == $worker.scope
@@ -63,6 +65,8 @@ Usage:
   registry.sh bind --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
   registry.sh activate --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
   registry.sh checkpoint --task-id ID --evidence TEXT [--repo PATH] [--state-root PATH]
+  registry.sh claim-invocation --task-id ID --pid PID --token TOKEN [--repo PATH] [--state-root PATH]
+  registry.sh release-invocation --task-id ID --token TOKEN [--repo PATH] [--state-root PATH]
   registry.sh complete-and-retire --task-id ID --status completed|failed|blocked|interrupted --evidence TEXT [--repo PATH] [--state-root PATH]
   registry.sh query --task-id ID [--repo PATH] [--state-root PATH]
   registry.sh active [--repo PATH] [--state-root PATH]
@@ -247,7 +251,7 @@ command_reserve() {
 	atomic_write '
     .updated_at = $timestamp
     | .identity_ledger += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", reserved_at: $timestamp, bound_at: null, activated_at: null, terminal_at: null, retired_at: null, terminal_status: null, terminal_evidence: ""}]
-    | .workers += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: ""}]
+    | .workers += [{task_id: $task_id, scope: $scope, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: null, invocation_token: null}]
   ' --arg task_id "$task_id" --arg scope "$scope" --arg retry_of "${retry_of:-}" --arg timestamp "$timestamp"
 	printf 'Reserved task=%s\n' "$task_id"
 }
@@ -356,6 +360,93 @@ command_checkpoint() {
 	printf 'Checkpointed task=%s\n' "$task_id"
 }
 
+command_claim_invocation() {
+	local task_id=''
+	local owner_pid=''
+	local token=''
+	local current_pid=''
+	local current_token=''
+	while [[ $# -gt 0 ]]; do
+		if parse_common "$@"; then
+			shift "$PARSE_SHIFT"
+			continue
+		fi
+		case "$1" in
+		--task-id)
+			task_id="${2:-}"
+			shift 2
+			;;
+		--pid)
+			owner_pid="${2:-}"
+			shift 2
+			;;
+		--token)
+			token="${2:-}"
+			shift 2
+			;;
+		*) die "$EXIT_USAGE" "unknown claim-invocation argument: $1." ;;
+		esac
+	done
+	[[ -n "$task_id" && -n "$owner_pid" && -n "$token" ]] || die "$EXIT_USAGE" 'claim-invocation requires --task-id, --pid, and --token.'
+	validate_identity 'task-id' "$task_id"
+	validate_identity 'invocation-token' "$token"
+	case "$owner_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "invocation PID must be a positive integer: $owner_pid." ;; esac
+	resolve_registry
+	acquire_lock
+	jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_NOT_FOUND" "live task not found: $task_id."
+	current_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_pid // empty' "$REGISTRY_PATH")"
+	current_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
+	if [[ -n "$current_pid" ]]; then
+		if [[ "$current_pid" == "$owner_pid" && "$current_token" == "$token" ]]; then
+			printf 'Invocation already claimed task=%s token=%s\n' "$task_id" "$token"
+			return "$EXIT_OK"
+		fi
+		pid_is_confirmed_nonexistent "$current_pid" || die "$EXIT_CONFLICT" "another invocation already owns task $task_id with live PID $current_pid."
+	fi
+	local timestamp
+	timestamp="$(now_utc)"
+	atomic_write '
+    .updated_at = $timestamp
+    | .workers |= map(if .task_id == $task_id then .invocation_pid = $owner_pid | .invocation_token = $token | .updated_at = $timestamp else . end)
+  ' --arg task_id "$task_id" --arg owner_pid "$owner_pid" --arg token "$token" --arg timestamp "$timestamp"
+	printf 'Claimed invocation task=%s token=%s\n' "$task_id" "$token"
+}
+
+command_release_invocation() {
+	local task_id=''
+	local token=''
+	while [[ $# -gt 0 ]]; do
+		if parse_common "$@"; then
+			shift "$PARSE_SHIFT"
+			continue
+		fi
+		case "$1" in
+		--task-id)
+			task_id="${2:-}"
+			shift 2
+			;;
+		--token)
+			token="${2:-}"
+			shift 2
+			;;
+		*) die "$EXIT_USAGE" "unknown release-invocation argument: $1." ;;
+		esac
+	done
+	[[ -n "$task_id" && -n "$token" ]] || die "$EXIT_USAGE" 'release-invocation requires --task-id and --token.'
+	validate_identity 'task-id' "$task_id"
+	validate_identity 'invocation-token' "$token"
+	resolve_registry
+	acquire_lock
+	jq -e --arg task_id "$task_id" --arg token "$token" 'any(.workers[]; .task_id == $task_id and .invocation_token == $token)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "invocation token does not own live task $task_id."
+	local timestamp
+	timestamp="$(now_utc)"
+	atomic_write '
+    .updated_at = $timestamp
+    | .workers |= map(if .task_id == $task_id then .invocation_pid = null | .invocation_token = null | .updated_at = $timestamp else . end)
+  ' --arg task_id "$task_id" --arg timestamp "$timestamp"
+	printf 'Released invocation task=%s token=%s\n' "$task_id" "$token"
+}
+
 command_complete_and_retire() {
 	local task_id=''
 	local status=''
@@ -444,6 +535,8 @@ reserve) command_reserve "$@" ;;
 bind) command_bind "$@" ;;
 activate) command_activate "$@" ;;
 checkpoint) command_checkpoint "$@" ;;
+claim-invocation) command_claim_invocation "$@" ;;
+release-invocation) command_release_invocation "$@" ;;
 complete-and-retire) command_complete_and_retire "$@" ;;
 query | active | assert-no-active | assert-empty) parse_read_args "$command" "$@" ;;
 *) die "$EXIT_USAGE" "unknown command: $command. Use --help for usage." ;;

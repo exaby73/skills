@@ -55,6 +55,8 @@ Never add `--ephemeral` to a resumable worker. The durable identity is the Codex
 
 The launcher uses `--ignore-user-config` so unrelated MCP servers/connectors do not start. Add task-relevant context to the prompt or target repository configuration; do not re-enable the full user connector set merely for convenience.
 
+The registry atomically claims each live invocation. A stale claim may be replaced only while holding the registry mutation lock, so concurrent recovery attempts cannot resume the same session. If the runner receives `INT` or `TERM`, it signals and waits for its Codex child before registry retirement; never bypass this shutdown path by deleting registry state manually.
+
 Use `read-only` for investigation/review and `workspace-write` for implementation. The parent shell must separately allow the owning Codex runtime-state directory (normally `$CODEX_HOME` or `~/.codex`) to be written. This runtime permission is distinct from the worker repository sandbox. If the launcher reports exit 11, stop and obtain that narrow outer permission; never broaden the repository sandbox as a workaround.
 
 ## Continue the exact task after parent action
