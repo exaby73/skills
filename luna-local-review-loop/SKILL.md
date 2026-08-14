@@ -81,11 +81,11 @@ If a launch failed or was interrupted, retire it with evidence, then retry the e
   --prompt-file '/absolute/path/to/task-prompt.txt'
 ```
 
-Only retired `failed` or `interrupted` attempts permit exact-scope retry. The ledger keeps both identities and their link.
+Only retired `failed` or `interrupted` attempts permit exact-scope retry. A failed attempt may have only one retry child, and no retry is permitted while another live worker owns that scope. If the child also fails, link the next retry to that child. The ledger keeps the complete linear retry chain.
 
 ## Judge evidence and review
 
-Each structured worker result contains outcome, concise summary, changed files, validator commands/status/evidence, unresolved items, and any required parent action. Streaming JSONL and repeated diffs stay in the external artifact directory shown on stderr.
+Each structured worker result contains outcome, concise summary, changed files, validator commands/status/evidence, unresolved items, and any required parent action. `needs_parent_action` requires a non-empty parent action; terminal outcomes require `null`. Streaming JSONL and repeated diffs stay in the external artifact directory shown on stderr, with process warnings in separate stderr logs.
 
 1. Collect all worker results and inspect the actual repository diff.
 2. Run every parent-owned or still-required validator under repository rules. A missing or failed validator remains unresolved.
@@ -114,3 +114,4 @@ Before completing or blocking any parent goal, terminate any real live invocatio
 ```
 
 If cleanup cannot be proven, the parent goal is not safely terminal. Preserve the external registry/artifacts and report the blocker. The registry never kills arbitrary processes and never deletes Codex history.
+Recovery and cleanup commands validate an existing external registry without requiring Codex or project skills, so launch-prerequisite damage cannot prevent retirement and assertions.

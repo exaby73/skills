@@ -68,6 +68,7 @@ readonly SCHEMA_FILTER='
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
+      and (([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | length) == ([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | unique | length))
       and (([$root.workers[].task_id] | length) == ([$root.workers[].task_id] | unique | length))
       and (([$root.workers[] | select(.session_id != null) | .session_id] | length) == ([$root.workers[] | select(.session_id != null) | .session_id] | unique | length))
       and all($root.identity_ledger[];
@@ -97,9 +98,11 @@ usage() {
 	cat <<'EOF'
 Usage:
   init.sh [--repo PATH|-C PATH] [--state-root PATH] [--print-path]
+  init.sh --existing-path [--repo PATH|-C PATH] [--state-root PATH]
 
 Validate project prerequisites and initialize a non-project worker registry.
-Init never installs skills and never changes repository files.
+--existing-path validates and prints an already initialized registry without
+requiring launch-only tools or project skills. Init never changes repository files.
 EOF
 	exit "$exit_code"
 }
@@ -118,7 +121,10 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq codex mktemp mkdir mv rm rmdir date kill ps sleep awk chmod shasum dirname find wc tr head cat)
+	local required_commands=(bash git jq mkdir rm rmdir kill ps sleep awk shasum cat)
+	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
+		required_commands+=(mktemp mv date chmod)
+	fi
 
 	for command_name in "${required_commands[@]}"; do
 		if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -133,13 +139,25 @@ require_commands() {
 resolve_paths() {
 	local candidate
 	local repo_fingerprint
+	local state_candidate
 
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_REPOSITORY" "repository path does not exist or is not a directory: $REPO_INPUT."
 	candidate="$(cd "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate."
 	REPO_ROOT="$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
-	mkdir -p "$STATE_ROOT_INPUT" || die "$EXIT_FILESYSTEM" "cannot create state root: $STATE_ROOT_INPUT."
+	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
+	case "$state_candidate/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $state_candidate." ;;
+	esac
+	if [[ "$EXISTING_ONLY" -eq 1 ]]; then
+		[[ -d "$STATE_ROOT_INPUT" ]] || die "$EXIT_FILESYSTEM" "state root does not exist: $STATE_ROOT_INPUT."
+	else
+		mkdir -p "$STATE_ROOT_INPUT" || die "$EXIT_FILESYSTEM" "cannot create state root: $STATE_ROOT_INPUT."
+	fi
 	STATE_ROOT="$(cd "$STATE_ROOT_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot access state root: $STATE_ROOT_INPUT."
+	case "$STATE_ROOT/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $STATE_ROOT." ;;
+	esac
 	repo_fingerprint="$(printf '%s' "$REPO_ROOT" | shasum -a 256 | awk '{print $1}')"
 	[[ -n "$repo_fingerprint" ]] || die "$EXIT_FILESYSTEM" 'could not derive repository state key.'
 	REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
@@ -147,11 +165,72 @@ resolve_paths() {
 	LOCK_DIR="$REGISTRY_DIR/.lock"
 }
 
+canonical_path_without_creation() {
+	local path="$1"
+	local suffix=''
+	local base
+	local parent
+	local resolved
+
+	[[ -n "$path" ]] || return 1
+	case "$path" in
+	/*) ;;
+	*) path="$PWD/$path" ;;
+	esac
+	path="$(normalize_absolute_path "$path")" || return 1
+	while [[ ! -e "$path" ]]; do
+		base="${path##*/}"
+		parent="${path%/*}"
+		[[ -n "$base" && -n "$parent" && "$parent" != "$path" ]] || return 1
+		suffix="/$base$suffix"
+		path="$parent"
+	done
+	[[ -d "$path" ]] || return 1
+	resolved="$(cd "$path" 2>/dev/null && pwd -P)" || return 1
+	printf '%s%s\n' "$resolved" "$suffix"
+}
+
+normalize_absolute_path() {
+	local path="$1"
+	local component
+	local output=''
+	local old_ifs="$IFS"
+	local components=()
+	local stack=()
+
+	[[ "$path" == /* ]] || return 1
+	IFS='/' read -r -a components <<<"$path"
+	IFS="$old_ifs"
+	for component in "${components[@]}"; do
+		case "$component" in
+		'' | .) ;;
+		..)
+			if [[ "${#stack[@]}" -gt 0 ]]; then
+				unset "stack[$((${#stack[@]} - 1))]"
+			fi
+			;;
+		*) stack+=("$component") ;;
+		esac
+	done
+	for component in "${stack[@]}"; do
+		output="$output/$component"
+	done
+	printf '%s\n' "${output:-/}"
+}
+
 require_project_skills() {
 	local code_reviewer="$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
 	local caveman="$REPO_ROOT/.agents/skills/caveman/SKILL.md"
 	local missing=''
+	local path
 
+	for path in \
+		"$REPO_ROOT/.agents" \
+		"$REPO_ROOT/.agents/skills" \
+		"$REPO_ROOT/.agents/skills/code-reviewer" \
+		"$REPO_ROOT/.agents/skills/caveman"; do
+		[[ ! -L "$path" ]] || die "$EXIT_PREREQUISITE" "project skill path must be a real directory, not a symlink: $path."
+	done
 	[[ -f "$code_reviewer" && ! -L "$code_reviewer" ]] || missing="${missing}${missing:+, }code-reviewer"
 	[[ -f "$caveman" && ! -L "$caveman" ]] || missing="${missing}${missing:+, }caveman"
 	[[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing project-local skill(s): $missing. Init is non-mutating. Install explicitly with '-a universal', review Skills CLI changes, then retry. code-reviewer: npx -y skills add https://github.com/google-gemini/gemini-cli --skill code-reviewer -a universal -y ; caveman: npx -y skills add https://github.com/juliusbrussee/caveman --skill caveman -a universal -y"
@@ -228,6 +307,7 @@ write_new_registry() {
 }
 
 PRINT_PATH=0
+EXISTING_ONLY=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--repo | -C)
@@ -244,6 +324,11 @@ while [[ $# -gt 0 ]]; do
 		PRINT_PATH=1
 		shift
 		;;
+	--existing-path)
+		EXISTING_ONLY=1
+		PRINT_PATH=1
+		shift
+		;;
 	--help | -h) usage "$EXIT_OK" ;;
 	*) die "$EXIT_USAGE" "unknown argument: $1. Use --help for usage." ;;
 	esac
@@ -251,13 +336,16 @@ done
 
 require_commands
 resolve_paths
-require_project_skills
+if [[ "$EXISTING_ONLY" -eq 0 ]]; then
+	require_project_skills
+fi
 acquire_lock
 if [[ -e "$REGISTRY_PATH" ]]; then
 	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "registry is not a regular file: $REGISTRY_PATH."
 	jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 2 validation: $REGISTRY_PATH. Preserve it for investigation."
 	[[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" == "$REPO_ROOT" ]] || die "$EXIT_SCHEMA" "registry repository root does not match $REPO_ROOT: $REGISTRY_PATH."
 else
+	[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_FILESYSTEM" "registry does not exist: $REGISTRY_PATH. Run init before launch."
 	write_new_registry
 fi
 

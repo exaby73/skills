@@ -53,7 +53,7 @@ Schema version 2 has two arrays:
 
 Statuses are `reserved`, `bound`, `active`, and `retired`. A retired row has terminal status `completed`, `failed`, `blocked`, or `interrupted` plus evidence.
 
-Scopes are permanently unique unless a new task explicitly uses `retry_of` to reference a retired failed/interrupted attempt with the exact same scope. Task IDs and Codex session IDs are always globally unique within the repository ledger.
+Scopes are permanently unique unless a new task explicitly uses `retry_of` to reference a retired failed/interrupted attempt with the exact same scope. Each failed attempt accepts at most one retry child, retries form a linear chain, and a live scope owner blocks another retry. Task IDs and Codex session IDs are always globally unique within the repository ledger.
 
 ## Identity and handle contract
 
@@ -129,9 +129,9 @@ scripts/run-worker.sh launch \
 - `changedFiles`: changed path list;
 - `validators`: command, passed/failed/not-run state, and evidence;
 - `unresolved`: remaining limitations;
-- `parentAction`: exact required action or `null`.
+- `parentAction`: a non-empty exact action for `needs_parent_action`; `null` for terminal outcomes.
 
-Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, and each final result. This prevents long streams, repeated diffs, reconnect noise, or unrelated warnings from burying the final report.
+Only that JSON result is emitted on stdout. The external artifact directory printed on stderr contains the handshake JSONL, each resume JSONL, separate stderr logs, and each final result. A per-task invocation lock serializes the first resume, later continuations, and explicit retirement. This prevents concurrent session resumes and keeps long streams, repeated diffs, reconnect noise, or unrelated warnings from burying or corrupting the final report.
 
 ## Low-level registry commands
 
@@ -173,4 +173,4 @@ Run without network access:
 ./luna-local-review-loop/scripts/test-init.sh
 ```
 
-The test covers non-mutating init, external persistent state, retry linkage, a fast handshake with no invocation handle, exact-session continuation without PTY/EOF, structured-output separation, disabled user MCP config, atomic retirement, and cleanup assertions.
+The test covers non-mutating init, external persistent state, single-child retry chains, a fast handshake with no invocation handle, serialized exact-session continuation without PTY/EOF, strict structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.

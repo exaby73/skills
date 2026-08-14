@@ -51,6 +51,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   )
   and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
   and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
+  and (([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | length) == ([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | unique | length))
 '
 
 usage() {
@@ -138,7 +139,7 @@ acquire_lock() {
 }
 
 resolve_registry() {
-	REGISTRY_PATH="$($INIT_SCRIPT --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" --print-path)" || exit $?
+	REGISTRY_PATH="$($INIT_SCRIPT --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" --existing-path)" || exit $?
 	[[ -n "$REGISTRY_PATH" ]] || die "$EXIT_FILESYSTEM" 'init returned an empty registry path.'
 	REGISTRY_DIR="$(dirname "$REGISTRY_PATH")"
 	LOCK_DIR="$REGISTRY_DIR/.lock"
@@ -236,6 +237,8 @@ command_reserve() {
 		jq -e --arg retry_of "$retry_of" --arg scope "$scope" '
       any(.identity_ledger[]; .task_id == $retry_of and .scope == $scope and .status == "retired" and (.terminal_status == "failed" or .terminal_status == "interrupted"))
     ' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "retry-of must name a retired failed/interrupted task with the exact same scope: $retry_of."
+		jq -e --arg scope "$scope" 'all(.workers[]; .scope != $scope)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'another live task already owns this retry scope.'
+		jq -e --arg retry_of "$retry_of" 'all(.identity_ledger[]; .retry_of != $retry_of)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "retry attempt already has a child; retry the latest failed/interrupted child instead: $retry_of."
 	else
 		jq -e --arg scope "$scope" 'all(.identity_ledger[]; .scope != $scope)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'scope is already reserved; use --retry-of with the failed/interrupted task ID to retry the exact scope.'
 	fi
@@ -435,7 +438,7 @@ init)
 	exec "$INIT_SCRIPT" "$@"
 	;;
 path)
-	exec "$INIT_SCRIPT" "$@" --print-path
+	exec "$INIT_SCRIPT" "$@" --existing-path
 	;;
 reserve) command_reserve "$@" ;;
 bind) command_bind "$@" ;;
