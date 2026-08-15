@@ -15,6 +15,7 @@ readonly RESULT_SCHEMA="$SCRIPT_DIR/../references/worker-result.schema.json"
 
 MODE='launch'
 REPO_INPUT='.'
+REPO_ROOT=''
 STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
 TASK_ID=''
 SCOPE=''
@@ -66,10 +67,20 @@ runtime_state_is_writable() {
 }
 
 validate_common() {
-	command -v "$CODEX_BIN" >/dev/null 2>&1 || die "$EXIT_PREREQUISITE" "Codex CLI not found: $CODEX_BIN."
+	local prompt_parent=''
+	local prompt_name=''
+	CODEX_BIN="$(command -v "$CODEX_BIN" 2>/dev/null)" || die "$EXIT_PREREQUISITE" "Codex CLI not found: $CODEX_BIN."
 	[[ -f "$RESULT_SCHEMA" ]] || die "$EXIT_PREREQUISITE" "worker result schema not found: $RESULT_SCHEMA."
+	[[ -d "$REPO_INPUT" ]] || die "$EXIT_USAGE" "repository path does not exist or is not a directory: $REPO_INPUT."
+	REPO_ROOT="$(git -C "$REPO_INPUT" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_USAGE" "repository path is not inside a Git repository: $REPO_INPUT."
+	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve repository root: $REPO_INPUT."
 	[[ "$TASK_ID" =~ ^[A-Za-z0-9._-]+$ ]] || die "$EXIT_USAGE" 'task-id must contain only letters, numbers, dot, underscore, or hyphen.'
 	[[ -f "$PROMPT_FILE" && ! -L "$PROMPT_FILE" ]] || die "$EXIT_USAGE" "prompt-file must be a regular non-symlink file: $PROMPT_FILE."
+	case "$PROMPT_FILE" in /*) ;; *) PROMPT_FILE="$PWD/$PROMPT_FILE" ;; esac
+	prompt_parent="${PROMPT_FILE%/*}"
+	prompt_name="${PROMPT_FILE##*/}"
+	prompt_parent="$(cd -P "$prompt_parent" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve prompt-file parent: $PROMPT_FILE."
+	PROMPT_FILE="$prompt_parent/$prompt_name"
 	case "$TASK_SANDBOX" in '' | read-only | workspace-write) ;; *) die "$EXIT_USAGE" 'sandbox must be read-only or workspace-write.' ;; esac
 	runtime_state_is_writable
 }
@@ -397,7 +408,8 @@ run_gated_codex() {
 	local stream_log="$2"
 	local stream_stderr="$3"
 	local stdin_path="$4"
-	shift 4
+	local codex_cwd="$5"
+	shift 5
 	local gate_path="$artifact_dir/.start-$INVOCATION_TOKEN"
 	local parent_pid="$$"
 	local child_status=0
@@ -410,6 +422,7 @@ run_gated_codex() {
 	set -m
 	(
 		export LUNA_WORKER_PROCESS_TOKEN="$INVOCATION_TOKEN"
+		cd "$codex_cwd" || exit 126
 		while [[ ! -f "$gate_path" ]]; do
 			kill -0 "$parent_pid" 2>/dev/null || exit 125
 			sleep 0.05
@@ -521,14 +534,15 @@ resume_task() {
 	create_owned_artifact_file "$result_path" 'worker result artifact'
 
 	local codex_status=0
-	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$PROMPT_FILE" "$CODEX_BIN" exec resume \
+	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$PROMPT_FILE" "$REPO_ROOT" "$CODEX_BIN" exec resume \
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
+		-c "sandbox_mode=\"$TASK_SANDBOX\"" \
 		--json \
 		--output-schema "$RESULT_SCHEMA" \
 		--output-last-message "$result_path" \
-		"$SESSION_ID" - || codex_status=$?
+		-- "$SESSION_ID" - || codex_status=$?
 	if [[ "$codex_status" -ne 0 ]]; then
 		die "$EXIT_WORKER" "Codex resume failed for task $TASK_ID. Logs: $stream_log and $stream_stderr"
 	fi
@@ -589,12 +603,12 @@ launch_worker() {
 	create_owned_artifact_file "$launch_stderr" 'handshake stderr artifact'
 
 	local codex_status=0
-	run_gated_codex "$artifact_dir" "$launch_log" "$launch_stderr" '' "$CODEX_BIN" exec \
+	run_gated_codex "$artifact_dir" "$launch_log" "$launch_stderr" '' "$REPO_ROOT" "$CODEX_BIN" exec \
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		-s "$TASK_SANDBOX" \
-		-C "$REPO_INPUT" \
+		-C "$REPO_ROOT" \
 		--json \
 		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' || codex_status=$?
 	if [[ "$codex_status" -ne 0 ]]; then
@@ -624,6 +638,8 @@ continue_worker() {
 	claim_invocation
 	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")"
 	SESSION_ID="$(jq -r '.session_id' <<<"$worker")"
+	TASK_SANDBOX="$(jq -r '.sandbox' <<<"$worker")"
+	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
 	resume_task "$artifact_dir"
 }
 

@@ -24,6 +24,7 @@ PARSE_SHIFT=0
 
 readonly TRANSITION_SCHEMA_FILTER='
   def nonempty: type == "string" and length > 0;
+  def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
   def valid_retry_chain($ledger):
     all($ledger | to_entries[];
@@ -50,7 +51,7 @@ readonly TRANSITION_SCHEMA_FILTER='
     and ($row.sandbox == "read-only" or $row.sandbox == "workspace-write")
     and (["reserved", "bound", "active", "retired"] | index($row.status) != null)
     and (if $row.status == "reserved" then $row.session_id == null
-         elif $row.status == "bound" or $row.status == "active" then ($row.session_id | nonempty)
+         elif $row.status == "bound" or $row.status == "active" then ($row.session_id | safe_session)
          else ($row.terminal_status == "completed" or $row.terminal_status == "failed" or $row.terminal_status == "blocked" or $row.terminal_status == "interrupted")
               and ($row.terminal_evidence | nonempty) and ($row.retired_at | nonempty)
          end)
@@ -258,6 +259,14 @@ validate_identity() {
 	esac
 }
 
+validate_session_id() {
+	local value="$1"
+	validate_identity 'session-id' "$value"
+	case "$value" in
+	-*) die "$EXIT_USAGE" "session-id must not begin with a hyphen: $value." ;;
+	esac
+}
+
 validate_scope() {
 	local scope="$1"
 	[[ -n "$scope" ]] || die "$EXIT_USAGE" 'scope must not be empty.'
@@ -378,7 +387,7 @@ command_bind() {
 	done
 	[[ -n "$task_id" && -n "$session_id" ]] || die "$EXIT_USAGE" 'bind requires --task-id and --session-id.'
 	validate_identity 'task-id' "$task_id"
-	validate_identity 'session-id' "$session_id"
+	validate_session_id "$session_id"
 	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
 	acquire_lock
@@ -422,7 +431,7 @@ command_activate() {
 	done
 	[[ -n "$task_id" && -n "$session_id" ]] || die "$EXIT_USAGE" 'activate requires --task-id and --session-id.'
 	validate_identity 'task-id' "$task_id"
-	validate_identity 'session-id' "$session_id"
+	validate_session_id "$session_id"
 	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
 	acquire_lock

@@ -30,6 +30,19 @@ process_group_has_live_non_zombie() {
 TEST_ROOT="$(mktemp -d)"
 readonly TEST_ROOT
 cleanup_test_root() {
+	local runner_pid
+	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}"; do
+		[[ -n "$runner_pid" ]] || continue
+		kill -TERM "$runner_pid" 2>/dev/null || true
+		wait "$runner_pid" 2>/dev/null || true
+	done
+	if [[ -n "${hard_killed_child_pgid:-}" ]]; then
+		kill -TERM -- "-$hard_killed_child_pgid" 2>/dev/null || true
+	fi
+	if [[ -n "${fixture_watchdog_pid:-}" ]]; then
+		kill -TERM "$fixture_watchdog_pid" 2>/dev/null || true
+		wait "$fixture_watchdog_pid" 2>/dev/null || true
+	fi
 	if [[ "${KEEP_TEST_ROOT:-0}" == '1' ]]; then
 		printf 'Preserved test root: %s\n' "$TEST_ROOT" >&2
 	else
@@ -37,6 +50,29 @@ cleanup_test_root() {
 	fi
 }
 trap cleanup_test_root EXIT
+
+wait_for_blocking_fixture() {
+	local runner_pid="$1"
+	local child_pid_file="$2"
+	local descendant_pid_file="$3"
+	local label="$4"
+	(
+		sleep 30
+		kill -TERM "$runner_pid" 2>/dev/null || true
+	) &
+	fixture_watchdog_pid=$!
+	while process_is_live_non_zombie "$runner_pid" && [[ ! -s "$child_pid_file" || ! -s "$descendant_pid_file" ]]; do
+		sleep 0.05
+	done
+	kill -TERM "$fixture_watchdog_pid" 2>/dev/null || true
+	wait "$fixture_watchdog_pid" 2>/dev/null || true
+	fixture_watchdog_pid=''
+	if [[ ! -s "$child_pid_file" || ! -s "$descendant_pid_file" ]]; then
+		kill -TERM "$runner_pid" 2>/dev/null || true
+		wait "$runner_pid" 2>/dev/null || true
+		fail "$label"
+	fi
+}
 readonly REPO_ROOT="$TEST_ROOT/repo"
 readonly STATE_ROOT="$TEST_ROOT/state"
 readonly BIN_DIR="$TEST_ROOT/bin"
@@ -64,7 +100,7 @@ git -C "$REPO_ROOT" commit -qm init
 cat >"$BIN_DIR/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "$CODEX_CALLS"
+printf 'cwd=%s args=%s\n' "$PWD" "$*" >> "$CODEX_CALLS"
 if [[ " $* " == *' exec resume '* ]]; then
   result_path=''
   previous=''
@@ -193,6 +229,13 @@ EOF
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy --status interrupted --evidence 'external recovery remained authoritative' >/dev/null
 rm -rf "$REPO_ROOT/.agents/agent-registry"
 
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id option-like-session --scope 'reject option-like session identity' >/dev/null
+if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id option-like-session --session-id --last >"$TEST_ROOT/option-like-session.out" 2>&1; then
+	fail 'registry accepted an option-like Codex session ID'
+fi
+jq -e 'any(.workers[]; .task_id == "option-like-session" and .status == "reserved" and .session_id == null)' "$registry_path" >/dev/null || fail 'rejected option-like session ID mutated the reservation'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id option-like-session --status interrupted --evidence 'option-like session test complete' >/dev/null
+
 schema_repo="$TEST_ROOT/schema-repo"
 schema_state="$TEST_ROOT/schema-state"
 mkdir -p "$schema_repo/.agents/skills"
@@ -266,6 +309,29 @@ copied_registry="$($INIT_SCRIPT --repo "$copied_repo" --state-root "$moved_state
 [[ "$copied_registry" != "$moved_registry" ]] || fail 'copied checkout shared the original checkout registry'
 jq -e '.workers == [] and .identity_ledger == []' "$copied_registry" >/dev/null || fail 'copied checkout inherited original live worker state'
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$moved_repo_new" --state-root "$moved_state" --task-id moved-checkout-worker --status interrupted --evidence 'repository move test complete' >/dev/null
+
+linked_main_repo="$TEST_ROOT/linked-main-repo"
+linked_worktree="$TEST_ROOT/linked-worktree"
+linked_worktree_copy="$TEST_ROOT/linked-worktree-copy"
+linked_state="$TEST_ROOT/linked-state"
+mkdir -p "$linked_main_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$linked_main_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$linked_main_repo/.agents/skills/caveman"
+git -C "$linked_main_repo" init -q
+git -C "$linked_main_repo" config user.email test@example.com
+git -C "$linked_main_repo" config user.name Test
+git -C "$linked_main_repo" add .agents
+git -C "$linked_main_repo" commit -qm init
+git -C "$linked_main_repo" worktree add -qb linked-test "$linked_worktree"
+linked_registry="$($INIT_SCRIPT --repo "$linked_worktree" --state-root "$linked_state" --print-path)"
+"$REGISTRY_SCRIPT" reserve --repo "$linked_worktree" --state-root "$linked_state" --task-id linked-live-worker --scope 'preserve linked worktree ownership' >/dev/null
+cp -a "$linked_worktree" "$linked_worktree_copy"
+if "$INIT_SCRIPT" --repo "$linked_worktree_copy" --state-root "$linked_state" >"$TEST_ROOT/copied-linked-worktree.out" 2>&1; then
+	fail 'init accepted a copied linked-worktree alias'
+fi
+linked_worktree_real="$(cd -P "$linked_worktree" && pwd -P)"
+jq -e --arg root "$linked_worktree_real" '.repository_root == $root and any(.workers[]; .task_id == "linked-live-worker")' "$linked_registry" >/dev/null || fail 'copied linked-worktree alias rewrote or abandoned original live state'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$linked_worktree" --state-root "$linked_state" --task-id linked-live-worker --status interrupted --evidence 'linked-worktree alias test complete' >/dev/null
 
 identity_repo="$TEST_ROOT/identity-repo"
 identity_state="$TEST_ROOT/identity-state"
@@ -563,15 +629,15 @@ read_only_retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --r
 jq -e '.outcome == "completed"' <<<"$read_only_retry_output" >/dev/null || fail 'read-only runner retry did not complete'
 jq -e 'any(.identity_ledger[]; .task_id == "read-only-runner-retry" and .sandbox == "read-only" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'runner retry did not preserve read-only sandbox'
 
-runner_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-worker --scope 'one fast task' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/runner.err")"
+runner_output="$(cd "$TEST_ROOT" && CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-worker --scope 'one fast task' --prompt-file task.txt 2>"$TEST_ROOT/runner.err")"
 jq -e '.outcome == "completed" and .summary == "worker concise result"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output'
 "$REGISTRY_SCRIPT" assert-no-active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'completed worker was not atomically retired'
 jq -e 'any(.identity_ledger[]; .task_id == "fast-worker" and (.session_id | startswith("01fake-session-")) and .status == "retired" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'fast worker identity/result was not retained'
 
 printf '%s\n' 'needs parent' >"$PROMPT_FILE"
-needs_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --scope 'one continued task' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/needs.err")"
+needs_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --scope 'one continued task' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/needs.err")"
 jq -e '.outcome == "needs_parent_action"' <<<"$needs_output" >/dev/null || fail 'parent-action result was not returned'
-jq -e 'any(.workers[]; .task_id == "continued-worker" and .status == "active" and (.session_id | startswith("01fake-session-")))' "$registry_path" >/dev/null || fail 'parent-action worker was not retained as active'
+jq -e 'any(.workers[]; .task_id == "continued-worker" and .status == "active" and .sandbox == "read-only" and (.session_id | startswith("01fake-session-")))' "$registry_path" >/dev/null || fail 'parent-action worker was not retained as an active read-only session'
 
 sleep 0.01 &
 stale_owner_pid=$!
@@ -637,12 +703,19 @@ if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task
 fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
-resume_count="$(rg -c 'exec resume .*01fake-session-[0-9]+ -|exec resume .*01sparse-continuation -' "$CODEX_CALLS")"
+resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
 [[ "$resume_count" -eq 7 ]] || fail "expected seven exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
 [[ "$ignore_count" -eq 14 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
-[[ "$read_only_count" -eq 2 ]] || fail "expected original and retry handshakes to use read-only sandbox, got $read_only_count"
+[[ "$read_only_count" -eq 3 ]] || fail "expected original, retry, and continued-worker handshakes to use read-only sandbox, got $read_only_count"
+resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
+[[ "$resume_sandbox_count" -eq 7 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
+[[ "$read_only_resume_count" -eq 3 ]] || fail "expected read-only sandbox on retry and both continued-session resumes, got $read_only_resume_count"
+if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then
+	fail 'a resumed Codex session ran outside the canonical target repository'
+fi
 if rg -F 'irrelevant connector warning' "$(dirname "$registry_path")/artifacts/fast-worker/launch.jsonl" >/dev/null; then
 	fail 'handshake stderr corrupted the JSONL event stream'
 fi
@@ -668,12 +741,7 @@ printf '%s\n' 'terminate child safely' >"$PROMPT_FILE"
 rm -f "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE"
 FAKE_BLOCK_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id terminated-worker --scope 'terminate child before retirement' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/terminated.out" 2>"$TEST_ROOT/terminated.err" &
 terminating_runner_pid=$!
-poll_attempt=0
-while [[ (! -s "$CODEX_CHILD_PID_FILE" || ! -s "$CODEX_DESCENDANT_PID_FILE") && "$poll_attempt" -lt 100 ]]; do
-	sleep 0.05
-	poll_attempt=$((poll_attempt + 1))
-done
-[[ -s "$CODEX_CHILD_PID_FILE" && -s "$CODEX_DESCENDANT_PID_FILE" ]] || fail 'blocking Codex process group did not start'
+wait_for_blocking_fixture "$terminating_runner_pid" "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE" 'blocking Codex process group did not start'
 codex_child_pid="$(cat "$CODEX_CHILD_PID_FILE")"
 codex_descendant_pid="$(cat "$CODEX_DESCENDANT_PID_FILE")"
 codex_child_pgid="$(ps -p "$codex_child_pid" -o pgid= 2>/dev/null | awk 'NF {print $1; exit}')"
@@ -681,6 +749,7 @@ codex_child_pgid="$(ps -p "$codex_child_pid" -o pgid= 2>/dev/null | awk 'NF {pri
 kill -TERM "$terminating_runner_pid"
 terminated_status=0
 wait "$terminating_runner_pid" || terminated_status=$?
+terminating_runner_pid=''
 [[ "$terminated_status" -ne 0 ]] || fail 'terminated runner exited successfully'
 poll_attempt=0
 while process_is_live_non_zombie "$codex_child_pid" && [[ "$poll_attempt" -lt 100 ]]; do
@@ -699,20 +768,17 @@ printf '%s\n' 'retain hard-killed child identity' >"$PROMPT_FILE"
 rm -f "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE"
 FAKE_BLOCK_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --scope 'retain hard-killed child identity' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/hard-killed.out" 2>"$TEST_ROOT/hard-killed.err" &
 hard_killed_runner_pid=$!
-poll_attempt=0
-while [[ (! -s "$CODEX_CHILD_PID_FILE" || ! -s "$CODEX_DESCENDANT_PID_FILE") && "$poll_attempt" -lt 100 ]]; do
-	sleep 0.05
-	poll_attempt=$((poll_attempt + 1))
-done
-[[ -s "$CODEX_CHILD_PID_FILE" && -s "$CODEX_DESCENDANT_PID_FILE" ]] || fail 'hard-kill Codex process group did not start'
+wait_for_blocking_fixture "$hard_killed_runner_pid" "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE" 'hard-kill Codex process group did not start'
 hard_killed_child_pid="$(cat "$CODEX_CHILD_PID_FILE")"
 hard_killed_descendant_pid="$(cat "$CODEX_DESCENDANT_PID_FILE")"
 hard_killed_child_pgid="$(ps -p "$hard_killed_child_pid" -o pgid= 2>/dev/null | awk 'NF {print $1; exit}')"
 [[ "$hard_killed_child_pgid" == "$hard_killed_child_pid" ]] || fail 'hard-kill Codex child was not its process-group leader'
+hard_killed_owner_pid="$hard_killed_runner_pid"
 kill -KILL "$hard_killed_runner_pid"
 wait "$hard_killed_runner_pid" 2>/dev/null || true
+hard_killed_runner_pid=''
 process_group_has_live_non_zombie "$hard_killed_child_pgid" || fail 'hard-killed runner did not leave a live Codex process group for recovery test'
-jq -e --arg runner_pid "$hard_killed_runner_pid" --arg child_pgid "$hard_killed_child_pgid" 'any(.workers[]; .task_id == "hard-killed-worker" and .status == "active" and .invocation_pid == $runner_pid and .active_child_pgid == $child_pgid)' "$registry_path" >/dev/null || fail 'registry lost durable process-group identity after hard kill'
+jq -e --arg runner_pid "$hard_killed_owner_pid" --arg child_pgid "$hard_killed_child_pgid" 'any(.workers[]; .task_id == "hard-killed-worker" and .status == "active" and .invocation_pid == $runner_pid and .active_child_pgid == $child_pgid)' "$registry_path" >/dev/null || fail 'registry lost durable process-group identity after hard kill'
 if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --status interrupted --evidence 'must not retire live child' >"$TEST_ROOT/live-child-finish.out" 2>&1; then
 	fail 'recovery retired a task while its hard-kill-surviving process group was live'
 fi
@@ -728,6 +794,7 @@ if process_group_has_live_non_zombie "$hard_killed_child_pgid" || process_is_liv
 fi
 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --status interrupted --evidence 'child stopped and identity verified' >"$TEST_ROOT/hard-kill-finish.out"
 jq -e 'any(.identity_ledger[]; .task_id == "hard-killed-worker" and .status == "retired" and .terminal_status == "interrupted") and all(.workers[]; .task_id != "hard-killed-worker")' "$registry_path" >/dev/null || fail 'hard-kill recovery did not retire after child exit'
+hard_killed_child_pgid=''
 
 missing_repo="$TEST_ROOT/missing-skills"
 git init -q "$missing_repo"

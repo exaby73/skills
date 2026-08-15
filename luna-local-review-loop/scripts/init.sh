@@ -29,8 +29,10 @@ ALLOW_INSTANCE_MARKER_CREATE=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
+  def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
   def nullable_string: . == null or (. | nonempty_string);
+  def nullable_session: . == null or (. | safe_session);
   def valid_status($status): ["reserved", "bound", "active", "retired"] | index($status) != null;
   def valid_terminal($status): ["completed", "failed", "blocked", "interrupted"] | index($status) != null;
   def valid_retry_chain($ledger):
@@ -63,7 +65,7 @@ readonly SCHEMA_FILTER='
         and (.scope | nonempty_string)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
         and (.retry_of | nullable_string)
-        and (.session_id | nullable_string)
+        and (.session_id | nullable_session)
         and (valid_status(.status))
         and (.reserved_at | nonempty_string)
         and ((.bound_at == null) or (.bound_at | nonempty_string))
@@ -83,7 +85,7 @@ readonly SCHEMA_FILTER='
         and (.scope | nonempty_string)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
         and (.retry_of | nullable_string)
-        and (.session_id | nullable_string)
+        and (.session_id | nullable_session)
         and (valid_status(.status))
         and (.status != "retired")
         and (.created_at | nonempty_string)
@@ -212,11 +214,32 @@ repository_instance_identity() {
 	local allow_create="$1"
 	local git_dir
 	local git_dir_real
+	local backlink=''
+	local backlink_parent=''
+	local backlink_name=''
+	local backlink_real=''
+	local expected_backlink=''
 	local marker_path
 	local nonce=''
 	local checkout_identity=''
 	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
 	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
+	if [[ -e "$git_dir_real/gitdir" || -L "$git_dir_real/gitdir" ]]; then
+		[[ -f "$git_dir_real/gitdir" && ! -L "$git_dir_real/gitdir" ]] || return 1
+		IFS= read -r backlink <"$git_dir_real/gitdir" || return 1
+		[[ -n "$backlink" ]] || return 1
+		case "$backlink" in
+		/*) ;;
+		*) backlink="$git_dir_real/$backlink" ;;
+		esac
+		backlink_parent="${backlink%/*}"
+		backlink_name="${backlink##*/}"
+		[[ -n "$backlink_parent" && -n "$backlink_name" ]] || return 1
+		backlink_parent="$(cd -P "$backlink_parent" 2>/dev/null && pwd -P)" || return 1
+		backlink_real="$backlink_parent/$backlink_name"
+		expected_backlink="$REPO_ROOT/.git"
+		[[ -f "$expected_backlink" && ! -L "$expected_backlink" && "$backlink_real" == "$expected_backlink" ]] || return 1
+	fi
 	marker_path="$git_dir_real/luna-local-review-loop.instance"
 	[[ ! -L "$marker_path" ]] || return 1
 	if [[ ! -e "$marker_path" ]]; then
