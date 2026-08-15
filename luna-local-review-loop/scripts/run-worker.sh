@@ -34,6 +34,7 @@ INVOCATION_TOKEN=''
 INVOCATION_CLAIMED=0
 ACTIVE_CODEX_PID=''
 ACTIVE_CODEX_PGID=''
+ACTIVE_CODEX_INSTANCE=''
 ACTIVE_HELPER_PID=''
 ACTIVE_TRACKER_PID=''
 ACTIVE_TRACKER_STATE=''
@@ -137,6 +138,7 @@ stop_active_child_and_exit() {
 	ACTIVE_HELPER_PID=''
 	ACTIVE_CODEX_PID=''
 	ACTIVE_CODEX_PGID=''
+	ACTIVE_CODEX_INSTANCE=''
 	exit "$exit_code"
 }
 
@@ -184,6 +186,25 @@ process_instance_matches() {
 	process_state="$(ps -p "$pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"
 	case "$process_state" in '' | Z*) return 1 ;; esac
 	return 0
+}
+
+process_has_invocation_token() {
+	local pid="$1"
+	local expected="LUNA_WORKER_PROCESS_TOKEN=$INVOCATION_TOKEN"
+	[[ -n "$INVOCATION_TOKEN" ]] || return 1
+	LC_ALL=C ps eww -p "$pid" -o command= 2>/dev/null \
+		| awk -v expected="$expected" '{ for (field = 1; field <= NF; field++) if ($field == expected) found = 1 } END { exit found ? 0 : 1 }'
+}
+
+process_instance_allows_signal() {
+	local pid="$1"
+	local expected="$2"
+	process_instance_matches "$pid" "$expected" || return 1
+	case "$expected" in
+	proc:*) return 0 ;;
+	ps:*) process_has_invocation_token "$pid" ;;
+	*) return 1 ;;
+	esac
 }
 
 record_process_instance() {
@@ -277,20 +298,37 @@ stop_tracked_worker_processes() {
 	local signal_name="$1"
 	local attempt=0
 	local kill_attempt=0
+	local unsafe_signal=0
 	local pid
 	local instance
 	[[ -n "$ACTIVE_TRACKER_STATE" ]] || return 0
 	while [[ -n "$ACTIVE_TRACKER_PID" ]] && tracker_process_is_live "$ACTIVE_TRACKER_PID" && [[ "$attempt" -lt 100 ]]; do
+		unsafe_signal=0
 		while IFS='|' read -r pid instance; do
-			process_instance_matches "$pid" "$instance" && kill -s "$signal_name" "$pid" 2>/dev/null || true
+			if process_instance_matches "$pid" "$instance"; then
+				if process_instance_allows_signal "$pid" "$instance"; then
+					kill -s "$signal_name" "$pid" 2>/dev/null || true
+				else
+					unsafe_signal=1
+				fi
+			fi
 		done < <(tracked_worker_processes "$ACTIVE_TRACKER_STATE")
+		[[ "$unsafe_signal" -eq 0 ]] || return 1
 		sleep 0.05
 		attempt=$((attempt + 1))
 	done
 	while [[ -n "$ACTIVE_TRACKER_PID" ]] && tracker_process_is_live "$ACTIVE_TRACKER_PID" && [[ "$kill_attempt" -lt 50 ]]; do
+		unsafe_signal=0
 		while IFS='|' read -r pid instance; do
-			process_instance_matches "$pid" "$instance" && kill -KILL "$pid" 2>/dev/null || true
+			if process_instance_matches "$pid" "$instance"; then
+				if process_instance_allows_signal "$pid" "$instance"; then
+					kill -KILL "$pid" 2>/dev/null || true
+				else
+					unsafe_signal=1
+				fi
+			fi
 		done < <(tracked_worker_processes "$ACTIVE_TRACKER_STATE")
+		[[ "$unsafe_signal" -eq 0 ]] || return 1
 		sleep 0.05
 		kill_attempt=$((kill_attempt + 1))
 	done
@@ -325,8 +363,12 @@ stop_codex_process_group() {
 	local signal_name="$1"
 	local pgid="$ACTIVE_CODEX_PGID"
 	local leader_pid="$ACTIVE_CODEX_PID"
+	local leader_instance="$ACTIVE_CODEX_INSTANCE"
 	[[ -n "$pgid" ]] || return 0
 	if ! process_group_is_empty "$pgid"; then
+		[[ -n "$leader_pid" && "$leader_pid" == "$pgid" && -n "$leader_instance" ]] || return 1
+		jobs -pr | awk -v target="$leader_pid" '$1 == target { found = 1 } END { exit found ? 0 : 1 }' || return 1
+		process_instance_matches "$leader_pid" "$leader_instance" || return 1
 		kill -s "$signal_name" -- "-$pgid" 2>/dev/null || true
 		if ! wait_for_process_group_exit "$pgid"; then
 			kill -KILL -- "-$pgid" 2>/dev/null || true
@@ -336,6 +378,7 @@ stop_codex_process_group() {
 	[[ -z "$leader_pid" ]] || wait "$leader_pid" 2>/dev/null || true
 	ACTIVE_CODEX_PID=''
 	ACTIVE_CODEX_PGID=''
+	ACTIVE_CODEX_INSTANCE=''
 }
 
 wait_for_helper() {
@@ -453,6 +496,13 @@ run_gated_codex() {
 	set +m
 	ACTIVE_CODEX_PID=$!
 	child_pid="$ACTIVE_CODEX_PID"
+	ACTIVE_CODEX_INSTANCE="$(process_instance_identity "$child_pid")" || {
+		kill -TERM "$child_pid" 2>/dev/null || true
+		wait "$child_pid" 2>/dev/null || true
+		ACTIVE_CODEX_PID=''
+		ACTIVE_CODEX_INSTANCE=''
+		return 1
+	}
 	child_pgid="$(ps -p "$child_pid" -o pgid= 2>/dev/null | awk 'NF {print $1; exit}')"
 	ACTIVE_CODEX_PGID="$child_pgid"
 	if [[ "$child_pgid" != "$child_pid" ]]; then
@@ -460,13 +510,14 @@ run_gated_codex() {
 		wait "$child_pid" 2>/dev/null || true
 		ACTIVE_CODEX_PID=''
 		ACTIVE_CODEX_PGID=''
+		ACTIVE_CODEX_INSTANCE=''
 		return 1
 	fi
 	ACTIVE_TRACKER_STATE="$artifact_dir/.descendants-$INVOCATION_TOKEN.json"
 	[[ ! -L "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must not be a symlink: $ACTIVE_TRACKER_STATE."
 	[[ ! -e "$ACTIVE_TRACKER_STATE" || -f "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must be a regular file target: $ACTIVE_TRACKER_STATE."
 	rm -f "$ACTIVE_TRACKER_STATE"
-	monitor_descendant_tree "$child_pid" "$ACTIVE_TRACKER_STATE" &
+	monitor_descendant_tree "$child_pid" "$ACTIVE_TRACKER_STATE" >/dev/null 2>&1 &
 	ACTIVE_TRACKER_PID=$!
 	while [[ ! -s "$ACTIVE_TRACKER_STATE" ]]; do
 		kill -0 "$ACTIVE_TRACKER_PID" 2>/dev/null || break
@@ -486,11 +537,9 @@ run_gated_codex() {
 	fi
 	wait "$child_pid" || child_status=$?
 	ACTIVE_CODEX_PID=''
+	ACTIVE_CODEX_INSTANCE=''
 	rm -f "$gate_path"
-	if ! process_group_is_empty "$child_pgid"; then
-		ACTIVE_CODEX_PGID="$child_pgid"
-		stop_codex_process_group TERM || return 1
-	fi
+	ACTIVE_CODEX_PGID=''
 	stop_tracked_worker_processes TERM || return 1
 	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
 	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'

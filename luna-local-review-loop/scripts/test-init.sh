@@ -450,6 +450,26 @@ ordinary_repo_real="$(cd -P "$ordinary_repo" && pwd -P)"
 jq -e --arg root "$ordinary_repo_real" '.repository_root == $root and any(.workers[]; .task_id == "ordinary-live-worker")' "$ordinary_registry" >/dev/null || fail 'ordinary Git-directory alias rewrote or abandoned original live state'
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$ordinary_repo" --state-root "$ordinary_state" --task-id ordinary-live-worker --status interrupted --evidence 'ordinary Git-directory alias test complete' >/dev/null
 
+metadata_repo="$TEST_ROOT/metadata-replacement-repo"
+metadata_state="$TEST_ROOT/metadata-replacement-state"
+mkdir -p "$metadata_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$metadata_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$metadata_repo/.agents/skills/caveman"
+git -C "$metadata_repo" init -q
+metadata_registry="$($INIT_SCRIPT --repo "$metadata_repo" --state-root "$metadata_state" --print-path)"
+"$REGISTRY_SCRIPT" reserve --repo "$metadata_repo" --state-root "$metadata_state" --task-id metadata-live-worker --scope 'preserve live ownership across Git metadata replacement' >/dev/null
+mv "$metadata_repo/.git" "$metadata_repo/.git-original"
+cp -R "$metadata_repo/.git-original" "$metadata_repo/.git"
+if "$INIT_SCRIPT" --repo "$metadata_repo" --state-root "$metadata_state" >"$TEST_ROOT/metadata-replacement.out" 2>&1; then
+	fail 'init replaced a stale locator while its referenced registry retained live ownership of the same working tree'
+fi
+rg -F 'Git metadata changed while the registry referenced by its locator still owns live workers' "$TEST_ROOT/metadata-replacement.out" >/dev/null || fail 'Git metadata replacement refusal lacked live-ownership evidence'
+metadata_repo_real="$(cd -P "$metadata_repo" && pwd -P)"
+jq -e --arg root "$metadata_repo_real" '.repository_root == $root and any(.workers[]; .task_id == "metadata-live-worker")' "$metadata_registry" >/dev/null || fail 'Git metadata replacement rewrote or abandoned original live state'
+mv "$metadata_repo/.git" "$metadata_repo/.git-replacement"
+mv "$metadata_repo/.git-original" "$metadata_repo/.git"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$metadata_repo" --state-root "$metadata_state" --task-id metadata-live-worker --status interrupted --evidence 'Git metadata replacement test complete' >/dev/null
+
 identity_repo="$TEST_ROOT/identity-repo"
 identity_state="$TEST_ROOT/identity-state"
 mkdir -p "$identity_repo/.agents/skills"
@@ -926,17 +946,38 @@ rg -F 'irrelevant connector warning' "$(dirname "$registry_path")/artifacts/fast
 printf '%s\n' 'drain detached descendant' >"$PROMPT_FILE"
 rm -f "$CODEX_DETACHED_PID_FILE" "$CODEX_DETACHED_OBSERVED_FILE"
 detached_tracker_dir="$(dirname "$registry_path")/artifacts/detached-worker"
-detached_output="$(FAKE_DETACH_RESUME=1 CODEX_DETACHED_TRACKER_DIR="$detached_tracker_dir" CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id detached-worker --scope 'drain detached worker descendant' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/detached.err")"
-jq -e '.outcome == "completed"' <<<"$detached_output" >/dev/null || fail 'worker with detached descendant did not complete'
+detached_status=0
+detached_output="$(FAKE_DETACH_RESUME=1 CODEX_DETACHED_TRACKER_DIR="$detached_tracker_dir" CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id detached-worker --scope 'drain detached worker descendant' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/detached.err")" || detached_status=$?
 [[ -s "$CODEX_DETACHED_PID_FILE" ]] || fail 'detached descendant fixture did not publish its PID'
 [[ -s "$CODEX_DETACHED_OBSERVED_FILE" ]] || fail 'detached descendant fixture exited before tracker observation'
 detached_pid="$(cat "$CODEX_DETACHED_PID_FILE")"
-if process_is_live_non_zombie "$detached_pid"; then
-	fail 'detached worker descendant survived registry retirement'
-fi
 detached_trackers=("$(dirname "$registry_path")/artifacts/detached-worker/".descendants-*.json)
 [[ "${#detached_trackers[@]}" -eq 1 && -f "${detached_trackers[0]}" ]] || fail 'detached worker descendant tracker was not unique'
 jq -e '.processes | type == "array" and all(.[]; (.pid | type == "number") and (.instance | type == "string" and length > 0))' "${detached_trackers[0]}" >/dev/null || fail 'descendant tracker did not pin process instances'
+if jq -e 'any(.processes[]; .instance | startswith("ps:"))' "${detached_trackers[0]}" >/dev/null; then
+	[[ "$detached_status" -ne 0 ]] || fail 'non-procfs cleanup destructively signaled a descendant using only second-resolution process identity'
+	process_is_live_non_zombie "$detached_pid" || fail 'non-procfs safe refusal did not preserve the unprovable detached descendant'
+	kill -TERM "$detached_pid" 2>/dev/null || true
+	poll_attempt=0
+	while process_is_live_non_zombie "$detached_pid" && [[ "$poll_attempt" -lt 100 ]]; do
+		sleep 0.05
+		poll_attempt=$((poll_attempt + 1))
+	done
+	process_is_live_non_zombie "$detached_pid" && fail 'detached descendant fixture did not stop after explicit test cleanup'
+	poll_attempt=0
+	while [[ "$(jq -r '.status // empty' "${detached_trackers[0]}" 2>/dev/null)" != clean ]] && [[ "$poll_attempt" -lt 100 ]]; do
+		sleep 0.05
+		poll_attempt=$((poll_attempt + 1))
+	done
+	jq -e '.status == "clean" and (.processes | length) == 0' "${detached_trackers[0]}" >/dev/null || fail 'detached tracker did not publish clean evidence after explicit test cleanup'
+	CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id detached-worker --status interrupted --evidence 'non-procfs descendant required explicit cleanup' >"$TEST_ROOT/detached-finish.out"
+else
+	[[ "$detached_status" -eq 0 ]] || fail 'worker with safely identifiable detached descendant did not complete'
+	jq -e '.outcome == "completed"' <<<"$detached_output" >/dev/null || fail 'worker with detached descendant did not return its structured result'
+	if process_is_live_non_zombie "$detached_pid"; then
+		fail 'detached worker descendant survived registry retirement'
+	fi
+fi
 
 printf '%s\n' 'terminate child safely' >"$PROMPT_FILE"
 rm -f "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE"

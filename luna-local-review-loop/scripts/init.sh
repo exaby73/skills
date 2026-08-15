@@ -257,6 +257,31 @@ regular_file_link_count() {
 	printf '%s\n' "$count"
 }
 
+refuse_live_stale_locator_for_current_root() {
+	local located_path="$1"
+	local located_dir=''
+	local candidate=''
+	local link_count=''
+	case "$located_path" in
+	/*/registry.json) ;;
+	*) die "$EXIT_FILESYSTEM" "registry locator contains an invalid path: $REGISTRY_LOCATOR_PATH." ;;
+	esac
+	located_dir="$(canonical_path_without_creation "${located_path%/*}")" || die "$EXIT_FILESYSTEM" "cannot resolve stale registry locator target: $located_path."
+	candidate="$located_dir/registry.json"
+	case "$candidate/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "stale registry locator target must be outside the repository: $candidate." ;;
+	esac
+	[[ -e "$candidate" || -L "$candidate" ]] || return 0
+	[[ -f "$candidate" && ! -L "$candidate" ]] || die "$EXIT_FILESYSTEM" "stale registry locator target must be a regular file: $candidate."
+	link_count="$(regular_file_link_count "$candidate")" || die "$EXIT_FILESYSTEM" "cannot inspect stale registry locator target link count: $candidate."
+	[[ "$link_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "stale registry locator target must have exactly one hard link: $candidate."
+	jq -e '(.schema_version == 2 or .schema_version == 3) and (.repository_root | type == "string" and length > 0) and (.workers | type == "array")' "$candidate" >/dev/null 2>&1 \
+		|| die "$EXIT_SCHEMA" "stale registry locator target is not a recognizable registry: $candidate."
+	if jq -e --arg root "$REPO_ROOT" '.repository_root == $root and (.workers | length) > 0' "$candidate" >/dev/null; then
+		die "$EXIT_REPOSITORY" "Git metadata changed while the registry referenced by its locator still owns live workers for $REPO_ROOT: $candidate. Restore the owning Git metadata or retire those workers before replacing the locator."
+	fi
+}
+
 read_registry_locator() {
 	local located_path=''
 	local located_checkout_identity=''
@@ -275,6 +300,7 @@ read_registry_locator() {
 	located_checkout_identity="$(jq -r '.repository_checkout_identity' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read checkout identity from locator: $REGISTRY_LOCATOR_PATH."
 	if [[ "$located_checkout_identity" != "$REPO_CHECKOUT_IDENTITY" ]]; then
 		[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_REPOSITORY" "registry locator belongs to another physical Git checkout: $REGISTRY_LOCATOR_PATH. Normal initialization can replace a copied locator; recovery will not guess."
+		refuse_live_stale_locator_for_current_root "$located_path"
 		STALE_LOCATOR=1
 		return 1
 	fi
