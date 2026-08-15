@@ -34,33 +34,5 @@
       "items": { "type": "string" }
     },
     "parentAction": { "type": ["string", "null"] }
-  },
-  "anyOf": [
-    {
-      "properties": {
-        "outcome": { "const": "needs_parent_action" },
-        "parentAction": { "type": "string", "minLength": 1 }
-      }
-    },
-    {
-      "properties": {
-        "outcome": { "const": "completed" },
-        "validators": {
-          "items": {
-            "properties": {
-              "status": { "const": "passed" }
-            }
-          }
-        },
-        "unresolved": { "maxItems": 0 },
-        "parentAction": { "type": "null" }
-      }
-    },
-    {
-      "properties": {
-        "outcome": { "const": "blocked" },
-        "parentAction": { "type": "null" }
-      }
-    }
-  ]
+  }
 }
