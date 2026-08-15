@@ -46,6 +46,7 @@ ALLOW_INSTANCE_MARKER_CREATE=0
 LOCATOR_LOADED=0
 LOCATOR_PENDING=0
 STALE_LOCATOR=0
+STALE_AUTHORITY_REGISTRY_PATH=''
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
@@ -306,6 +307,9 @@ inspect_checkout_authority() {
 	local recorded_root
 	local recorded_path
 	local recorded_dir
+	local recorded_registry_root
+	local recorded_checkout_identity
+	local recorded_schema_version
 	local recorded_live_count
 	[[ -e "$AUTHORITY_PATH" || -L "$AUTHORITY_PATH" ]] || return 0
 	[[ -f "$AUTHORITY_PATH" && ! -L "$AUTHORITY_PATH" ]] || die "$EXIT_FILESYSTEM" "checkout authority must be a regular file: $AUTHORITY_PATH."
@@ -331,11 +335,29 @@ inspect_checkout_authority() {
 	[[ -f "$recorded_path" && ! -L "$recorded_path" ]] || die "$EXIT_FILESYSTEM" "checkout authority registry target must be a regular file: $recorded_path."
 	link_count="$(regular_file_link_count "$recorded_path")" || die "$EXIT_FILESYSTEM" "cannot inspect checkout authority registry target link count: $recorded_path."
 	[[ "$link_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "checkout authority registry target must have exactly one hard link: $recorded_path."
-	jq -e --arg root "$REPO_ROOT" '(.schema_version == 2 or .schema_version == 3) and .registry == "luna-local-review-loop" and .repository_root == $root and (.workers | type == "array")' "$recorded_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "checkout authority registry target is not a recognizable registry for $REPO_ROOT: $recorded_path."
+	jq -e '(.schema_version == 2 or .schema_version == 3) and .registry == "luna-local-review-loop" and (.repository_root | type == "string" and length > 0) and (.repository_identity | type == "string" and length > 0) and (.workers | type == "array")' "$recorded_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "checkout authority registry target is not a recognizable registry: $recorded_path."
+	recorded_registry_root="$(jq -r '.repository_root' "$recorded_path")"
+	recorded_checkout_identity="$(jq -r '.repository_checkout_identity // empty' "$recorded_path")"
+	recorded_schema_version="$(jq -r '.schema_version' "$recorded_path")"
 	recorded_live_count="$(jq '.workers | length' "$recorded_path")"
 	if [[ "$recorded_live_count" -gt 0 ]] && { [[ ! -e "$INSTANCE_MARKER_PATH" ]] || [[ ! -e "$REGISTRY_LOCATOR_PATH" ]]; }; then
 		die "$EXIT_REPOSITORY" "durable checkout authority retains $recorded_live_count live worker(s) for $REPO_ROOT while Git metadata ownership markers are missing: $recorded_path. Restore the owning Git metadata or retire those workers before initialization."
 	fi
+	if [[ "$recorded_registry_root" == "$REPO_ROOT" ]]; then
+		return 0
+	fi
+	if [[ "$recorded_checkout_identity" == "$REPO_CHECKOUT_IDENTITY" && -n "$recorded_checkout_identity" ]]; then
+		return 0
+	fi
+	if [[ "$recorded_live_count" -gt 0 ]]; then
+		die "$EXIT_REPOSITORY" "checkout authority registry target belongs to another physical Git checkout and retains $recorded_live_count live worker(s): $recorded_path. Restore the owning checkout or retire those workers before initializing a replacement repository."
+	fi
+	if [[ "$EXISTING_ONLY" -eq 0 && "$recorded_schema_version" == 3 && "$recorded_checkout_identity" =~ ^[0-9]+:[0-9]+$ && "$recorded_checkout_identity" != "$REPO_CHECKOUT_IDENTITY" ]]; then
+		jq -e "$SCHEMA_FILTER" "$recorded_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "stale checkout authority target fails schema validation: $recorded_path. Preserve it and recover the owning checkout before replacement."
+		STALE_AUTHORITY_REGISTRY_PATH="$recorded_path"
+		return 0
+	fi
+	die "$EXIT_REPOSITORY" "checkout authority registry target belongs to another physical Git checkout: $recorded_path. Recovery will not guess a replacement repository."
 }
 
 publish_checkout_authority() {
@@ -600,6 +622,10 @@ resolve_registry_location() {
 		[[ -n "$repo_fingerprint" ]] || die "$EXIT_FILESYSTEM" 'could not derive repository state key.'
 		REGISTRY_DIR="$STATE_ROOT/$repo_fingerprint"
 		REGISTRY_PATH="$REGISTRY_DIR/registry.json"
+		if [[ -n "$STALE_AUTHORITY_REGISTRY_PATH" && "$REGISTRY_PATH" == "$STALE_AUTHORITY_REGISTRY_PATH" ]]; then
+			REGISTRY_DIR="$STATE_ROOT/$REPO_IDENTITY"
+			REGISTRY_PATH="$REGISTRY_DIR/registry.json"
+		fi
 	fi
 	LOCK_DIR="$REGISTRY_DIR/.lock"
 	validate_registry_dir
