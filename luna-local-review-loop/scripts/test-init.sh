@@ -70,6 +70,7 @@ wait_for_blocking_fixture() {
 readonly REPO_ROOT="$TEST_ROOT/repo"
 readonly STATE_ROOT="$TEST_ROOT/state"
 readonly BIN_DIR="$TEST_ROOT/bin"
+readonly SLOW_BIN_DIR="$TEST_ROOT/slow-bin"
 readonly CODEX_STATE="$TEST_ROOT/codex-home"
 readonly PROMPT_FILE="$TEST_ROOT/task.txt"
 readonly CONTINUE_FILE="$TEST_ROOT/continue.txt"
@@ -80,7 +81,7 @@ readonly CODEX_DESCENDANT_PID_FILE="$TEST_ROOT/codex-descendant.pid"
 readonly CODEX_DETACHED_PID_FILE="$TEST_ROOT/codex-detached.pid"
 readonly CODEX_DETACHED_OBSERVED_FILE="$TEST_ROOT/codex-detached-observed"
 
-mkdir -p "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman" "$BIN_DIR" "$CODEX_STATE"
+mkdir -p "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman" "$BIN_DIR" "$SLOW_BIN_DIR" "$CODEX_STATE"
 printf '%s\n' '# code reviewer' >"$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
 printf '%s\n' '# caveman' >"$REPO_ROOT/.agents/skills/caveman/SKILL.md"
 printf '%s\n' 'task prompt' >"$PROMPT_FILE"
@@ -183,6 +184,17 @@ else
 fi
 EOF
 chmod +x "$BIN_DIR/codex"
+ln -s "$BIN_DIR/codex" "$SLOW_BIN_DIR/codex"
+cat >"$SLOW_BIN_DIR/ps" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${LUNA_TEST_SLOW_PS:-0}" == '1' && "$*" == '-ax -o pid=,ppid=,stat=' && ! -e "$SLOW_PS_MARKER" ]]; then
+	: >"$SLOW_PS_MARKER"
+	sleep 2
+fi
+exec "$(command -p -v ps)" "$@"
+EOF
+chmod +x "$SLOW_BIN_DIR/ps"
 export PATH="$BIN_DIR:$PATH"
 export CODEX_CALLS
 export CODEX_COUNTER
@@ -293,7 +305,7 @@ git -C "$pid_schema_repo" init -q
 pid_schema_registry="$($INIT_SCRIPT --repo "$pid_schema_repo" --state-root "$pid_schema_state" --print-path)"
 "$REGISTRY_SCRIPT" reserve --repo "$pid_schema_repo" --state-root "$pid_schema_state" --task-id malformed-process-id --scope 'reject malformed persisted process identifiers' >/dev/null
 cp "$pid_schema_registry" "$pid_schema_registry.clean"
-jq '.workers[0].invocation_pid = "not-a-pid" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "instance"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+jq '.workers[0].invocation_pid = "not-a-pid" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "ps:Thu Jan 1 00:00:00 1970"' "$pid_schema_registry.clean" >"$pid_schema_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-invocation-pid.out" 2>&1; then
 	fail 'schema accepted a nonnumeric invocation PID'
 fi
@@ -303,14 +315,24 @@ if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_s
 	fail 'schema accepted an invocation claim without process-start identity'
 fi
 cp "$pid_schema_registry.clean" "$pid_schema_registry"
-jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "instance" | .workers[0].active_child_pgid = "not-a-pgid" | .workers[0].active_child_instance = "instance"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "ps:garbage"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-invocation-instance.out" 2>&1; then
+	fail 'schema accepted a malformed invocation process-start identity'
+fi
+cp "$pid_schema_registry.clean" "$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "ps:Thu Jan 1 00:00:00 1970" | .workers[0].active_child_pgid = "not-a-pgid" | .workers[0].active_child_instance = "ps:Thu Jan 1 00:00:00 1970"' "$pid_schema_registry.clean" >"$pid_schema_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-child-pgid.out" 2>&1; then
 	fail 'schema accepted a nonnumeric child process-group ID'
 fi
 cp "$pid_schema_registry.clean" "$pid_schema_registry"
-jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "instance" | .workers[0].active_child_pgid = "123" | .workers[0].active_child_instance = null' "$pid_schema_registry.clean" >"$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "ps:Thu Jan 1 00:00:00 1970" | .workers[0].active_child_pgid = "123" | .workers[0].active_child_instance = null' "$pid_schema_registry.clean" >"$pid_schema_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/missing-child-instance.out" 2>&1; then
 	fail 'schema accepted a child process group without leader process-start identity'
+fi
+cp "$pid_schema_registry.clean" "$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "ps:Thu Jan 1 00:00:00 1970" | .workers[0].active_child_pgid = "123" | .workers[0].active_child_instance = "ps:garbage"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-child-instance.out" 2>&1; then
+	fail 'schema accepted a malformed child process-group leader identity'
 fi
 cp "$pid_schema_registry.clean" "$pid_schema_registry"
 
@@ -448,7 +470,7 @@ rm -rf "$lock_symlink_target"
 "$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'registry could not reclaim an ownerless atomic lock file'
 [[ ! -e "$registry_dir/.lock" ]] || fail 'ownerless atomic lock remained after recovery'
 
-printf '%s|%s\n' "$$" 'ps:stale-lock-owner-instance' >"$registry_dir/.lock"
+printf '%s|%s\n' "$$" 'ps:Thu Jan 1 00:00:00 1970' >"$registry_dir/.lock"
 "$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'registry could not reclaim a lock after PID reuse'
 [[ ! -e "$registry_dir/.lock" ]] || fail 'PID-reused stale lock remained after recovery'
 
@@ -686,6 +708,14 @@ read_only_retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --r
 jq -e '.outcome == "completed"' <<<"$read_only_retry_output" >/dev/null || fail 'read-only runner retry did not complete'
 jq -e 'any(.identity_ledger[]; .task_id == "read-only-runner-retry" and .sandbox == "read-only" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'runner retry did not preserve read-only sandbox'
 
+relative_codex_output="$(cd "$TEST_ROOT" && PATH="bin:$PATH" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id relative-codex-worker --scope 'canonicalize relative codex path' --prompt-file task.txt 2>"$TEST_ROOT/relative-codex.err")"
+jq -e '.outcome == "completed"' <<<"$relative_codex_output" >/dev/null || fail 'runner did not canonicalize a Codex executable found through a relative PATH entry'
+
+slow_ps_marker="$TEST_ROOT/slow-ps.ready"
+slow_tracker_output="$(PATH="$SLOW_BIN_DIR:$PATH" LUNA_TEST_SLOW_PS=1 SLOW_PS_MARKER="$slow_ps_marker" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id slow-tracker-worker --scope 'wait for slow tracker readiness' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/slow-tracker.err")"
+jq -e '.outcome == "completed"' <<<"$slow_tracker_output" >/dev/null || fail 'runner imposed a fixed deadline on tracker readiness'
+[[ -e "$slow_ps_marker" ]] || fail 'slow tracker fixture did not delay its initial process snapshot'
+
 runner_output="$(cd "$TEST_ROOT" && CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-worker --scope 'one fast task' --prompt-file task.txt 2>"$TEST_ROOT/runner.err")"
 jq -e '.outcome == "completed" and .summary == "worker concise result"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output'
 "$REGISTRY_SCRIPT" assert-no-active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'completed worker was not atomically retired'
@@ -698,13 +728,13 @@ jq -e 'any(.workers[]; .task_id == "continued-worker" and .status == "active" an
 
 jq --arg pid "$$" '
   .workers |= map(if .task_id == "continued-worker"
-    then .invocation_pid = $pid | .invocation_token = "reused-pid-stale-owner" | .invocation_instance = "ps:stale-process-instance"
+    then .invocation_pid = $pid | .invocation_token = "reused-pid-stale-owner" | .invocation_instance = "ps:Thu Jan 1 00:00:00 1970"
     else .
     end)
 ' "$registry_path" >"$registry_path.tmp"
 mv "$registry_path.tmp" "$registry_path"
 "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token reused-pid-current-owner >/dev/null
-jq -e 'any(.workers[]; .task_id == "continued-worker" and .invocation_pid == $pid and .invocation_token == "reused-pid-current-owner" and (.invocation_instance | type == "string" and length > 0 and . != "ps:stale-process-instance"))' --arg pid "$$" "$registry_path" >/dev/null || fail 'PID reuse simulation did not replace stale invocation process identity'
+jq -e 'any(.workers[]; .task_id == "continued-worker" and .invocation_pid == $pid and .invocation_token == "reused-pid-current-owner" and (.invocation_instance | type == "string" and length > 0 and . != "ps:Thu Jan 1 00:00:00 1970"))' --arg pid "$$" "$registry_path" >/dev/null || fail 'PID reuse simulation did not replace stale invocation process identity'
 "$REGISTRY_SCRIPT" release-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --token reused-pid-current-owner >/dev/null
 
 sleep 30 &
@@ -715,7 +745,7 @@ wait "$stale_owner_pid" 2>/dev/null || true
 stale_owner_pid=''
 jq --arg pgid "$$" '
   .workers |= map(if .task_id == "continued-worker"
-    then .active_child_pgid = $pgid | .active_child_instance = "ps:stale-child-group-instance"
+    then .active_child_pgid = $pgid | .active_child_instance = "ps:Thu Jan 1 00:00:00 1970"
     else .
     end)
 ' "$registry_path" >"$registry_path.tmp"
@@ -724,6 +754,10 @@ stale_tracker="$registry_dir/artifacts/continued-worker/.descendants-stale-owner
 printf '%s\n' '{"status":"active","root_pid":99999999,"processes":[]}' >"$stale_tracker"
 if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token premature-reclaimer >"$TEST_ROOT/active-stale-tracker.out" 2>&1; then
 	fail 'stale invocation reclaim ignored an active tracker from the previous token'
+fi
+printf '%s\n' '{"status":"clean","root_pid":99999999,"processes":[{"pid":99999999,"instance":"ps:recorded-process"}]}' >"$stale_tracker"
+if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token dirty-clean-reclaimer >"$TEST_ROOT/dirty-clean-tracker.out" 2>&1; then
+	fail 'stale invocation reclaim accepted a clean tracker that retained process identities'
 fi
 printf '%s\n' '{"status":"clean","root_pid":99999999,"processes":[]}' >"$stale_tracker"
 sleep 30 &
@@ -778,13 +812,13 @@ fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
 resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 7 ]] || fail "expected seven exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 9 ]] || fail "expected nine exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 14 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 18 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
 [[ "$read_only_count" -eq 3 ]] || fail "expected original, retry, and continued-worker handshakes to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 7 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 9 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
 [[ "$read_only_resume_count" -eq 3 ]] || fail "expected read-only sandbox on retry and both continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then

@@ -33,6 +33,7 @@ readonly SCHEMA_FILTER='
   def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
+  def process_instance: type == "string" and test("^(proc:[0-9]+|ps:[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4})$");
   def nullable_identity: . == null or (. | safe_identity);
   def nullable_session: . == null or (. | safe_session);
   def valid_status($status): ["reserved", "bound", "active", "retired"] | index($status) != null;
@@ -97,9 +98,9 @@ readonly SCHEMA_FILTER='
         and ((.activated_at == null) or (.activated_at | nonempty_string))
         and (.checkpoint_evidence | type == "string")
         and ((.invocation_pid == null and .invocation_token == null and .invocation_instance == null)
-             or ((.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | nonempty_string)))
+             or ((.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | process_instance)))
         and ((.active_child_pgid == null and .active_child_instance == null)
-             or ((.active_child_pgid | positive_pid) and (.active_child_instance | nonempty_string) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | nonempty_string)))
+             or ((.active_child_pgid | positive_pid) and (.active_child_instance | process_instance) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | process_instance)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))

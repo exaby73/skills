@@ -67,9 +67,18 @@ runtime_state_is_writable() {
 }
 
 validate_common() {
+	local codex_discovered=''
+	local codex_parent=''
+	local codex_name=''
 	local prompt_parent=''
 	local prompt_name=''
-	CODEX_BIN="$(command -v "$CODEX_BIN" 2>/dev/null)" || die "$EXIT_PREREQUISITE" "Codex CLI not found: $CODEX_BIN."
+	codex_discovered="$(command -v "$CODEX_BIN" 2>/dev/null)" || die "$EXIT_PREREQUISITE" "Codex CLI not found: $CODEX_BIN."
+	case "$codex_discovered" in /*) ;; *) codex_discovered="$PWD/$codex_discovered" ;; esac
+	codex_parent="${codex_discovered%/*}"
+	codex_name="${codex_discovered##*/}"
+	codex_parent="$(cd -P "$codex_parent" 2>/dev/null && pwd -P)" || die "$EXIT_PREREQUISITE" "cannot resolve Codex CLI parent: $codex_discovered."
+	CODEX_BIN="$codex_parent/$codex_name"
+	[[ -f "$CODEX_BIN" && -x "$CODEX_BIN" ]] || die "$EXIT_PREREQUISITE" "Codex CLI is not an executable file: $CODEX_BIN."
 	[[ -f "$RESULT_SCHEMA" ]] || die "$EXIT_PREREQUISITE" "worker result schema not found: $RESULT_SCHEMA."
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_USAGE" "repository path does not exist or is not a directory: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$REPO_INPUT" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_USAGE" "repository path is not inside a Git repository: $REPO_INPUT."
@@ -415,7 +424,6 @@ run_gated_codex() {
 	local child_status=0
 	local child_pid
 	local child_pgid
-	local tracker_attempt=0
 	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
 	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
 	rm -f "$gate_path"
@@ -451,10 +459,9 @@ run_gated_codex() {
 	rm -f "$ACTIVE_TRACKER_STATE"
 	monitor_descendant_tree "$child_pid" "$ACTIVE_TRACKER_STATE" &
 	ACTIVE_TRACKER_PID=$!
-	while [[ ! -s "$ACTIVE_TRACKER_STATE" && "$tracker_attempt" -lt 100 ]]; do
+	while [[ ! -s "$ACTIVE_TRACKER_STATE" ]]; do
 		kill -0 "$ACTIVE_TRACKER_PID" 2>/dev/null || break
 		sleep 0.01
-		tracker_attempt=$((tracker_attempt + 1))
 	done
 	jq -e '.status == "active"' "$ACTIVE_TRACKER_STATE" >/dev/null 2>&1 || {
 		stop_codex_process_group TERM || true

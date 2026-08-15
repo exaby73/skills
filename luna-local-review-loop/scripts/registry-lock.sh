@@ -67,6 +67,7 @@ lock_owner_is_confirmed_stale() {
 	local owner_pid=''
 	local owner_instance=''
 	local current_instance=''
+	local ps_instance_pattern='^ps:[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$'
 	case "$owner_record" in
 	*'|'*)
 		owner_pid="${owner_record%%|*}"
@@ -79,7 +80,7 @@ lock_owner_is_confirmed_stale() {
 	if [[ -z "$owner_instance" ]]; then
 		return 1
 	fi
-	[[ "$owner_instance" =~ ^proc:[0-9]+$ || "$owner_instance" =~ ^ps:.+ ]] || return 1
+	[[ "$owner_instance" =~ ^proc:[0-9]+$ || "$owner_instance" =~ $ps_instance_pattern ]] || return 1
 	if current_instance="$(lock_process_instance_identity "$owner_pid")"; then
 		[[ "$current_instance" != "$owner_instance" ]]
 		return

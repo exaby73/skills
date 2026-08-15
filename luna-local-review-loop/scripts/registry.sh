@@ -27,6 +27,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
+  def process_instance: type == "string" and test("^(proc:[0-9]+|ps:[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4})$");
   def valid_retry_chain($ledger):
     all($ledger | to_entries[];
       . as $entry
@@ -65,9 +66,9 @@ readonly TRANSITION_SCHEMA_FILTER='
       and (($worker.retry_of == null) or ($worker.retry_of | safe_identity))
       and (.status == "reserved" or .status == "bound" or .status == "active")
       and (($worker.invocation_pid == null and $worker.invocation_token == null and $worker.invocation_instance == null)
-           or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | nonempty)))
+           or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | process_instance)))
       and (($worker.active_child_pgid == null and $worker.active_child_instance == null)
-           or (($worker.active_child_pgid | positive_pid) and ($worker.active_child_instance | nonempty) and ($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | nonempty)))
+           or (($worker.active_child_pgid | positive_pid) and ($worker.active_child_instance | process_instance) and ($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | process_instance)))
       and any($root.identity_ledger[];
         .task_id == $worker.task_id
         and .scope == $worker.scope
@@ -246,11 +247,7 @@ descendant_state_is_confirmed_clean() {
 	jq -e '
 	    .status == "clean"
 	    and (.root_pid | type == "number" and . > 0 and floor == .)
-	    and (.processes | type == "array")
-	    and all(.processes[];
-	      (.pid | type == "number" and . > 0 and floor == .)
-	      and (.instance | type == "string" and length > 0)
-	    )
+	    and .processes == []
 	  ' "$state_path" >/dev/null 2>&1
 }
 
