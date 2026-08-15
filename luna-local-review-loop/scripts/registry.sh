@@ -589,7 +589,10 @@ command_claim_invocation() {
 		if [[ -n "$current_child_pid" ]] && recorded_process_group_blocks_recovery "$current_child_pid" "$current_child_instance"; then
 			die "$EXIT_CONFLICT" "Codex process group $current_child_pid remains live for task $task_id; stop and verify that group before reclaiming the invocation."
 		fi
-		if [[ -n "$current_token" && (-e "$(descendant_state_path "$task_id" "$current_token")" || -L "$(descendant_state_path "$task_id" "$current_token")") ]] && ! descendant_state_is_confirmed_clean "$task_id" "$current_token"; then
+		if [[ -n "$current_child_pid" ]] && { [[ -z "$current_token" ]] || ! descendant_state_is_confirmed_clean "$task_id" "$current_token"; }; then
+			die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the recorded child process tree stopped for task $task_id; restore or verify its cleanup evidence before reclaiming."
+		fi
+		if [[ -z "$current_child_pid" && -n "$current_token" && (-e "$(descendant_state_path "$task_id" "$current_token")" || -L "$(descendant_state_path "$task_id" "$current_token")") ]] && ! descendant_state_is_confirmed_clean "$task_id" "$current_token"; then
 			die "$EXIT_CONFLICT" "Codex descendant tracker remains active for the previous invocation of task $task_id; stop and verify its recorded processes before reclaiming."
 		fi
 	fi
@@ -751,7 +754,10 @@ command_complete_and_retire() {
 		die "$EXIT_CONFLICT" "Codex process group $active_child_pgid remains live for task $task_id; stop and verify that group before retirement."
 	fi
 	stored_invocation_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
-	if [[ -n "$stored_invocation_token" && -e "$(descendant_state_path "$task_id" "$stored_invocation_token")" ]] && ! descendant_state_is_confirmed_clean "$task_id" "$stored_invocation_token"; then
+	if [[ -n "$active_child_pgid" ]] && { [[ -z "$stored_invocation_token" ]] || ! descendant_state_is_confirmed_clean "$task_id" "$stored_invocation_token"; }; then
+		die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the recorded child process tree stopped for task $task_id; restore or verify its cleanup evidence before retirement."
+	fi
+	if [[ -z "$active_child_pgid" && -n "$stored_invocation_token" && (-e "$(descendant_state_path "$task_id" "$stored_invocation_token")" || -L "$(descendant_state_path "$task_id" "$stored_invocation_token")") ]] && ! descendant_state_is_confirmed_clean "$task_id" "$stored_invocation_token"; then
 		die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the full process tree stopped for task $task_id; stop and verify it before retirement."
 	fi
 	local timestamp

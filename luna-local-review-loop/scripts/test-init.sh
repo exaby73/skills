@@ -217,7 +217,12 @@ rg -F 'legacy project registry contains 1 live worker' "$TEST_ROOT/legacy-live.o
 rm -rf "$REPO_ROOT/.agents/agent-registry"
 registry_path="$($INIT_SCRIPT --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --print-path)"
 state_root_real="$(cd "$STATE_ROOT" && pwd -P)"
+repo_real="$(cd -P "$REPO_ROOT" && pwd -P)"
 [[ "$registry_path" == "$state_root_real/"*/registry.json ]] || fail "registry was not created below the external state root: $registry_path"
+alternate_state_root="$TEST_ROOT/alternate-state"
+alternate_registry="$($INIT_SCRIPT --existing-path --repo "$REPO_ROOT" --state-root "$alternate_state_root")"
+[[ "$alternate_registry" == "$registry_path" ]] || fail 'changed state root selected a duplicate registry for the same checkout'
+[[ ! -e "$alternate_state_root" ]] || fail 'authoritative registry lookup created the ignored alternate state root'
 [[ ! -e "$REPO_ROOT/.agents/agent-registry" ]] || fail 'init created project-local registry state'
 [[ ! -e "$REPO_ROOT/.gitignore" ]] || fail 'init modified repository ignore rules'
 [[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'init modified repository files'
@@ -426,6 +431,15 @@ for missing_dependency in sort head sed; do
 	fi
 	rg -F "missing runtime prerequisite(s): $missing_dependency" "$TEST_ROOT/missing-$missing_dependency.out" >/dev/null || fail "init did not report missing runner dependency: $missing_dependency"
 done
+for recovery_optional_dependency in sort head; do
+	rm -rf "$dependency_bin"
+	mkdir "$dependency_bin"
+	for dependency_command in "${dependency_commands[@]}"; do
+		[[ "$dependency_command" == "$recovery_optional_dependency" ]] && continue
+		ln -s "$(command -v "$dependency_command")" "$dependency_bin/$dependency_command"
+	done
+	PATH="$dependency_bin" CODEX_BIN=codex "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$alternate_state_root" >/dev/null || fail "recovery required launch-only dependency: $recovery_optional_dependency"
+done
 
 if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$REPO_ROOT/.runtime/luna" >"$TEST_ROOT/project-state.out" 2>&1; then
 	fail 'init accepted a state root inside the repository'
@@ -442,12 +456,17 @@ rm -f "$TEST_ROOT/state-link"
 rm -rf "$REPO_ROOT/.state-link-target"
 
 fingerprint_state="$TEST_ROOT/fingerprint-state"
-fingerprint_target="$REPO_ROOT/.fingerprint-target"
-repo_real="$(cd -P "$REPO_ROOT" && pwd -P)"
-repo_fingerprint="$(printf '%s' "$repo_real" | shasum -a 256 | awk '{print $1}')"
+fingerprint_repo="$TEST_ROOT/fingerprint-repo"
+fingerprint_target="$fingerprint_repo/.fingerprint-target"
+mkdir -p "$fingerprint_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$fingerprint_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$fingerprint_repo/.agents/skills/caveman"
+git -C "$fingerprint_repo" init -q
+fingerprint_repo_real="$(cd -P "$fingerprint_repo" && pwd -P)"
+repo_fingerprint="$(printf '%s' "$fingerprint_repo_real" | shasum -a 256 | awk '{print $1}')"
 mkdir -p "$fingerprint_state" "$fingerprint_target"
 ln -s "$fingerprint_target" "$fingerprint_state/$repo_fingerprint"
-if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$fingerprint_state" >"$TEST_ROOT/fingerprint-symlink.out" 2>&1; then
+if "$INIT_SCRIPT" --repo "$fingerprint_repo" --state-root "$fingerprint_state" >"$TEST_ROOT/fingerprint-symlink.out" 2>&1; then
 	fail 'init accepted a symlinked repository fingerprint directory'
 fi
 [[ ! -e "$fingerprint_target/registry.json" && ! -e "$fingerprint_target/.lock" ]] || fail 'init wrote registry state through a symlinked fingerprint directory'
@@ -751,6 +770,9 @@ jq --arg pgid "$$" '
 ' "$registry_path" >"$registry_path.tmp"
 mv "$registry_path.tmp" "$registry_path"
 stale_tracker="$registry_dir/artifacts/continued-worker/.descendants-stale-owner.json"
+if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token missing-tracker-reclaimer >"$TEST_ROOT/missing-stale-tracker.out" 2>&1; then
+	fail 'stale invocation reclaim accepted a recorded child after its tracker artifact disappeared'
+fi
 printf '%s\n' '{"status":"active","root_pid":99999999,"processes":[]}' >"$stale_tracker"
 if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token premature-reclaimer >"$TEST_ROOT/active-stale-tracker.out" 2>&1; then
 	fail 'stale invocation reclaim ignored an active tracker from the previous token'
@@ -900,6 +922,18 @@ done
 if process_group_has_live_non_zombie "$hard_killed_child_pgid" || process_is_live_non_zombie "$hard_killed_descendant_pid"; then
 	fail 'hard-kill recovery process group did not stop'
 fi
+hard_killed_tracker="$registry_dir/artifacts/hard-killed-worker/.descendants-$(jq -r '.workers[] | select(.task_id == "hard-killed-worker") | .invocation_token' "$registry_path").json"
+poll_attempt=0
+while [[ ! -f "$hard_killed_tracker" || "$(jq -r '.status // empty' "$hard_killed_tracker" 2>/dev/null)" != 'clean' ]] && [[ "$poll_attempt" -lt 100 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -f "$hard_killed_tracker" ]] || fail 'hard-kill recovery tracker did not publish cleanup evidence'
+mv "$hard_killed_tracker" "$hard_killed_tracker.saved"
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --status interrupted --evidence 'missing tracker must block retirement' >"$TEST_ROOT/missing-tracker-finish.out" 2>&1; then
+	fail 'recovery retired a recorded child after its tracker artifact disappeared'
+fi
+mv "$hard_killed_tracker.saved" "$hard_killed_tracker"
 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --status interrupted --evidence 'child stopped and identity verified' >"$TEST_ROOT/hard-kill-finish.out"
 jq -e 'any(.identity_ledger[]; .task_id == "hard-killed-worker" and .status == "retired" and .terminal_status == "interrupted") and all(.workers[]; .task_id != "hard-killed-worker")' "$registry_path" >/dev/null || fail 'hard-kill recovery did not retire after child exit'
 hard_killed_child_pgid=''

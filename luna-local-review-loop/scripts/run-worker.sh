@@ -212,6 +212,12 @@ monitor_descendant_tree() {
 	while true; do
 		ps -ax -o pid=,ppid=,stat= 2>/dev/null | awk 'NF >= 3 {print $1 "|" $2 "|" $3}' >"$snapshot" || exit 1
 		while true; do
+			: >"$additions"
+			while IFS='|' read -r pid instance; do
+				process_instance_matches "$pid" "$instance" && printf '%s|%s\n' "$pid" "$instance" >>"$additions"
+			done <"$known_file"
+			mv "$additions" "$known_file"
+			additions="$(mktemp "${state_path}.additions.XXXXXX")" || exit 1
 			awk -F '|' 'NR == FNR { known[$1] = 1; next } $3 !~ /^Z/ && known[$2] && !known[$1] { print $1 }' "$known_file" "$snapshot" >"$additions"
 			[[ -s "$additions" ]] || break
 			recorded_count=0

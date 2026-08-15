@@ -20,6 +20,8 @@ CODEX_BIN="${CODEX_BIN:-codex}"
 REPO_ROOT=''
 REPO_IDENTITY=''
 REPO_CHECKOUT_IDENTITY=''
+GIT_DIR_REAL=''
+REGISTRY_LOCATOR_PATH=''
 STATE_ROOT=''
 REGISTRY_DIR=''
 REGISTRY_PATH=''
@@ -27,6 +29,8 @@ LOCK_DIR=''
 LEGACY_REGISTRY_PATH=''
 LOCK_HELD=0
 ALLOW_INSTANCE_MARKER_CREATE=0
+LOCATOR_LOADED=0
+STALE_LOCATOR=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
@@ -169,9 +173,9 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sort head sed)
+	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
-		required_commands+=(od tr)
+		required_commands+=(od tr sort head)
 	fi
 
 	for command_name in "${required_commands[@]}"; do
@@ -189,13 +193,23 @@ require_commands() {
 
 resolve_paths() {
 	local candidate
-	local state_candidate
 
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_REPOSITORY" "repository path does not exist or is not a directory: $REPO_INPUT."
 	candidate="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot access repository path: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_REPOSITORY" "path is not inside a Git repository: $candidate."
 	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve repository root: $candidate."
 	LEGACY_REGISTRY_PATH="$REPO_ROOT/.agents/agent-registry/registry.json"
+}
+
+resolve_git_admin() {
+	local git_dir
+	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || die "$EXIT_REPOSITORY" "cannot locate the Git administration directory for $REPO_ROOT."
+	GIT_DIR_REAL="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve the Git administration directory for $REPO_ROOT."
+	REGISTRY_LOCATOR_PATH="$GIT_DIR_REAL/luna-local-review-loop.registry"
+}
+
+resolve_state_root() {
+	local state_candidate
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
 	case "$state_candidate/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $state_candidate." ;;
@@ -214,24 +228,101 @@ resolve_paths() {
 	esac
 }
 
+validate_state_root_candidate() {
+	local state_candidate
+	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
+	case "$state_candidate/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $state_candidate." ;;
+	esac
+}
+
+regular_file_link_count() {
+	local path="$1"
+	local count=''
+	if count="$(stat -f '%l' "$path" 2>/dev/null)"; then
+		:
+	elif count="$(stat -c '%h' "$path" 2>/dev/null)"; then
+		:
+	else
+		return 1
+	fi
+	[[ "$count" =~ ^[1-9][0-9]*$ ]] || return 1
+	printf '%s\n' "$count"
+}
+
+read_registry_locator() {
+	local located_path=''
+	local located_checkout_identity=''
+	local located_dir=''
+	local line_count=''
+	local link_count=''
+	[[ ! -L "$REGISTRY_LOCATOR_PATH" ]] || die "$EXIT_FILESYSTEM" "registry locator must not be a symlink: $REGISTRY_LOCATOR_PATH."
+	[[ -e "$REGISTRY_LOCATOR_PATH" ]] || return 1
+	[[ -f "$REGISTRY_LOCATOR_PATH" ]] || die "$EXIT_FILESYSTEM" "registry locator must be a regular file: $REGISTRY_LOCATOR_PATH."
+	link_count="$(regular_file_link_count "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot inspect registry locator link count: $REGISTRY_LOCATOR_PATH."
+	[[ "$link_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "registry locator must have exactly one hard link: $REGISTRY_LOCATOR_PATH."
+	line_count="$(awk 'END {print NR + 0}' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read registry locator: $REGISTRY_LOCATOR_PATH."
+	[[ "$line_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "registry locator must contain exactly one record: $REGISTRY_LOCATOR_PATH."
+	jq -e 'type == "object" and keys == ["registry_path", "repository_checkout_identity"] and (.registry_path | type == "string" and length > 0) and (.repository_checkout_identity | type == "string" and test("^[0-9]+:[0-9]+$"))' "$REGISTRY_LOCATOR_PATH" >/dev/null 2>&1 || die "$EXIT_FILESYSTEM" "registry locator record is invalid: $REGISTRY_LOCATOR_PATH."
+	located_path="$(jq -r '.registry_path' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read registry path from locator: $REGISTRY_LOCATOR_PATH."
+	located_checkout_identity="$(jq -r '.repository_checkout_identity' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read checkout identity from locator: $REGISTRY_LOCATOR_PATH."
+	if [[ "$located_checkout_identity" != "$REPO_CHECKOUT_IDENTITY" ]]; then
+		[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_REPOSITORY" "registry locator belongs to another physical Git checkout: $REGISTRY_LOCATOR_PATH. Normal initialization can replace a copied locator; recovery will not guess."
+		STALE_LOCATOR=1
+		return 1
+	fi
+	case "$located_path" in
+	/*/registry.json) ;;
+	*) die "$EXIT_FILESYSTEM" "registry locator contains an invalid path: $REGISTRY_LOCATOR_PATH." ;;
+	esac
+	located_dir="$(canonical_path_without_creation "${located_path%/*}")" || die "$EXIT_FILESYSTEM" "cannot resolve registry locator target: $located_path."
+	REGISTRY_DIR="$located_dir"
+	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
+	STATE_ROOT="${REGISTRY_DIR%/*}"
+	case "$REGISTRY_PATH/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "registry locator target must be outside the repository: $REGISTRY_PATH." ;;
+	esac
+	LOCK_DIR="$REGISTRY_DIR/.lock"
+	LOCATOR_LOADED=1
+	validate_registry_dir
+}
+
+publish_or_adopt_registry_locator() {
+	local temp_path
+	temp_path="$(mktemp "$GIT_DIR_REAL/.luna-registry-locator.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create temporary registry locator in $GIT_DIR_REAL."
+	jq -nc --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, repository_checkout_identity:$checkout_identity}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write temporary registry locator: $temp_path."
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict temporary registry locator: $temp_path."
+	if ln "$temp_path" "$REGISTRY_LOCATOR_PATH" 2>/dev/null; then
+		rm -f "$temp_path"
+		return 0
+	fi
+	rm -f "$temp_path"
+	read_registry_locator || die "$EXIT_FILESYSTEM" "cannot publish or read registry locator: $REGISTRY_LOCATOR_PATH."
+}
+
+replace_registry_locator() {
+	local temp_path
+	temp_path="$(mktemp "$GIT_DIR_REAL/.luna-registry-locator.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create replacement registry locator in $GIT_DIR_REAL."
+	jq -nc --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, repository_checkout_identity:$checkout_identity}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write replacement registry locator: $temp_path."
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict replacement registry locator: $temp_path."
+	mv "$temp_path" "$REGISTRY_LOCATOR_PATH" || die "$EXIT_FILESYSTEM" "cannot replace stale copied registry locator: $REGISTRY_LOCATOR_PATH."
+	LOCATOR_LOADED=1
+}
+
 repository_checkout_identity() {
-	local git_dir
-	local git_dir_real
 	local backlink=''
 	local backlink_parent=''
 	local backlink_name=''
 	local backlink_real=''
 	local expected_backlink=''
 	local checkout_identity=''
-	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
-	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
-	if [[ -e "$git_dir_real/gitdir" || -L "$git_dir_real/gitdir" ]]; then
-		[[ -f "$git_dir_real/gitdir" && ! -L "$git_dir_real/gitdir" ]] || return 1
-		IFS= read -r backlink <"$git_dir_real/gitdir" || return 1
+	if [[ -e "$GIT_DIR_REAL/gitdir" || -L "$GIT_DIR_REAL/gitdir" ]]; then
+		[[ -f "$GIT_DIR_REAL/gitdir" && ! -L "$GIT_DIR_REAL/gitdir" ]] || return 1
+		IFS= read -r backlink <"$GIT_DIR_REAL/gitdir" || return 1
 		[[ -n "$backlink" ]] || return 1
 		case "$backlink" in
 		/*) ;;
-		*) backlink="$git_dir_real/$backlink" ;;
+		*) backlink="$GIT_DIR_REAL/$backlink" ;;
 		esac
 		backlink_parent="${backlink%/*}"
 		backlink_name="${backlink##*/}"
@@ -241,9 +332,9 @@ repository_checkout_identity() {
 		expected_backlink="$REPO_ROOT/.git"
 		[[ -f "$expected_backlink" && ! -L "$expected_backlink" && "$backlink_real" == "$expected_backlink" ]] || return 1
 	fi
-	if checkout_identity="$(stat -f '%d:%i' "$git_dir_real" 2>/dev/null)"; then
+	if checkout_identity="$(stat -f '%d:%i' "$GIT_DIR_REAL" 2>/dev/null)"; then
 		:
-	elif checkout_identity="$(stat -c '%d:%i' "$git_dir_real" 2>/dev/null)"; then
+	elif checkout_identity="$(stat -c '%d:%i' "$GIT_DIR_REAL" 2>/dev/null)"; then
 		:
 	else
 		return 1
@@ -254,13 +345,9 @@ repository_checkout_identity() {
 
 repository_instance_identity() {
 	local allow_create="$1"
-	local git_dir
-	local git_dir_real
 	local marker_path
 	local nonce=''
-	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
-	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
-	marker_path="$git_dir_real/luna-local-review-loop.instance"
+	marker_path="$GIT_DIR_REAL/luna-local-review-loop.instance"
 	[[ ! -L "$marker_path" ]] || return 1
 	if [[ ! -e "$marker_path" ]]; then
 		[[ "$allow_create" -eq 1 ]] || return 1
@@ -537,13 +624,25 @@ done
 
 require_commands
 resolve_paths
+resolve_git_admin
+validate_state_root_candidate
+REPO_CHECKOUT_IDENTITY="$(repository_checkout_identity)" || die "$EXIT_REPOSITORY" "cannot identify the physical Git checkout for $REPO_ROOT. Preserve external state and inspect the repository before retrying."
+if ! read_registry_locator; then
+	resolve_state_root
+fi
 if [[ "$EXISTING_ONLY" -eq 0 ]]; then
 	ALLOW_INSTANCE_MARKER_CREATE=1
 	require_project_skills
 fi
-REPO_CHECKOUT_IDENTITY="$(repository_checkout_identity)" || die "$EXIT_REPOSITORY" "cannot identify the physical Git checkout for $REPO_ROOT. Preserve external state and inspect the repository before retrying."
 REPO_IDENTITY="$(repository_instance_identity "$ALLOW_INSTANCE_MARKER_CREATE")" || die "$EXIT_REPOSITORY" "cannot read or safely create the Git-directory instance marker for $REPO_ROOT. This may be a different Git repository instance at the same path; preserve external state and inspect the repository before retrying."
-resolve_registry_location
+if [[ -z "$REGISTRY_PATH" ]]; then
+	resolve_registry_location
+	if [[ "$STALE_LOCATOR" -eq 1 ]]; then
+		replace_registry_locator
+	else
+		publish_or_adopt_registry_locator
+	fi
+fi
 if [[ "$EXISTING_ONLY" -eq 0 && ! -e "$REGISTRY_PATH" ]]; then
 	refuse_live_legacy_registry
 fi
