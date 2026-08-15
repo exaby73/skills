@@ -837,6 +837,11 @@ if ! read_registry_locator; then
 		die "$EXIT_FILESYSTEM" "the Git-directory instance marker exists but its authoritative registry locator is missing: $REGISTRY_LOCATOR_PATH. Restore the locator from recovery evidence; do not initialize another state root for this checkout."
 	fi
 	resolve_state_root
+else
+	STATE_ROOT_INPUT="$STATE_ROOT"
+	validate_state_root_candidate
+	resolve_state_root
+	resolve_authority_root
 fi
 if [[ "$EXISTING_ONLY" -eq 0 ]]; then
 	ALLOW_INSTANCE_MARKER_CREATE=1
