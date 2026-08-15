@@ -301,6 +301,26 @@ if "$INIT_SCRIPT" --existing-path --repo "$duplicate_scope_repo" --state-root "$
 	fail 'schema accepted duplicate live worker scopes'
 fi
 
+history_scope_repo="$TEST_ROOT/history-scope-repo"
+history_scope_state="$TEST_ROOT/history-scope-state"
+mkdir -p "$history_scope_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$history_scope_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$history_scope_repo/.agents/skills/caveman"
+git -C "$history_scope_repo" init -q
+history_scope_registry="$($INIT_SCRIPT --repo "$history_scope_repo" --state-root "$history_scope_state" --print-path)"
+"$REGISTRY_SCRIPT" reserve --repo "$history_scope_repo" --state-root "$history_scope_state" --task-id scope-history-a --scope 'unique root scope history' >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$history_scope_repo" --state-root "$history_scope_state" --task-id scope-history-a --status failed --evidence 'prepare persisted scope validation' >/dev/null
+cp "$history_scope_registry" "$history_scope_registry.clean"
+jq '.identity_ledger += [(.identity_ledger[0] | .task_id = "scope-history-b")]' "$history_scope_registry.clean" >"$history_scope_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$history_scope_repo" --state-root "$history_scope_state" >"$TEST_ROOT/duplicate-root-scope.out" 2>&1; then
+	fail 'schema accepted duplicate independent root scope histories'
+fi
+cp "$history_scope_registry.clean" "$history_scope_registry"
+jq '.identity_ledger[0].scope = "persisted\nmultiline scope"' "$history_scope_registry.clean" >"$history_scope_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$history_scope_repo" --state-root "$history_scope_state" >"$TEST_ROOT/multiline-scope.out" 2>&1; then
+	fail 'schema accepted a persisted scope rejected by registry commands'
+fi
+
 pid_schema_repo="$TEST_ROOT/pid-schema-repo"
 pid_schema_state="$TEST_ROOT/pid-schema-state"
 mkdir -p "$pid_schema_repo/.agents/skills"
@@ -782,6 +802,10 @@ if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_
 	fail 'stale invocation reclaim accepted a clean tracker that retained process identities'
 fi
 printf '%s\n' '{"status":"clean","root_pid":99999999,"processes":[]}' >"$stale_tracker"
+if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token mismatched-root-reclaimer >"$TEST_ROOT/mismatched-root-tracker.out" 2>&1; then
+	fail 'stale invocation reclaim accepted cleanup evidence for a different process-tree root'
+fi
+printf '%s\n' "{\"status\":\"clean\",\"root_pid\":$$,\"processes\":[]}" >"$stale_tracker"
 sleep 30 &
 claim_owner_a=$!
 sleep 30 &

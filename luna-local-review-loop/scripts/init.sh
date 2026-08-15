@@ -34,6 +34,7 @@ STALE_LOCATOR=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
+  def safe_scope: type == "string" and length > 0 and (test("[\\r\\n]") | not);
   def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
@@ -70,7 +71,7 @@ readonly SCHEMA_FILTER='
       and (.workers | type == "array")
       and all($root.identity_ledger[];
         (.task_id | safe_identity)
-        and (.scope | nonempty_string)
+        and (.scope | safe_scope)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
         and (.retry_of | nullable_identity)
         and (.session_id | nullable_session)
@@ -90,7 +91,7 @@ readonly SCHEMA_FILTER='
       )
       and all($root.workers[];
         (.task_id | safe_identity)
-        and (.scope | nonempty_string)
+        and (.scope | safe_scope)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
         and (.retry_of | nullable_identity)
         and (.session_id | nullable_session)
@@ -109,6 +110,7 @@ readonly SCHEMA_FILTER='
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
       and (([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | length) == ([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | unique | length))
+      and (([$root.identity_ledger[] | select(.retry_of == null) | .scope] | length) == ([$root.identity_ledger[] | select(.retry_of == null) | .scope] | unique | length))
       and (([$root.workers[].task_id] | length) == ([$root.workers[].task_id] | unique | length))
       and (([$root.workers[].scope] | length) == ([$root.workers[].scope] | unique | length))
       and (([$root.workers[] | select(.session_id != null) | .session_id] | length) == ([$root.workers[] | select(.session_id != null) | .session_id] | unique | length))

@@ -24,6 +24,7 @@ PARSE_SHIFT=0
 
 readonly TRANSITION_SCHEMA_FILTER='
   def nonempty: type == "string" and length > 0;
+  def safe_scope: type == "string" and length > 0 and (test("[\\r\\n]") | not);
   def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
@@ -49,7 +50,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   and (.workers | type == "array")
   and all($root.identity_ledger[];
     . as $row
-    | (.task_id | safe_identity) and (.scope | nonempty)
+    | (.task_id | safe_identity) and (.scope | safe_scope)
     and (($row.retry_of == null) or ($row.retry_of | safe_identity))
     and ($row.sandbox == "read-only" or $row.sandbox == "workspace-write")
     and (["reserved", "bound", "active", "retired"] | index($row.status) != null)
@@ -61,7 +62,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   )
   and all($root.workers[];
     . as $worker
-    | (.task_id | safe_identity) and (.scope | nonempty)
+    | (.task_id | safe_identity) and (.scope | safe_scope)
       and ($worker.sandbox == "read-only" or $worker.sandbox == "workspace-write")
       and (($worker.retry_of == null) or ($worker.retry_of | safe_identity))
       and (.status == "reserved" or .status == "bound" or .status == "active")
@@ -93,6 +94,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   and (([$root.workers[].scope] | length) == ([$root.workers[].scope] | unique | length))
   and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
   and (([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | length) == ([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | unique | length))
+  and (([$root.identity_ledger[] | select(.retry_of == null) | .scope] | length) == ([$root.identity_ledger[] | select(.retry_of == null) | .scope] | unique | length))
   and valid_retry_chain($root.identity_ledger)
 '
 
@@ -241,9 +243,19 @@ descendant_state_path() {
 descendant_state_is_confirmed_clean() {
 	local task_id="$1"
 	local token="$2"
+	local expected_root_pid="${3:-}"
 	local state_path
 	state_path="$(descendant_state_path "$task_id" "$token")"
 	[[ -f "$state_path" && ! -L "$state_path" ]] || return 1
+	if [[ -n "$expected_root_pid" ]]; then
+		case "$expected_root_pid" in '' | 0 | *[!0-9]*) return 1 ;; esac
+		jq -e --argjson expected_root_pid "$expected_root_pid" '
+		    .status == "clean"
+		    and .root_pid == $expected_root_pid
+		    and .processes == []
+		  ' "$state_path" >/dev/null 2>&1
+		return
+	fi
 	jq -e '
 	    .status == "clean"
 	    and (.root_pid | type == "number" and . > 0 and floor == .)
@@ -589,7 +601,7 @@ command_claim_invocation() {
 		if [[ -n "$current_child_pid" ]] && recorded_process_group_blocks_recovery "$current_child_pid" "$current_child_instance"; then
 			die "$EXIT_CONFLICT" "Codex process group $current_child_pid remains live for task $task_id; stop and verify that group before reclaiming the invocation."
 		fi
-		if [[ -n "$current_child_pid" ]] && { [[ -z "$current_token" ]] || ! descendant_state_is_confirmed_clean "$task_id" "$current_token"; }; then
+		if [[ -n "$current_child_pid" ]] && { [[ -z "$current_token" ]] || ! descendant_state_is_confirmed_clean "$task_id" "$current_token" "$current_child_pid"; }; then
 			die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the recorded child process tree stopped for task $task_id; restore or verify its cleanup evidence before reclaiming."
 		fi
 		if [[ -z "$current_child_pid" && -n "$current_token" && (-e "$(descendant_state_path "$task_id" "$current_token")" || -L "$(descendant_state_path "$task_id" "$current_token")") ]] && ! descendant_state_is_confirmed_clean "$task_id" "$current_token"; then
@@ -651,7 +663,7 @@ command_child_registration() {
 		child_instance="$(jq -r --arg task_id "$task_id" --arg token "$token" --arg child_pgid "$child_pgid" '.workers[] | select(.task_id == $task_id and .invocation_token == $token and .active_child_pgid == $child_pgid) | .active_child_instance // empty' "$REGISTRY_PATH")"
 		[[ -n "$child_instance" ]] || die "$EXIT_CONFLICT" "invocation token does not own child process group $child_pgid for task $task_id."
 		recorded_process_group_blocks_recovery "$child_pgid" "$child_instance" && die "$EXIT_CONFLICT" "Codex process group $child_pgid is not confirmed stopped for task $task_id."
-		descendant_state_is_confirmed_clean "$task_id" "$token" || die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the full process tree stopped for task $task_id."
+		descendant_state_is_confirmed_clean "$task_id" "$token" "$child_pgid" || die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the full process tree stopped for task $task_id."
 		atomic_write '.workers |= map(if .task_id == $task_id then .active_child_pgid = null | .active_child_instance = null else . end)' --arg task_id "$task_id"
 		;;
 	esac
@@ -754,7 +766,7 @@ command_complete_and_retire() {
 		die "$EXIT_CONFLICT" "Codex process group $active_child_pgid remains live for task $task_id; stop and verify that group before retirement."
 	fi
 	stored_invocation_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
-	if [[ -n "$active_child_pgid" ]] && { [[ -z "$stored_invocation_token" ]] || ! descendant_state_is_confirmed_clean "$task_id" "$stored_invocation_token"; }; then
+	if [[ -n "$active_child_pgid" ]] && { [[ -z "$stored_invocation_token" ]] || ! descendant_state_is_confirmed_clean "$task_id" "$stored_invocation_token" "$active_child_pgid"; }; then
 		die "$EXIT_CONFLICT" "Codex descendant tracker has not proved the recorded child process tree stopped for task $task_id; restore or verify its cleanup evidence before retirement."
 	fi
 	if [[ -z "$active_child_pgid" && -n "$stored_invocation_token" && (-e "$(descendant_state_path "$task_id" "$stored_invocation_token")" || -L "$(descendant_state_path "$task_id" "$stored_invocation_token")") ]] && ! descendant_state_is_confirmed_clean "$task_id" "$stored_invocation_token"; then
