@@ -18,7 +18,7 @@ readonly SCRIPT_DIR
 readonly INIT_SCRIPT="$SCRIPT_DIR/init.sh"
 
 REPO_INPUT='.'
-STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
+STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/luna-local-review-loop-${UID}}"
 REGISTRY_PATH=''
 REGISTRY_DIR=''
 LOCK_DIR=''

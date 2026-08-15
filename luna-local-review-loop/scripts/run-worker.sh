@@ -19,7 +19,7 @@ readonly RESULT_SCHEMA="$SCRIPT_DIR/../references/worker-result.schema.json"
 MODE='launch'
 REPO_INPUT='.'
 REPO_ROOT=''
-STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
+STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/luna-local-review-loop-${UID}}"
 TASK_ID=''
 SCOPE=''
 RETRY_OF=''
@@ -38,6 +38,8 @@ ACTIVE_CODEX_INSTANCE=''
 ACTIVE_HELPER_PID=''
 ACTIVE_TRACKER_PID=''
 ACTIVE_TRACKER_STATE=''
+ACTIVE_LEASE_PID=''
+ACTIVE_LEASE_INSTANCE=''
 
 usage() {
 	local exit_code="${1:-0}"
@@ -74,8 +76,17 @@ validate_common() {
 	local codex_discovered=''
 	local codex_parent=''
 	local codex_name=''
+	local command_name=''
+	local missing=''
 	local prompt_parent=''
 	local prompt_name=''
+	local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed od tr sort head mkfifo)
+	for command_name in "${required_commands[@]}"; do
+		if ! command -v "$command_name" >/dev/null 2>&1; then
+			missing="${missing}${missing:+, }${command_name}"
+		fi
+	done
+	[[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing runtime prerequisite(s): $missing. Install them through the approved host mechanism, then retry."
 	codex_discovered="$(command -v "$CODEX_BIN" 2>/dev/null)" || die "$EXIT_PREREQUISITE" "Codex CLI not found: $CODEX_BIN."
 	case "$codex_discovered" in /*) ;; *) codex_discovered="$PWD/$codex_discovered" ;; esac
 	codex_parent="${codex_discovered%/*}"
@@ -126,6 +137,15 @@ release_invocation() {
 	fi
 }
 
+stop_active_lease() {
+	if [[ -n "$ACTIVE_LEASE_PID" ]]; then
+		process_instance_matches "$ACTIVE_LEASE_PID" "$ACTIVE_LEASE_INSTANCE" && kill -TERM "$ACTIVE_LEASE_PID" 2>/dev/null || true
+		wait "$ACTIVE_LEASE_PID" 2>/dev/null || true
+	fi
+	ACTIVE_LEASE_PID=''
+	ACTIVE_LEASE_INSTANCE=''
+}
+
 stop_active_child_and_exit() {
 	local signal_name="$1"
 	local exit_code="$2"
@@ -135,6 +155,7 @@ stop_active_child_and_exit() {
 	fi
 	stop_codex_process_group "$signal_name" || true
 	stop_tracked_worker_processes "$signal_name" || true
+	stop_active_lease
 	ACTIVE_HELPER_PID=''
 	ACTIVE_CODEX_PID=''
 	ACTIVE_CODEX_PGID=''
@@ -215,14 +236,36 @@ record_process_instance() {
 	printf '%s|%s\n' "$pid" "$instance" >>"$destination"
 }
 
+record_token_bearing_processes() {
+	local destination="$1"
+	local expected="LUNA_WORKER_PROCESS_TOKEN=$INVOCATION_TOKEN"
+	local snapshot
+	local pid
+	[[ -n "$INVOCATION_TOKEN" ]] || return 1
+	snapshot="$(mktemp "${destination}.tokens.XXXXXX")" || return 1
+	if ! LC_ALL=C ps axeww -o pid=,stat=,command= 2>/dev/null \
+		| awk -v expected="$expected" 'NF >= 3 && $2 !~ /^Z/ { for (field = 3; field <= NF; field++) if ($field == expected) { print $1; next } }' >"$snapshot"; then
+		rm -f "$snapshot"
+		return 1
+	fi
+	while IFS= read -r pid; do
+		record_process_instance "$pid" "$destination" || true
+	done <"$snapshot"
+	rm -f "$snapshot"
+	sort -t '|' -k1,1n -u -o "$destination" "$destination"
+}
+
 monitor_descendant_tree() {
 	local root_pid="$1"
 	local state_path="$2"
+	local lease_pid="$3"
+	local lease_instance="$4"
 	local known_file
 	local snapshot
 	local additions
 	local live_count
 	local root_live
+	local lease_live
 	local root_instance
 	local pid
 	local instance
@@ -262,7 +305,16 @@ monitor_descendant_tree() {
 		live_count="$(awk 'END { print NR + 0 }' "$known_file")"
 		root_live=0
 		process_instance_matches "$root_pid" "$root_instance" && root_live=1
-		if [[ "$root_live" -eq 0 && "$live_count" -eq 0 ]]; then
+		lease_live=0
+		process_instance_matches "$lease_pid" "$lease_instance" && lease_live=1
+		if [[ "$root_live" -eq 0 && "$live_count" -eq 0 && "$lease_live" -eq 0 ]]; then
+			record_token_bearing_processes "$known_file" || exit 1
+			live_count="$(awk 'END { print NR + 0 }' "$known_file")"
+			if [[ "$live_count" -gt 0 ]]; then
+				write_descendant_state active "$root_pid" "$known_file" "$state_path" || exit 1
+				sleep 0.01
+				continue
+			fi
 			write_descendant_state clean "$root_pid" "$known_file" "$state_path" || exit 1
 			exit 0
 		fi
@@ -336,9 +388,15 @@ stop_tracked_worker_processes() {
 		tracker_process_is_live "$ACTIVE_TRACKER_PID" && return 1
 		wait "$ACTIVE_TRACKER_PID" 2>/dev/null || return 1
 	fi
+	if [[ -n "$ACTIVE_LEASE_PID" ]]; then
+		process_instance_matches "$ACTIVE_LEASE_PID" "$ACTIVE_LEASE_INSTANCE" && return 1
+		wait "$ACTIVE_LEASE_PID" 2>/dev/null || return 1
+	fi
 	tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE" || return 1
 	jq -e '.status == "clean"' "$ACTIVE_TRACKER_STATE" >/dev/null 2>&1 || return 1
 	ACTIVE_TRACKER_PID=''
+	ACTIVE_LEASE_PID=''
+	ACTIVE_LEASE_INSTANCE=''
 }
 
 process_group_is_empty() {
@@ -472,15 +530,29 @@ run_gated_codex() {
 	local codex_cwd="$5"
 	shift 5
 	local gate_path="$artifact_dir/.start-$INVOCATION_TOKEN"
+	local lease_path="$artifact_dir/.lease-$INVOCATION_TOKEN"
+	local lease_ready_path="$artifact_dir/.lease-ready-$INVOCATION_TOKEN"
 	local parent_pid="$$"
 	local child_status=0
 	local child_pid
 	local child_pgid
 	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
 	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
-	rm -f "$gate_path"
+	rm -f "$gate_path" "$lease_path" "$lease_ready_path"
+	mkfifo "$lease_path" || return 1
+	cat "$lease_path" >/dev/null &
+	ACTIVE_LEASE_PID=$!
+	ACTIVE_LEASE_INSTANCE="$(process_instance_identity "$ACTIVE_LEASE_PID")" || {
+		kill -TERM "$ACTIVE_LEASE_PID" 2>/dev/null || true
+		wait "$ACTIVE_LEASE_PID" 2>/dev/null || true
+		ACTIVE_LEASE_PID=''
+		rm -f "$lease_path"
+		return 1
+	}
 	set -m
 	(
+		exec 9>"$lease_path"
+		: >"$lease_ready_path"
 		export LUNA_WORKER_PROCESS_TOKEN="$INVOCATION_TOKEN"
 		cd "$codex_cwd" || exit 126
 		while [[ ! -f "$gate_path" ]]; do
@@ -496,9 +568,27 @@ run_gated_codex() {
 	set +m
 	ACTIVE_CODEX_PID=$!
 	child_pid="$ACTIVE_CODEX_PID"
+	while [[ ! -f "$lease_ready_path" ]]; do
+		kill -0 "$child_pid" 2>/dev/null || break
+		process_instance_matches "$ACTIVE_LEASE_PID" "$ACTIVE_LEASE_INSTANCE" || break
+		sleep 0.01
+	done
+	if [[ ! -f "$lease_ready_path" ]]; then
+		kill -TERM "$child_pid" 2>/dev/null || true
+		wait "$child_pid" 2>/dev/null || true
+		kill -TERM "$ACTIVE_LEASE_PID" 2>/dev/null || true
+		wait "$ACTIVE_LEASE_PID" 2>/dev/null || true
+		ACTIVE_CODEX_PID=''
+		ACTIVE_LEASE_PID=''
+		ACTIVE_LEASE_INSTANCE=''
+		rm -f "$lease_path" "$lease_ready_path"
+		return 1
+	fi
+	rm -f "$lease_path" "$lease_ready_path"
 	ACTIVE_CODEX_INSTANCE="$(process_instance_identity "$child_pid")" || {
 		kill -TERM "$child_pid" 2>/dev/null || true
 		wait "$child_pid" 2>/dev/null || true
+		stop_active_lease
 		ACTIVE_CODEX_PID=''
 		ACTIVE_CODEX_INSTANCE=''
 		return 1
@@ -508,6 +598,7 @@ run_gated_codex() {
 	if [[ "$child_pgid" != "$child_pid" ]]; then
 		kill -TERM "$child_pid" 2>/dev/null || true
 		wait "$child_pid" 2>/dev/null || true
+		stop_active_lease
 		ACTIVE_CODEX_PID=''
 		ACTIVE_CODEX_PGID=''
 		ACTIVE_CODEX_INSTANCE=''
@@ -517,7 +608,7 @@ run_gated_codex() {
 	[[ ! -L "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must not be a symlink: $ACTIVE_TRACKER_STATE."
 	[[ ! -e "$ACTIVE_TRACKER_STATE" || -f "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must be a regular file target: $ACTIVE_TRACKER_STATE."
 	rm -f "$ACTIVE_TRACKER_STATE"
-	monitor_descendant_tree "$child_pid" "$ACTIVE_TRACKER_STATE" >/dev/null 2>&1 &
+	monitor_descendant_tree "$child_pid" "$ACTIVE_TRACKER_STATE" "$ACTIVE_LEASE_PID" "$ACTIVE_LEASE_INSTANCE" >/dev/null 2>&1 &
 	ACTIVE_TRACKER_PID=$!
 	while [[ ! -s "$ACTIVE_TRACKER_STATE" ]]; do
 		kill -0 "$ACTIVE_TRACKER_PID" 2>/dev/null || break
@@ -525,14 +616,20 @@ run_gated_codex() {
 	done
 	jq -e '.status == "active"' "$ACTIVE_TRACKER_STATE" >/dev/null 2>&1 || {
 		stop_codex_process_group TERM || true
+		stop_tracked_worker_processes TERM || true
+		stop_active_lease
 		return 1
 	}
 	if ! run_registry_quiet record-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
 		stop_codex_process_group TERM || true
+		stop_tracked_worker_processes TERM || true
+		stop_active_lease
 		return 1
 	fi
 	if ! : >"$gate_path"; then
 		stop_codex_process_group TERM || true
+		stop_tracked_worker_processes TERM || true
+		stop_active_lease
 		return 1
 	fi
 	wait "$child_pid" || child_status=$?

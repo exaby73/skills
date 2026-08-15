@@ -18,7 +18,7 @@ readonly EXIT_LOCK=9
 readonly EXIT_FILESYSTEM=10
 
 REPO_INPUT='.'
-STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
+STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/luna-local-review-loop-${UID}}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 REPO_ROOT=''
 REPO_IDENTITY=''
@@ -181,7 +181,7 @@ require_commands() {
 	local command_name
 	local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
-		required_commands+=(od tr sort head)
+		required_commands+=(od tr sort head mkfifo)
 	fi
 
 	for command_name in "${required_commands[@]}"; do
@@ -217,6 +217,9 @@ resolve_git_admin() {
 
 resolve_state_root() {
 	local state_candidate
+	local state_metadata=''
+	local state_owner=''
+	local state_mode=''
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
 	case "$state_candidate/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $state_candidate." ;;
@@ -230,6 +233,16 @@ resolve_state_root() {
 		mkdir -p "$STATE_ROOT_INPUT" || die "$EXIT_FILESYSTEM" "cannot create state root: $STATE_ROOT_INPUT."
 	fi
 	STATE_ROOT="$(cd -P "$STATE_ROOT_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot access state root: $STATE_ROOT_INPUT."
+	if state_metadata="$(stat -f '%u %Lp' "$STATE_ROOT" 2>/dev/null)" && [[ "$state_metadata" =~ ^[0-9]+[[:space:]][0-7]+$ ]]; then
+		read -r state_owner state_mode <<<"$state_metadata"
+	elif state_metadata="$(stat -c '%u %a' "$STATE_ROOT" 2>/dev/null)" && [[ "$state_metadata" =~ ^[0-9]+[[:space:]][0-7]+$ ]]; then
+		read -r state_owner state_mode <<<"$state_metadata"
+	else
+		die "$EXIT_FILESYSTEM" "cannot inspect state root ownership and permissions: $STATE_ROOT."
+	fi
+	[[ "$state_owner" == "$UID" ]] || die "$EXIT_FILESYSTEM" "state root must be owned by UID $UID: $STATE_ROOT is owned by UID $state_owner."
+	[[ "$state_mode" =~ ^[0-7]+$ ]] || die "$EXIT_FILESYSTEM" "state root returned an invalid permission mode: $STATE_ROOT ($state_mode)."
+	(( (8#$state_mode & 077) == 0 )) || die "$EXIT_FILESYSTEM" "state root must not grant group or other permissions: $STATE_ROOT has mode $state_mode."
 	case "$STATE_ROOT/" in
 	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "state root must be outside the repository: $STATE_ROOT." ;;
 	esac

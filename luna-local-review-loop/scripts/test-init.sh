@@ -80,6 +80,7 @@ readonly CODEX_CHILD_PID_FILE="$TEST_ROOT/codex-child.pid"
 readonly CODEX_DESCENDANT_PID_FILE="$TEST_ROOT/codex-descendant.pid"
 readonly CODEX_DETACHED_PID_FILE="$TEST_ROOT/codex-detached.pid"
 readonly CODEX_DETACHED_OBSERVED_FILE="$TEST_ROOT/codex-detached-observed"
+readonly CODEX_FAST_REPARENT_PID_FILE="$TEST_ROOT/codex-fast-reparent.pid"
 
 mkdir -p "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman" "$BIN_DIR" "$SLOW_BIN_DIR" "$CODEX_STATE"
 printf '%s\n' '# code reviewer' >"$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
@@ -104,6 +105,16 @@ if [[ " $* " == *' exec resume '* ]]; then
     previous="$argument"
   done
   prompt="$(cat)"
+  if [[ "${FAKE_FAST_REPARENT_RESUME:-0}" == '1' ]]; then
+    (
+      nohup sleep 300 >/dev/null 2>&1 &
+      fast_reparent_pid=$!
+      printf '%s\n' "$fast_reparent_pid" > "$CODEX_FAST_REPARENT_PID_FILE"
+      disown "$fast_reparent_pid"
+    ) &
+    fast_intermediate_pid=$!
+    wait "$fast_intermediate_pid"
+  fi
   if [[ "${FAKE_DETACH_RESUME:-0}" == '1' ]]; then
     set -m
     (
@@ -192,6 +203,13 @@ if [[ "${LUNA_TEST_SLOW_PS:-0}" == '1' && "$*" == '-ax -o pid=,ppid=,stat=' && !
 	: >"$SLOW_PS_MARKER"
 	sleep 2
 fi
+if [[ "${LUNA_TEST_DELAY_REPARENT_PS:-0}" == '1' && "$*" == '-ax -o pid=,ppid=,stat=' ]]; then
+	if [[ -e "$FAST_REPARENT_PS_MARKER" ]]; then
+		sleep 0.2
+	else
+		: >"$FAST_REPARENT_PS_MARKER"
+	fi
+fi
 exec "$(command -p -v ps)" "$@"
 EOF
 chmod +x "$SLOW_BIN_DIR/ps"
@@ -202,6 +220,7 @@ export CODEX_CHILD_PID_FILE
 export CODEX_DESCENDANT_PID_FILE
 export CODEX_DETACHED_PID_FILE
 export CODEX_DETACHED_OBSERVED_FILE
+export CODEX_FAST_REPARENT_PID_FILE
 export CODEX_HOME="$CODEX_STATE"
 
 before_status="$(git -C "$REPO_ROOT" status --short)"
@@ -215,6 +234,32 @@ fi
 rg -F 'legacy project registry contains 1 live worker' "$TEST_ROOT/legacy-live.out" >/dev/null || fail 'legacy registry refusal lacked recovery evidence'
 [[ ! -e "$STATE_ROOT" ]] || fail 'legacy registry refusal created external state'
 rm -rf "$REPO_ROOT/.agents/agent-registry"
+default_parent="$TEST_ROOT/default-runtime-parent"
+default_repo="$TEST_ROOT/default-repo"
+mkdir "$default_parent"
+chmod 1777 "$default_parent"
+mkdir -p "$default_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$default_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$default_repo/.agents/skills/caveman"
+git -C "$default_repo" init -q
+default_registry="$(env -u LUNA_REGISTRY_ROOT -u XDG_RUNTIME_DIR TMPDIR="$default_parent" "$INIT_SCRIPT" --repo "$default_repo" --print-path)"
+default_state_root="$default_parent/luna-local-review-loop-$UID"
+default_state_root="$(cd -P "$default_state_root" && pwd -P)"
+[[ "$default_registry" == "$default_state_root/"*/registry.json ]] || fail 'default registry root was not namespaced by user identity'
+default_state_mode="$(stat -f '%Lp' "$default_state_root" 2>/dev/null || true)"
+if [[ ! "$default_state_mode" =~ ^[0-7]+$ ]]; then
+	default_state_mode="$(stat -c '%a' "$default_state_root" 2>/dev/null)"
+fi
+[[ "$default_state_mode" == 700 ]] || fail "default registry root was not private: mode $default_state_mode"
+rm -rf "$default_state_root"
+insecure_state_root="$TEST_ROOT/insecure-state"
+mkdir "$insecure_state_root"
+chmod 0777 "$insecure_state_root"
+if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$insecure_state_root" >"$TEST_ROOT/insecure-state.out" 2>&1; then
+	fail 'init trusted a state root with group or other permissions'
+fi
+rg -F 'state root must not grant group or other permissions' "$TEST_ROOT/insecure-state.out" >/dev/null || fail 'insecure state-root refusal lacked permission evidence'
+rm -rf "$insecure_state_root"
 registry_path="$($INIT_SCRIPT --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --print-path)"
 state_root_real="$(cd "$STATE_ROOT" && pwd -P)"
 repo_real="$(cd -P "$REPO_ROOT" && pwd -P)"
@@ -495,7 +540,7 @@ rg -F 'Codex CLI not found' "$TEST_ROOT/missing-codex.out" >/dev/null || fail 'n
 CODEX_BIN="$TEST_ROOT/missing-codex" "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'recovery-only init unexpectedly required Codex'
 
 dependency_bin="$TEST_ROOT/dependency-bin"
-dependency_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sort head sed od tr codex)
+dependency_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sort head sed od tr mkfifo codex)
 for missing_dependency in sort head sed; do
 	rm -rf "$dependency_bin"
 	mkdir "$dependency_bin"
@@ -517,6 +562,21 @@ for recovery_optional_dependency in sort head; do
 	done
 	PATH="$dependency_bin" CODEX_BIN=codex "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$alternate_state_root" >/dev/null || fail "recovery required launch-only dependency: $recovery_optional_dependency"
 done
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-sort-continuation --scope 'validate continuation launch dependencies' >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-sort-continuation --session-id 01missing-sort >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-sort-continuation --session-id 01missing-sort >/dev/null
+rm -rf "$dependency_bin"
+mkdir "$dependency_bin"
+for dependency_command in "${dependency_commands[@]}"; do
+	[[ "$dependency_command" == sort ]] && continue
+	ln -s "$(command -v "$dependency_command")" "$dependency_bin/$dependency_command"
+done
+if PATH="$dependency_bin" CODEX_BIN=codex "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-sort-continuation --prompt-file "$CONTINUE_FILE" >"$TEST_ROOT/missing-sort-continuation.out" 2>&1; then
+	fail 'continuation started without the descendant monitor sort dependency'
+fi
+rg -F 'missing runtime prerequisite(s): sort' "$TEST_ROOT/missing-sort-continuation.out" >/dev/null || fail 'continuation dependency refusal did not identify sort'
+jq -e 'any(.workers[]; .task_id == "missing-sort-continuation" and .status == "active" and .invocation_pid == null)' "$registry_path" >/dev/null || fail 'missing continuation dependency claimed or retired the active task'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-sort-continuation --status interrupted --evidence 'missing dependency validation complete' >/dev/null
 rm -rf "$dependency_bin"
 mkdir "$dependency_bin"
 for dependency_command in "${dependency_commands[@]}"; do
@@ -977,6 +1037,39 @@ else
 	if process_is_live_non_zombie "$detached_pid"; then
 		fail 'detached worker descendant survived registry retirement'
 	fi
+fi
+
+printf '%s\n' 'drain fast-reparented descendant' >"$PROMPT_FILE"
+rm -f "$CODEX_FAST_REPARENT_PID_FILE"
+fast_reparent_ps_marker="$TEST_ROOT/fast-reparent-ps.ready"
+fast_reparent_status=0
+fast_reparent_output="$(PATH="$SLOW_BIN_DIR:$PATH" LUNA_TEST_DELAY_REPARENT_PS=1 FAST_REPARENT_PS_MARKER="$fast_reparent_ps_marker" FAKE_FAST_REPARENT_RESUME=1 CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-reparent-worker --scope 'drain a fast-reparented worker descendant' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/fast-reparent.err")" || fast_reparent_status=$?
+[[ -s "$CODEX_FAST_REPARENT_PID_FILE" ]] || fail 'fast-reparent fixture did not publish its descendant PID'
+fast_reparent_pid="$(cat "$CODEX_FAST_REPARENT_PID_FILE")"
+[[ -e "$fast_reparent_ps_marker" ]] || fail 'fast-reparent fixture did not delay the post-launch ancestry snapshot'
+if [[ "$fast_reparent_status" -eq 0 ]]; then
+	jq -e '.outcome == "completed"' <<<"$fast_reparent_output" >/dev/null || fail 'worker with a safely identifiable fast-reparented descendant returned an invalid result'
+	process_is_live_non_zombie "$fast_reparent_pid" && fail 'fast-reparented descendant escaped cleanup and registry retirement'
+else
+	process_is_live_non_zombie "$fast_reparent_pid" || fail 'safe cleanup refusal lost its live fast-reparent evidence'
+	jq -e 'any(.workers[]; .task_id == "fast-reparent-worker" and .status == "active")' "$registry_path" >/dev/null || fail 'safe cleanup refusal retired the worker while its fast-reparented descendant remained live'
+	kill -TERM "$fast_reparent_pid" 2>/dev/null || true
+	poll_attempt=0
+	while process_is_live_non_zombie "$fast_reparent_pid" && [[ "$poll_attempt" -lt 100 ]]; do
+		sleep 0.05
+		poll_attempt=$((poll_attempt + 1))
+	done
+	process_is_live_non_zombie "$fast_reparent_pid" && fail 'fast-reparented descendant did not stop after explicit cleanup'
+	fast_reparent_trackers=("$(dirname "$registry_path")/artifacts/fast-reparent-worker/".descendants-*.json)
+	[[ "${#fast_reparent_trackers[@]}" -eq 1 && -f "${fast_reparent_trackers[0]}" ]] || fail 'fast-reparent tracker was not unique'
+	fast_reparent_tracker="${fast_reparent_trackers[0]}"
+	poll_attempt=0
+	while [[ "$(jq -r '.status // empty' "$fast_reparent_tracker" 2>/dev/null)" != clean ]] && [[ "$poll_attempt" -lt 100 ]]; do
+		sleep 0.05
+		poll_attempt=$((poll_attempt + 1))
+	done
+	jq -e '.status == "clean" and (.processes | length) == 0' "$fast_reparent_tracker" >/dev/null || fail 'fast-reparent tracker did not publish clean evidence after explicit cleanup'
+	CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-reparent-worker --status interrupted --evidence 'non-procfs fast-reparented descendant required explicit cleanup' >"$TEST_ROOT/fast-reparent-finish.out"
 fi
 
 printf '%s\n' 'terminate child safely' >"$PROMPT_FILE"
