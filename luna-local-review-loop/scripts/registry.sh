@@ -44,7 +44,7 @@ readonly TRANSITION_SCHEMA_FILTER='
           and .value.scope == $row.scope
           and .value.sandbox == $row.sandbox
           and .value.status == "retired"
-          and (.value.terminal_status == "failed" or .value.terminal_status == "interrupted")
+          and (.value.terminal_status == "failed" or .value.terminal_status == "blocked" or .value.terminal_status == "interrupted")
         )
         end
     );
@@ -122,6 +122,8 @@ Usage:
 
 The durable identity is the Codex session ID. Process handles and outer tool-cell
 IDs are transient orchestration details and are never accepted by this registry.
+Exact-scope retries may name retired failed, blocked, or interrupted attempts;
+the retry inherits or matches the parent sandbox.
 EOF
 	exit "$exit_code"
 }
@@ -410,20 +412,20 @@ command_reserve() {
 		local retry_sandbox
 		retry_sandbox="$(jq -r --arg retry_of "$retry_of" --arg scope "$scope" '
       .identity_ledger[]
-      | select(.task_id == $retry_of and .scope == $scope and .status == "retired" and (.terminal_status == "failed" or .terminal_status == "interrupted"))
+      | select(.task_id == $retry_of and .scope == $scope and .status == "retired" and (.terminal_status == "failed" or .terminal_status == "blocked" or .terminal_status == "interrupted"))
       | .sandbox
     ' "$REGISTRY_PATH")"
-		[[ -n "$retry_sandbox" && "$retry_sandbox" != null ]] || die "$EXIT_CONFLICT" "retry-of must name a retired failed/interrupted task with the exact same scope: $retry_of."
+		[[ -n "$retry_sandbox" && "$retry_sandbox" != null ]] || die "$EXIT_CONFLICT" "retry-of must name a retired failed/blocked/interrupted task with the exact same scope: $retry_of."
 		if [[ -z "$sandbox" ]]; then
 			sandbox="$retry_sandbox"
 		else
 			[[ "$sandbox" == "$retry_sandbox" ]] || die "$EXIT_CONFLICT" "retry sandbox must match parent task $retry_of: expected $retry_sandbox, got $sandbox."
 		fi
 		jq -e --arg scope "$scope" 'all(.workers[]; .scope != $scope)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'another live task already owns this retry scope.'
-		jq -e --arg retry_of "$retry_of" 'all(.identity_ledger[]; .retry_of != $retry_of)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "retry attempt already has a child; retry the latest failed/interrupted child instead: $retry_of."
+		jq -e --arg retry_of "$retry_of" 'all(.identity_ledger[]; .retry_of != $retry_of)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "retry attempt already has a child; retry the latest failed/blocked/interrupted child instead: $retry_of."
 	else
 		sandbox="${sandbox:-workspace-write}"
-		jq -e --arg scope "$scope" 'all(.identity_ledger[]; .scope != $scope)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'scope is already reserved; use --retry-of with the failed/interrupted task ID to retry the exact scope.'
+		jq -e --arg scope "$scope" 'all(.identity_ledger[]; .scope != $scope)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'scope is already reserved; use --retry-of with the failed/blocked/interrupted task ID to retry the exact scope.'
 	fi
 	local timestamp
 	timestamp="$(now_utc)"
