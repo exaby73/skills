@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "summary", "changedFiles", "validators", "unresolved", "parentAction"],
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": ["completed", "blocked", "needs_parent_action"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "changedFiles": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "validators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "status", "evidence"],
+        "properties": {
+          "command": { "type": "string" },
+          "status": { "type": "string", "enum": ["passed", "failed", "not_run"] },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "parentAction": { "type": ["string", "null"] }
+  },
+  "anyOf": [
+    {
+      "properties": {
+        "outcome": { "const": "needs_parent_action" },
+        "parentAction": { "type": "string", "minLength": 1 }
+      }
+    },
+    {
+      "properties": {
+        "outcome": { "const": "completed" },
+        "validators": {
+          "items": {
+            "properties": {
+              "status": { "const": "passed" }
+            }
+          }
+        },
+        "unresolved": { "maxItems": 0 },
+        "parentAction": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "outcome": { "const": "blocked" },
+        "parentAction": { "type": "null" }
+      }
+    }
+  ]
+}
