@@ -29,6 +29,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   def nonempty: type == "string" and length > 0;
   def safe_scope: type == "string" and length > 0 and (test("[\\r\\n]") | not);
   def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
+  def safe_task_id: type == "string" and test("^[A-Za-z0-9._-]+$") and . != "." and . != "..";
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
   def process_instance: type == "string" and test("^(proc:[0-9]+|ps:[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4})$");
@@ -53,8 +54,8 @@ readonly TRANSITION_SCHEMA_FILTER='
   and (.workers | type == "array")
   and all($root.identity_ledger[];
     . as $row
-    | (.task_id | safe_identity) and (.scope | safe_scope)
-    and (($row.retry_of == null) or ($row.retry_of | safe_identity))
+    | (.task_id | safe_task_id) and (.scope | safe_scope)
+    and (($row.retry_of == null) or ($row.retry_of | safe_task_id))
     and ($row.sandbox == "read-only" or $row.sandbox == "workspace-write")
     and (["reserved", "bound", "active", "retired"] | index($row.status) != null)
     and (if $row.status == "reserved" then $row.session_id == null
@@ -65,9 +66,9 @@ readonly TRANSITION_SCHEMA_FILTER='
   )
   and all($root.workers[];
     . as $worker
-    | (.task_id | safe_identity) and (.scope | safe_scope)
+    | (.task_id | safe_task_id) and (.scope | safe_scope)
       and ($worker.sandbox == "read-only" or $worker.sandbox == "workspace-write")
-      and (($worker.retry_of == null) or ($worker.retry_of | safe_identity))
+      and (($worker.retry_of == null) or ($worker.retry_of | safe_task_id))
       and (.status == "reserved" or .status == "bound" or .status == "active")
       and (($worker.invocation_pid == null and $worker.invocation_token == null and $worker.invocation_instance == null)
            or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | safe_identity) and ($worker.invocation_instance | process_instance)))
@@ -321,6 +322,16 @@ validate_identity() {
 	esac
 }
 
+validate_task_id() {
+	local label="$1"
+	local value="$2"
+	[[ -n "$value" ]] || die "$EXIT_USAGE" "$label must not be empty."
+	case "$value" in
+	. | ..) die "$EXIT_USAGE" "$label must not be dot or dot-dot: $value." ;;
+	*[!A-Za-z0-9._-]*) die "$EXIT_USAGE" "$label contains unsupported artifact-name characters: $value." ;;
+	esac
+}
+
 validate_session_id() {
 	local value="$1"
 	validate_identity 'session-id' "$value"
@@ -382,9 +393,9 @@ command_reserve() {
 		esac
 	done
 	[[ -n "$task_id" && -n "$scope" ]] || die "$EXIT_USAGE" 'reserve requires non-empty --task-id and --scope.'
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	validate_scope "$scope"
-	[[ -z "$retry_of" ]] || validate_identity 'retry-of' "$retry_of"
+	[[ -z "$retry_of" ]] || validate_task_id 'retry-of' "$retry_of"
 	case "$sandbox" in '' | read-only | workspace-write) ;; *) die "$EXIT_USAGE" 'sandbox must be read-only or workspace-write.' ;; esac
 	if [[ -n "$owner_pid" || -n "$token" ]]; then
 		[[ -n "$owner_pid" && -n "$token" ]] || die "$EXIT_USAGE" 'reserve requires both --pid and --token when claiming the initial invocation.'
@@ -450,7 +461,7 @@ command_bind() {
 		esac
 	done
 	[[ -n "$task_id" && -n "$session_id" ]] || die "$EXIT_USAGE" 'bind requires --task-id and --session-id.'
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	validate_session_id "$session_id"
 	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
@@ -494,7 +505,7 @@ command_activate() {
 		esac
 	done
 	[[ -n "$task_id" && -n "$session_id" ]] || die "$EXIT_USAGE" 'activate requires --task-id and --session-id.'
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	validate_session_id "$session_id"
 	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
@@ -532,7 +543,7 @@ command_checkpoint() {
 		esac
 	done
 	[[ -n "$task_id" && -n "$evidence" ]] || die "$EXIT_USAGE" 'checkpoint requires --task-id and non-empty --evidence.'
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	resolve_registry
 	acquire_lock
 	jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id and .status == "active")' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "checkpoint requires an active task: $task_id."
@@ -579,7 +590,7 @@ command_claim_invocation() {
 		esac
 	done
 	[[ -n "$task_id" && -n "$owner_pid" && -n "$token" ]] || die "$EXIT_USAGE" 'claim-invocation requires --task-id, --pid, and --token.'
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	validate_identity 'invocation-token' "$token"
 	case "$required_status" in '' | active) ;; *) die "$EXIT_USAGE" 'require-status must be active when provided.' ;; esac
 	case "$owner_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "invocation PID must be a positive integer: $owner_pid." ;; esac
@@ -649,7 +660,7 @@ command_child_registration() {
 		esac
 	done
 	[[ -n "$task_id" && -n "$child_pgid" && -n "$token" ]] || die "$EXIT_USAGE" "$mode requires --task-id, --pgid, and --token."
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	validate_identity 'invocation-token' "$token"
 	case "$child_pgid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "child process-group ID must be a positive integer: $child_pgid." ;; esac
 	if [[ "$mode" == record-child ]]; then
@@ -694,7 +705,7 @@ command_release_invocation() {
 		esac
 	done
 	[[ -n "$task_id" && -n "$token" ]] || die "$EXIT_USAGE" 'release-invocation requires --task-id and --token.'
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	validate_identity 'invocation-token' "$token"
 	resolve_registry
 	acquire_lock
@@ -740,7 +751,7 @@ command_complete_and_retire() {
 	done
 	case "$status" in completed | failed | blocked | interrupted) ;; *) die "$EXIT_USAGE" 'terminal status must be completed, failed, blocked, or interrupted.' ;; esac
 	[[ -n "$task_id" && -n "$evidence" ]] || die "$EXIT_USAGE" 'complete-and-retire requires --task-id, --status, and non-empty --evidence.'
-	validate_identity 'task-id' "$task_id"
+	validate_task_id 'task-id' "$task_id"
 	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
 	acquire_lock
@@ -806,7 +817,7 @@ parse_read_args() {
 	case "$mode" in
 	query)
 		[[ -n "$task_id" ]] || die "$EXIT_USAGE" 'query requires --task-id.'
-		validate_identity 'task-id' "$task_id"
+		validate_task_id 'task-id' "$task_id"
 		jq -e --arg task_id "$task_id" '.identity_ledger[] | select(.task_id == $task_id)' "$REGISTRY_PATH" || die "$EXIT_NOT_FOUND" "task not found: $task_id."
 		;;
 	active) jq '.workers' "$REGISTRY_PATH" ;;

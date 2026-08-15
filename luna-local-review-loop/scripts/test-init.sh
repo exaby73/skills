@@ -69,6 +69,7 @@ wait_for_blocking_fixture() {
 }
 readonly REPO_ROOT="$TEST_ROOT/repo"
 readonly STATE_ROOT="$TEST_ROOT/state"
+readonly AUTHORITY_ROOT="$TEST_ROOT/authority"
 readonly BIN_DIR="$TEST_ROOT/bin"
 readonly SLOW_BIN_DIR="$TEST_ROOT/slow-bin"
 readonly CODEX_STATE="$TEST_ROOT/codex-home"
@@ -181,7 +182,15 @@ if [[ " $* " == *' exec resume '* ]]; then
     outcome='completed'
     parent_action='null'
   fi
-  printf '{"outcome":"%s","summary":"worker concise result","changedFiles":[],"validators":[],"unresolved":[],"parentAction":%s}\n' "$outcome" "$parent_action" > "$result_path"
+  validators='[]'
+  unresolved='[]'
+  if [[ "${FAKE_FAILED_COMPLETED:-0}" == '1' ]]; then
+    validators='[{"command":"validator","status":"failed","evidence":"failed evidence"}]'
+  fi
+  if [[ "${FAKE_UNRESOLVED_COMPLETED:-0}" == '1' ]]; then
+    unresolved='["remaining work"]'
+  fi
+  printf '{"outcome":"%s","summary":"worker concise result","changedFiles":[],"validators":%s,"unresolved":%s,"parentAction":%s}\n' "$outcome" "$validators" "$unresolved" "$parent_action" > "$result_path"
   printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"large stream stays in log"}}'
 else
 	printf '%s\n' 'irrelevant connector warning' >&2
@@ -222,6 +231,7 @@ export CODEX_DETACHED_PID_FILE
 export CODEX_DETACHED_OBSERVED_FILE
 export CODEX_FAST_REPARENT_PID_FILE
 export CODEX_HOME="$CODEX_STATE"
+export LUNA_AUTHORITY_ROOT="$AUTHORITY_ROOT"
 
 before_status="$(git -C "$REPO_ROOT" status --short)"
 mkdir -p "$REPO_ROOT/.agents/agent-registry"
@@ -260,6 +270,12 @@ if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$insecure_state_root" >"$TES
 fi
 rg -F 'state root must not grant group or other permissions' "$TEST_ROOT/insecure-state.out" >/dev/null || fail 'insecure state-root refusal lacked permission evidence'
 rm -rf "$insecure_state_root"
+overlap_root="$TEST_ROOT/overlapping-authority-state"
+if LUNA_AUTHORITY_ROOT="$overlap_root" "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$overlap_root" >"$TEST_ROOT/overlapping-authority-state.out" 2>&1; then
+	fail 'init accepted an authority root inside the selectable registry state root'
+fi
+rg -F 'checkout authority root must be outside the selectable registry state root' "$TEST_ROOT/overlapping-authority-state.out" >/dev/null || fail 'overlapping authority/state refusal lacked separation evidence'
+[[ ! -e "$overlap_root" ]] || fail 'overlapping authority/state refusal created unsafe shared state'
 registry_path="$($INIT_SCRIPT --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --print-path)"
 state_root_real="$(cd "$STATE_ROOT" && pwd -P)"
 repo_real="$(cd -P "$REPO_ROOT" && pwd -P)"
@@ -286,11 +302,48 @@ missing_locator_state="$TEST_ROOT/missing-locator-state"
 if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$missing_locator_state" >"$TEST_ROOT/missing-locator.out" 2>&1; then
 	fail 'init replaced a missing authoritative locator with a second registry'
 fi
-rg -F 'instance marker exists but its authoritative registry locator is missing' "$TEST_ROOT/missing-locator.out" >/dev/null || fail 'missing locator refusal lacked recovery evidence'
+rg -e 'instance marker exists but its authoritative registry locator is missing|durable checkout authority retains 1 live worker\(s\)' "$TEST_ROOT/missing-locator.out" >/dev/null || fail 'missing locator refusal lacked recovery evidence'
 [[ ! -e "$missing_locator_state" ]] || fail 'missing locator fallback created a second state root'
 mv "$TEST_ROOT/registry-locator.backup" "$registry_locator"
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-locator-worker --status interrupted --evidence 'missing locator test complete' >/dev/null
 [[ "$(cat "$instance_marker")" =~ ^[0-9a-f]{64}$ ]] || fail 'repository instance marker is malformed'
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-registry-worker --scope 'refuse missing authoritative registry recreation' >/dev/null
+cp "$registry_path" "$TEST_ROOT/registry-target.backup"
+rm "$registry_path"
+if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/missing-registry.out" 2>&1; then
+	fail 'init recreated a missing authoritative registry target'
+fi
+rg -e 'checkout authority registry target is missing|authoritative registry target is missing behind a ready locator' "$TEST_ROOT/missing-registry.out" >/dev/null || fail 'missing registry target refusal lacked recovery evidence'
+[[ ! -e "$registry_path" ]] || fail 'missing registry target refusal recreated empty state'
+mv "$TEST_ROOT/registry-target.backup" "$registry_path"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-registry-worker --status interrupted --evidence 'missing registry target test complete' >/dev/null
+
+pending_repo="$TEST_ROOT/pending-repo"
+pending_state="$TEST_ROOT/pending-state"
+mkdir -p "$pending_repo/.agents/skills" "$pending_state/pending-registry"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$pending_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$pending_repo/.agents/skills/caveman"
+git -C "$pending_repo" init -q
+git -C "$pending_repo" config user.email 'test@example.com'
+git -C "$pending_repo" config user.name 'Test User'
+touch "$pending_repo/.agents/skills/.keep"
+git -C "$pending_repo" add .
+git -C "$pending_repo" commit -qm init
+pending_git_dir="$(git -C "$pending_repo" rev-parse --absolute-git-dir)"
+if pending_checkout_identity="$(stat -f '%d:%i' "$pending_git_dir" 2>/dev/null)" && [[ "$pending_checkout_identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+	:
+elif pending_checkout_identity="$(stat -c '%d:%i' "$pending_git_dir" 2>/dev/null)" && [[ "$pending_checkout_identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+	:
+else
+	fail 'cannot derive pending-locator checkout identity'
+fi
+pending_registry="$(cd -P "$pending_state/pending-registry" && pwd -P)/registry.json"
+jq -nc --arg checkout_identity "$pending_checkout_identity" --arg registry_path "$pending_registry" '{registry_path:$registry_path, registry_state:"pending", repository_checkout_identity:$checkout_identity}' >"$pending_git_dir/luna-local-review-loop.registry"
+chmod 0600 "$pending_git_dir/luna-local-review-loop.registry"
+resolved_pending_registry="$($INIT_SCRIPT --repo "$pending_repo" --state-root "$pending_state" --print-path)"
+[[ "$resolved_pending_registry" == "$pending_registry" && -f "$pending_registry" ]] || fail 'pending locator did not recover its interrupted initial registry creation'
+jq -e '.registry_state == "ready"' "$pending_git_dir/luna-local-review-loop.registry" >/dev/null || fail 'recovered pending locator was not promoted to ready'
 
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy --scope 'recover external state after legacy registry reappears' >/dev/null
 registry_checkout_identity="$(jq -r '.repository_checkout_identity' "$registry_path")"
@@ -317,6 +370,18 @@ fi
 jq -e 'any(.workers[]; .task_id == "option-like-session" and .status == "reserved" and .session_id == null)' "$registry_path" >/dev/null || fail 'rejected option-like session ID mutated the reservation'
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id option-like-session --status interrupted --evidence 'option-like session test complete' >/dev/null
 
+for invalid_task_id in . ..; do
+	if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id "$invalid_task_id" --scope "reject artifact path component $invalid_task_id" >"$TEST_ROOT/invalid-task-component-registry.out" 2>&1; then
+		fail "registry accepted artifact-unsafe task ID $invalid_task_id"
+	fi
+	if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id "$invalid_task_id" --scope "reject runner artifact path component $invalid_task_id" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/invalid-task-component-runner.out" 2>&1; then
+		fail "runner accepted artifact-unsafe task ID $invalid_task_id"
+	fi
+done
+if jq -e 'any(.identity_ledger[]; .task_id == "." or .task_id == "..")' "$registry_path" >/dev/null; then
+	fail 'artifact-unsafe task ID consumed durable registry identity'
+fi
+
 schema_repo="$TEST_ROOT/schema-repo"
 schema_state="$TEST_ROOT/schema-state"
 mkdir -p "$schema_repo/.agents/skills"
@@ -327,7 +392,7 @@ schema_registry="$($INIT_SCRIPT --repo "$schema_repo" --state-root "$schema_stat
 schema_timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 "$REGISTRY_SCRIPT" reserve --repo "$schema_repo" --state-root "$schema_state" --task-id valid-task-id --scope 'reject unreachable persisted task identity' >/dev/null
 cp "$schema_registry" "$schema_registry.valid-task"
-jq '.identity_ledger[0].task_id = "invalid task" | .workers[0].task_id = "invalid task"' "$schema_registry.valid-task" >"$schema_registry"
+jq '.identity_ledger[0].task_id = "." | .workers[0].task_id = "."' "$schema_registry.valid-task" >"$schema_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$schema_repo" --state-root "$schema_state" >"$TEST_ROOT/invalid-task-id.out" 2>&1; then
 	fail 'schema accepted a persisted task ID rejected by registry commands'
 fi
@@ -515,6 +580,21 @@ mv "$metadata_repo/.git" "$metadata_repo/.git-replacement"
 mv "$metadata_repo/.git-original" "$metadata_repo/.git"
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$metadata_repo" --state-root "$metadata_state" --task-id metadata-live-worker --status interrupted --evidence 'Git metadata replacement test complete' >/dev/null
 
+"$REGISTRY_SCRIPT" reserve --repo "$metadata_repo" --state-root "$metadata_state" --task-id metadata-loss-worker --scope 'preserve live ownership when Git authority files disappear' >/dev/null
+mv "$metadata_repo/.git" "$metadata_repo/.git-owning"
+cp -R "$metadata_repo/.git-owning" "$metadata_repo/.git"
+rm "$metadata_repo/.git/luna-local-review-loop.instance" "$metadata_repo/.git/luna-local-review-loop.registry"
+metadata_loss_state="$TEST_ROOT/metadata-loss-alternate-state"
+if "$INIT_SCRIPT" --repo "$metadata_repo" --state-root "$metadata_loss_state" >"$TEST_ROOT/metadata-loss.out" 2>&1; then
+	fail 'init forked live ownership after replacement Git metadata dropped both authority files'
+fi
+rg -F 'durable checkout authority retains 1 live worker(s)' "$TEST_ROOT/metadata-loss.out" >/dev/null || fail 'metadata-loss refusal lacked durable external authority evidence'
+[[ ! -e "$metadata_loss_state" ]] || fail 'metadata-loss refusal created an alternate registry root'
+[[ ! -e "$metadata_repo/.git/luna-local-review-loop.instance" && ! -e "$metadata_repo/.git/luna-local-review-loop.registry" ]] || fail 'metadata-loss refusal created replacement Git authority files'
+mv "$metadata_repo/.git" "$metadata_repo/.git-without-authority"
+mv "$metadata_repo/.git-owning" "$metadata_repo/.git"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$metadata_repo" --state-root "$metadata_state" --task-id metadata-loss-worker --status interrupted --evidence 'Git authority loss test complete' >/dev/null
+
 identity_repo="$TEST_ROOT/identity-repo"
 identity_state="$TEST_ROOT/identity-state"
 mkdir -p "$identity_repo/.agents/skills"
@@ -531,7 +611,7 @@ git -C "$identity_repo" init -q
 if "$INIT_SCRIPT" --existing-path --repo "$identity_repo" --state-root "$identity_state" >"$TEST_ROOT/replaced-repository.out" 2>&1; then
 	fail 'init attached live state to a replacement repository at the same path'
 fi
-rg -e 'instance marker is missing|cannot read or safely create the Git-directory instance marker' "$TEST_ROOT/replaced-repository.out" >/dev/null || fail 'repository replacement refusal lacked identity evidence'
+rg -e 'instance marker is missing|cannot read or safely create the Git-directory instance marker|durable checkout authority retains 1 live worker\(s\)' "$TEST_ROOT/replaced-repository.out" >/dev/null || fail 'repository replacement refusal lacked identity evidence'
 
 if CODEX_BIN="$TEST_ROOT/missing-codex" "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/missing-codex.out" 2>&1; then
 	fail 'normal init accepted a missing Codex CLI'
@@ -979,19 +1059,29 @@ if FAKE_INVALID_PARENT_ACTION=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" laun
 fi
 jq -e 'any(.identity_ledger[]; .task_id == "invalid-parent-action" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'invalid structured result was not retired as failed'
 
+printf '%s\n' 'complete only with valid evidence' >"$PROMPT_FILE"
+if FAKE_FAILED_COMPLETED=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-completed-validator --scope 'reject completed result with failed validation' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/invalid-completed-validator.out" 2>&1; then
+	fail 'runner retired a completed result with failed validation'
+fi
+jq -e 'any(.identity_ledger[]; .task_id == "invalid-completed-validator" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'failed completed-validator result was not left retryable as failed'
+if FAKE_UNRESOLVED_COMPLETED=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-completed-unresolved --scope 'reject completed result with unresolved work' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/invalid-completed-unresolved.out" 2>&1; then
+	fail 'runner retired a completed result with unresolved work'
+fi
+jq -e 'any(.identity_ledger[]; .task_id == "invalid-completed-unresolved" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'unresolved completed result was not left retryable as failed'
+
 if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing --session-id nope --handle process-123 >/dev/null 2>&1; then
 	fail 'ambiguous process handle argument was accepted'
 fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
 resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 9 ]] || fail "expected nine exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 11 ]] || fail "expected eleven exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 18 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 22 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
 [[ "$read_only_count" -eq 3 ]] || fail "expected original, retry, and continued-worker handshakes to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 9 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 11 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
 [[ "$read_only_resume_count" -eq 3 ]] || fail "expected read-only sandbox on retry and both continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then

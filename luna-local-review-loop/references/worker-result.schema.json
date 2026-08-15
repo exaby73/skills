@@ -44,7 +44,21 @@
     },
     {
       "properties": {
-        "outcome": { "enum": ["completed", "blocked"] },
+        "outcome": { "const": "completed" },
+        "validators": {
+          "items": {
+            "properties": {
+              "status": { "const": "passed" }
+            }
+          }
+        },
+        "unresolved": { "maxItems": 0 },
+        "parentAction": { "type": "null" }
+      }
+    },
+    {
+      "properties": {
+        "outcome": { "const": "blocked" },
         "parentAction": { "type": "null" }
       }
     }

@@ -98,7 +98,7 @@ validate_common() {
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_USAGE" "repository path does not exist or is not a directory: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$REPO_INPUT" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_USAGE" "repository path is not inside a Git repository: $REPO_INPUT."
 	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve repository root: $REPO_INPUT."
-	[[ "$TASK_ID" =~ ^[A-Za-z0-9._-]+$ ]] || die "$EXIT_USAGE" 'task-id must contain only letters, numbers, dot, underscore, or hyphen.'
+	[[ "$TASK_ID" =~ ^[A-Za-z0-9._-]+$ && "$TASK_ID" != . && "$TASK_ID" != .. ]] || die "$EXIT_USAGE" 'task-id must be an artifact-safe name containing only letters, numbers, dot, underscore, or hyphen, and must not be dot or dot-dot.'
 	[[ -f "$PROMPT_FILE" && ! -L "$PROMPT_FILE" ]] || die "$EXIT_USAGE" "prompt-file must be a regular non-symlink file: $PROMPT_FILE."
 	case "$PROMPT_FILE" in /*) ;; *) PROMPT_FILE="$PWD/$PROMPT_FILE" ;; esac
 	prompt_parent="${PROMPT_FILE%/*}"
@@ -667,6 +667,8 @@ validate_result() {
     and (.unresolved | type == "array" and all(.[]; type == "string"))
     and (if .outcome == "needs_parent_action"
          then (.parentAction | type == "string" and length > 0)
+         elif .outcome == "completed"
+         then .parentAction == null and (.unresolved | length == 0) and all(.validators[]; .status == "passed")
          else .parentAction == null
          end)
   ' "$result_path" >/dev/null

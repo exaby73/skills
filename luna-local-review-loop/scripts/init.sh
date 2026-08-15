@@ -19,6 +19,14 @@ readonly EXIT_FILESYSTEM=10
 
 REPO_INPUT='.'
 STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/luna-local-review-loop-${UID}}"
+AUTHORITY_ROOT_INPUT="${LUNA_AUTHORITY_ROOT:-}"
+if [[ -z "$AUTHORITY_ROOT_INPUT" ]]; then
+	if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+		AUTHORITY_ROOT_INPUT="$XDG_STATE_HOME/luna-local-review-loop"
+	elif [[ -n "${HOME:-}" ]]; then
+		AUTHORITY_ROOT_INPUT="$HOME/.local/state/luna-local-review-loop"
+	fi
+fi
 CODEX_BIN="${CODEX_BIN:-codex}"
 REPO_ROOT=''
 REPO_IDENTITY=''
@@ -27,6 +35,8 @@ GIT_DIR_REAL=''
 REGISTRY_LOCATOR_PATH=''
 INSTANCE_MARKER_PATH=''
 STATE_ROOT=''
+AUTHORITY_ROOT=''
+AUTHORITY_PATH=''
 REGISTRY_DIR=''
 REGISTRY_PATH=''
 LOCK_DIR=''
@@ -34,12 +44,14 @@ LEGACY_REGISTRY_PATH=''
 LOCK_HELD=0
 ALLOW_INSTANCE_MARKER_CREATE=0
 LOCATOR_LOADED=0
+LOCATOR_PENDING=0
 STALE_LOCATOR=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
   def safe_scope: type == "string" and length > 0 and (test("[\\r\\n]") | not);
   def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
+  def safe_task_id: type == "string" and test("^[A-Za-z0-9._-]+$") and . != "." and . != "..";
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
   def process_instance: type == "string" and test("^(proc:[0-9]+|ps:[A-Z][a-z]{2} [A-Z][a-z]{2} [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4})$");
@@ -74,10 +86,10 @@ readonly SCHEMA_FILTER='
       and (.identity_ledger | type == "array")
       and (.workers | type == "array")
       and all($root.identity_ledger[];
-        (.task_id | safe_identity)
+        (.task_id | safe_task_id)
         and (.scope | safe_scope)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
-        and (.retry_of | nullable_identity)
+        and (.retry_of == null or (.retry_of | safe_task_id))
         and (.session_id | nullable_session)
         and (valid_status(.status))
         and (.reserved_at | nonempty_string)
@@ -94,10 +106,10 @@ readonly SCHEMA_FILTER='
              end)
       )
       and all($root.workers[];
-        (.task_id | safe_identity)
+        (.task_id | safe_task_id)
         and (.scope | safe_scope)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
-        and (.retry_of | nullable_identity)
+        and (.retry_of == null or (.retry_of | safe_task_id))
         and (.session_id | nullable_session)
         and (valid_status(.status))
         and (.status != "retired")
@@ -248,6 +260,99 @@ resolve_state_root() {
 	esac
 }
 
+resolve_authority_root() {
+	local authority_candidate
+	local authority_key
+	local authority_metadata=''
+	local authority_owner=''
+	local authority_mode=''
+	local state_candidate
+	[[ -n "$AUTHORITY_ROOT_INPUT" ]] || die "$EXIT_FILESYSTEM" 'cannot select durable checkout authority root: set HOME, XDG_STATE_HOME, or LUNA_AUTHORITY_ROOT.'
+	authority_candidate="$(canonical_path_without_creation "$AUTHORITY_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve checkout authority root candidate: $AUTHORITY_ROOT_INPUT."
+	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate while separating checkout authority: $STATE_ROOT_INPUT."
+	case "$authority_candidate/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "checkout authority root must be outside the repository: $authority_candidate." ;;
+	"$state_candidate/"*) die "$EXIT_FILESYSTEM" "checkout authority root must be outside the selectable registry state root: $authority_candidate." ;;
+	esac
+	case "$state_candidate/" in
+	"$authority_candidate/"*) die "$EXIT_FILESYSTEM" "selectable registry state root must be outside the checkout authority root: $state_candidate." ;;
+	esac
+	# Only the deepest authority directory must be private; parents retain their normal platform modes.
+	# shellcheck disable=SC2174
+	mkdir -p -m 0700 "$AUTHORITY_ROOT_INPUT" || die "$EXIT_FILESYSTEM" "cannot create checkout authority root: $AUTHORITY_ROOT_INPUT."
+	[[ -d "$AUTHORITY_ROOT_INPUT" && ! -L "$AUTHORITY_ROOT_INPUT" ]] || die "$EXIT_FILESYSTEM" "checkout authority root must be a real directory, not a symlink: $AUTHORITY_ROOT_INPUT."
+	AUTHORITY_ROOT="$(cd -P "$AUTHORITY_ROOT_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot access checkout authority root: $AUTHORITY_ROOT_INPUT."
+	if authority_metadata="$(stat -f '%u %Lp' "$AUTHORITY_ROOT" 2>/dev/null)" && [[ "$authority_metadata" =~ ^[0-9]+[[:space:]][0-7]+$ ]]; then
+		read -r authority_owner authority_mode <<<"$authority_metadata"
+	elif authority_metadata="$(stat -c '%u %a' "$AUTHORITY_ROOT" 2>/dev/null)" && [[ "$authority_metadata" =~ ^[0-9]+[[:space:]][0-7]+$ ]]; then
+		read -r authority_owner authority_mode <<<"$authority_metadata"
+	else
+		die "$EXIT_FILESYSTEM" "cannot inspect checkout authority root ownership and permissions: $AUTHORITY_ROOT."
+	fi
+	[[ "$authority_owner" == "$UID" ]] || die "$EXIT_FILESYSTEM" "checkout authority root must be owned by UID $UID: $AUTHORITY_ROOT is owned by UID $authority_owner."
+	[[ "$authority_mode" =~ ^[0-7]+$ ]] || die "$EXIT_FILESYSTEM" "checkout authority root returned an invalid permission mode: $AUTHORITY_ROOT ($authority_mode)."
+	(( (8#$authority_mode & 077) == 0 )) || die "$EXIT_FILESYSTEM" "checkout authority root must not grant group or other permissions: $AUTHORITY_ROOT has mode $authority_mode."
+	case "$AUTHORITY_ROOT/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "checkout authority root must be outside the repository: $AUTHORITY_ROOT." ;;
+	esac
+	authority_key="$(printf '%s\n' "$REPO_ROOT" | shasum -a 256 | awk '{print $1}')" || die "$EXIT_FILESYSTEM" "cannot derive checkout authority key for $REPO_ROOT."
+	[[ "$authority_key" =~ ^[0-9a-f]{64}$ ]] || die "$EXIT_FILESYSTEM" "checkout authority key is invalid for $REPO_ROOT."
+	AUTHORITY_PATH="$AUTHORITY_ROOT/$authority_key.json"
+}
+
+inspect_checkout_authority() {
+	local line_count
+	local link_count
+	local recorded_root
+	local recorded_path
+	local recorded_dir
+	local recorded_live_count
+	[[ -e "$AUTHORITY_PATH" || -L "$AUTHORITY_PATH" ]] || return 0
+	[[ -f "$AUTHORITY_PATH" && ! -L "$AUTHORITY_PATH" ]] || die "$EXIT_FILESYSTEM" "checkout authority must be a regular file: $AUTHORITY_PATH."
+	link_count="$(regular_file_link_count "$AUTHORITY_PATH")" || die "$EXIT_FILESYSTEM" "cannot inspect checkout authority link count: $AUTHORITY_PATH."
+	[[ "$link_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "checkout authority must have exactly one hard link: $AUTHORITY_PATH."
+	line_count="$(awk 'END {print NR + 0}' "$AUTHORITY_PATH")" || die "$EXIT_FILESYSTEM" "cannot read checkout authority: $AUTHORITY_PATH."
+	[[ "$line_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "checkout authority must contain exactly one record: $AUTHORITY_PATH."
+	jq -e 'type == "object" and keys == ["registry_path", "repository_root"] and (.registry_path | type == "string" and length > 0) and (.repository_root | type == "string" and length > 0)' "$AUTHORITY_PATH" >/dev/null 2>&1 || die "$EXIT_FILESYSTEM" "checkout authority record is invalid: $AUTHORITY_PATH."
+	recorded_root="$(jq -r '.repository_root' "$AUTHORITY_PATH")" || die "$EXIT_FILESYSTEM" "cannot read checkout authority repository root: $AUTHORITY_PATH."
+	[[ "$recorded_root" == "$REPO_ROOT" ]] || die "$EXIT_FILESYSTEM" "checkout authority key collision for $REPO_ROOT: $AUTHORITY_PATH records $recorded_root."
+	recorded_path="$(jq -r '.registry_path' "$AUTHORITY_PATH")" || die "$EXIT_FILESYSTEM" "cannot read checkout authority registry path: $AUTHORITY_PATH."
+	case "$recorded_path" in
+	/*/registry.json) ;;
+	*) die "$EXIT_FILESYSTEM" "checkout authority contains an invalid registry path: $AUTHORITY_PATH." ;;
+	esac
+	recorded_dir="$(canonical_path_without_creation "${recorded_path%/*}")" || die "$EXIT_FILESYSTEM" "cannot resolve checkout authority registry target: $recorded_path."
+	recorded_path="$recorded_dir/registry.json"
+	case "$recorded_path/" in
+	"$REPO_ROOT/"*) die "$EXIT_FILESYSTEM" "checkout authority registry target must be outside the repository: $recorded_path." ;;
+	"$AUTHORITY_ROOT/"*) die "$EXIT_FILESYSTEM" "checkout authority registry target must be outside the authority root: $recorded_path." ;;
+	esac
+	[[ -e "$recorded_path" || -L "$recorded_path" ]] || die "$EXIT_FILESYSTEM" "checkout authority registry target is missing: $recorded_path. Restore that registry from recovery evidence; never recreate it while prior worker ownership is unknown."
+	[[ -f "$recorded_path" && ! -L "$recorded_path" ]] || die "$EXIT_FILESYSTEM" "checkout authority registry target must be a regular file: $recorded_path."
+	link_count="$(regular_file_link_count "$recorded_path")" || die "$EXIT_FILESYSTEM" "cannot inspect checkout authority registry target link count: $recorded_path."
+	[[ "$link_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "checkout authority registry target must have exactly one hard link: $recorded_path."
+	jq -e --arg root "$REPO_ROOT" '(.schema_version == 2 or .schema_version == 3) and .registry == "luna-local-review-loop" and .repository_root == $root and (.workers | type == "array")' "$recorded_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "checkout authority registry target is not a recognizable registry for $REPO_ROOT: $recorded_path."
+	recorded_live_count="$(jq '.workers | length' "$recorded_path")"
+	if [[ "$recorded_live_count" -gt 0 ]] && { [[ ! -e "$INSTANCE_MARKER_PATH" ]] || [[ ! -e "$REGISTRY_LOCATOR_PATH" ]]; }; then
+		die "$EXIT_REPOSITORY" "durable checkout authority retains $recorded_live_count live worker(s) for $REPO_ROOT while Git metadata ownership markers are missing: $recorded_path. Restore the owning Git metadata or retire those workers before initialization."
+	fi
+}
+
+publish_checkout_authority() {
+	local temp_path
+	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_FILESYSTEM" "cannot publish checkout authority before registry exists: $REGISTRY_PATH."
+	case "$REGISTRY_PATH/" in
+	"$AUTHORITY_ROOT/"*) die "$EXIT_FILESYSTEM" "cannot publish a registry target inside the checkout authority root: $REGISTRY_PATH." ;;
+	esac
+	temp_path="$(mktemp "$AUTHORITY_ROOT/.checkout-authority.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create temporary checkout authority in $AUTHORITY_ROOT."
+	jq -nc --arg root "$REPO_ROOT" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, repository_root:$root}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write temporary checkout authority: $temp_path."
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict temporary checkout authority: $temp_path."
+	if [[ -e "$AUTHORITY_PATH" || -L "$AUTHORITY_PATH" ]]; then
+		[[ -f "$AUTHORITY_PATH" && ! -L "$AUTHORITY_PATH" ]] || die "$EXIT_FILESYSTEM" "checkout authority must be a regular file before replacement: $AUTHORITY_PATH."
+	fi
+	mv "$temp_path" "$AUTHORITY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish checkout authority: $AUTHORITY_PATH."
+}
+
 validate_state_root_candidate() {
 	local state_candidate
 	state_candidate="$(canonical_path_without_creation "$STATE_ROOT_INPUT")" || die "$EXIT_FILESYSTEM" "cannot resolve state root candidate: $STATE_ROOT_INPUT."
@@ -298,6 +403,7 @@ refuse_live_stale_locator_for_current_root() {
 read_registry_locator() {
 	local located_path=''
 	local located_checkout_identity=''
+	local located_state='ready'
 	local located_dir=''
 	local line_count=''
 	local link_count=''
@@ -308,9 +414,10 @@ read_registry_locator() {
 	[[ "$link_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "registry locator must have exactly one hard link: $REGISTRY_LOCATOR_PATH."
 	line_count="$(awk 'END {print NR + 0}' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read registry locator: $REGISTRY_LOCATOR_PATH."
 	[[ "$line_count" -eq 1 ]] || die "$EXIT_FILESYSTEM" "registry locator must contain exactly one record: $REGISTRY_LOCATOR_PATH."
-	jq -e 'type == "object" and keys == ["registry_path", "repository_checkout_identity"] and (.registry_path | type == "string" and length > 0) and (.repository_checkout_identity | type == "string" and test("^[0-9]+:[0-9]+$"))' "$REGISTRY_LOCATOR_PATH" >/dev/null 2>&1 || die "$EXIT_FILESYSTEM" "registry locator record is invalid: $REGISTRY_LOCATOR_PATH."
+	jq -e 'type == "object" and ((keys == ["registry_path", "repository_checkout_identity"]) or (keys == ["registry_path", "registry_state", "repository_checkout_identity"] and (.registry_state == "pending" or .registry_state == "ready"))) and (.registry_path | type == "string" and length > 0) and (.repository_checkout_identity | type == "string" and test("^[0-9]+:[0-9]+$"))' "$REGISTRY_LOCATOR_PATH" >/dev/null 2>&1 || die "$EXIT_FILESYSTEM" "registry locator record is invalid: $REGISTRY_LOCATOR_PATH."
 	located_path="$(jq -r '.registry_path' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read registry path from locator: $REGISTRY_LOCATOR_PATH."
 	located_checkout_identity="$(jq -r '.repository_checkout_identity' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read checkout identity from locator: $REGISTRY_LOCATOR_PATH."
+	located_state="$(jq -r '.registry_state // "ready"' "$REGISTRY_LOCATOR_PATH")" || die "$EXIT_FILESYSTEM" "cannot read registry state from locator: $REGISTRY_LOCATOR_PATH."
 	if [[ "$located_checkout_identity" != "$REPO_CHECKOUT_IDENTITY" ]]; then
 		[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_REPOSITORY" "registry locator belongs to another physical Git checkout: $REGISTRY_LOCATOR_PATH. Normal initialization can replace a copied locator; recovery will not guess."
 		refuse_live_stale_locator_for_current_root "$located_path"
@@ -330,16 +437,22 @@ read_registry_locator() {
 	esac
 	LOCK_DIR="$REGISTRY_DIR/.lock"
 	LOCATOR_LOADED=1
+	if [[ "$located_state" == ready && ! -e "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]]; then
+		die "$EXIT_FILESYSTEM" "authoritative registry target is missing behind a ready locator: $REGISTRY_PATH. Restore it from recovery evidence; never recreate it while prior worker ownership is unknown."
+	fi
+	[[ "$located_state" != pending ]] || LOCATOR_PENDING=1
 	validate_registry_dir
 }
 
 publish_or_adopt_registry_locator() {
 	local temp_path
 	temp_path="$(mktemp "$GIT_DIR_REAL/.luna-registry-locator.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create temporary registry locator in $GIT_DIR_REAL."
-	jq -nc --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, repository_checkout_identity:$checkout_identity}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write temporary registry locator: $temp_path."
+	jq -nc --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, registry_state:"pending", repository_checkout_identity:$checkout_identity}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write temporary registry locator: $temp_path."
 	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict temporary registry locator: $temp_path."
 	if ln "$temp_path" "$REGISTRY_LOCATOR_PATH" 2>/dev/null; then
 		rm -f "$temp_path"
+		LOCATOR_LOADED=1
+		LOCATOR_PENDING=1
 		return 0
 	fi
 	rm -f "$temp_path"
@@ -349,10 +462,23 @@ publish_or_adopt_registry_locator() {
 replace_registry_locator() {
 	local temp_path
 	temp_path="$(mktemp "$GIT_DIR_REAL/.luna-registry-locator.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create replacement registry locator in $GIT_DIR_REAL."
-	jq -nc --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, repository_checkout_identity:$checkout_identity}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write replacement registry locator: $temp_path."
+	jq -nc --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, registry_state:"pending", repository_checkout_identity:$checkout_identity}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write replacement registry locator: $temp_path."
 	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict replacement registry locator: $temp_path."
 	mv "$temp_path" "$REGISTRY_LOCATOR_PATH" || die "$EXIT_FILESYSTEM" "cannot replace stale copied registry locator: $REGISTRY_LOCATOR_PATH."
 	LOCATOR_LOADED=1
+	LOCATOR_PENDING=1
+}
+
+mark_registry_locator_ready() {
+	local temp_path
+	[[ "$LOCATOR_LOADED" -eq 1 ]] || die "$EXIT_FILESYSTEM" "cannot mark an unloaded registry locator ready: $REGISTRY_LOCATOR_PATH."
+	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_FILESYSTEM" "cannot mark registry locator ready before registry exists: $REGISTRY_PATH."
+	[[ "$LOCATOR_PENDING" -eq 1 ]] || return 0
+	temp_path="$(mktemp "$GIT_DIR_REAL/.luna-registry-locator-ready.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create ready registry locator in $GIT_DIR_REAL."
+	jq -nc --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg registry_path "$REGISTRY_PATH" '{registry_path:$registry_path, registry_state:"ready", repository_checkout_identity:$checkout_identity}' >"$temp_path" || die "$EXIT_FILESYSTEM" "cannot write ready registry locator: $temp_path."
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict ready registry locator: $temp_path."
+	mv "$temp_path" "$REGISTRY_LOCATOR_PATH" || die "$EXIT_FILESYSTEM" "cannot publish ready registry locator: $REGISTRY_LOCATOR_PATH."
+	LOCATOR_PENDING=0
 }
 
 repository_checkout_identity() {
@@ -678,6 +804,8 @@ resolve_paths
 resolve_git_admin
 validate_state_root_candidate
 REPO_CHECKOUT_IDENTITY="$(repository_checkout_identity)" || die "$EXIT_REPOSITORY" "cannot identify the physical Git checkout for $REPO_ROOT. Preserve external state and inspect the repository before retrying."
+resolve_authority_root
+inspect_checkout_authority
 if ! read_registry_locator; then
 	if [[ ! -e "$REGISTRY_LOCATOR_PATH" ]] && [[ -e "$INSTANCE_MARKER_PATH" || -L "$INSTANCE_MARKER_PATH" ]]; then
 		die "$EXIT_FILESYSTEM" "the Git-directory instance marker exists but its authoritative registry locator is missing: $REGISTRY_LOCATOR_PATH. Restore the locator from recovery evidence; do not initialize another state root for this checkout."
@@ -719,6 +847,8 @@ else
 	[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_FILESYSTEM" "registry does not exist: $REGISTRY_PATH. Run init before launch."
 	write_new_registry
 fi
+mark_registry_locator_ready
+publish_checkout_authority
 
 if [[ "$PRINT_PATH" -eq 1 ]]; then
 	printf '%s\n' "$REGISTRY_PATH"
