@@ -71,7 +71,7 @@ readonly SCHEMA_FILTER='
           and .value.scope == $row.scope
           and .value.sandbox == $row.sandbox
           and .value.status == "retired"
-          and (.value.terminal_status == "failed" or .value.terminal_status == "interrupted")
+          and (.value.terminal_status == "failed" or .value.terminal_status == "blocked" or .value.terminal_status == "interrupted")
         )
         end
     );

@@ -8,6 +8,13 @@ readonly EXIT_PREREQUISITE=3
 readonly EXIT_RUNTIME_STATE=11
 readonly EXIT_WORKER=12
 
+# Start promptly for launch readiness, then back off after stable observations.
+# The lease and independent token enumeration keep cleanup safe without a
+# sustained 10 ms process-table loop.
+readonly TRACKER_MIN_INTERVAL='0.05'
+readonly TRACKER_STABLE_INTERVAL='0.10'
+readonly TRACKER_MAX_INTERVAL='0.25'
+
 SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || SCRIPT_DIR='.'
 [[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR='/'
@@ -41,6 +48,12 @@ ACTIVE_TRACKER_STATE=''
 ACTIVE_LEASE_PID=''
 ACTIVE_LEASE_INSTANCE=''
 PRESERVE_REGISTRY_STATE=0
+# Bash 3 has no allocated-FD syntax; FD 8 carries the launch snapshot and
+# FD 9 remains reserved for each Codex child lease.
+readonly PROMPT_DESCRIPTOR_SOURCE='fd8'
+PROMPT_DESCRIPTOR_OPEN=0
+PROMPT_STAGING_PATH=''
+PROMPT_STAGING_IDENTITY=''
 
 usage() {
 	local exit_code="${1:-0}"
@@ -54,6 +67,8 @@ Launch atomically reserves, creates and binds a resumable Codex session with a
 read-only handshake, activates it, and sends the task without a PTY or manual
 EOF. Continue resumes the exact registered session. Structured final output is
 printed to stdout; streaming logs stay in the external registry state directory.
+`--retry-of` resumes an exact scope from a retired failed, blocked, or
+interrupted attempt while preserving its sandbox.
 EOF
 	exit "$exit_code"
 }
@@ -125,6 +140,8 @@ validate_common() {
 
 finish_on_error() {
 	local exit_code=$?
+	close_prompt_descriptor
+	cleanup_prompt_staging
 	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && -n "$TASK_ID" && -n "$INVOCATION_TOKEN" ]]; then
 		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status failed --evidence "worker launcher exited $exit_code before a structured terminal result" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null 2>&1 || true
 	fi
@@ -293,6 +310,11 @@ monitor_descendant_tree() {
 	local pid
 	local instance
 	local recorded_count
+	local tracker_status
+	local current_signature
+	local last_observation_signature=''
+	local stable_cycles=0
+	local tracker_interval="$TRACKER_MIN_INTERVAL"
 	known_file="$(mktemp "${state_path}.known.XXXXXX")" || exit 1
 	snapshot="$(mktemp "${state_path}.snapshot.XXXXXX")" || exit 1
 	additions="$(mktemp "${state_path}.additions.XXXXXX")" || exit 1
@@ -330,19 +352,28 @@ monitor_descendant_tree() {
 		process_instance_matches "$root_pid" "$root_instance" && root_live=1
 		lease_live=0
 		process_instance_matches "$lease_pid" "$lease_instance" && lease_live=1
+		tracker_status='active'
 		if [[ "$root_live" -eq 0 && "$live_count" -eq 0 && "$lease_live" -eq 0 ]]; then
 			record_token_bearing_processes "$known_file" || exit 1
 			live_count="$(awk 'END { print NR + 0 }' "$known_file")"
-			if [[ "$live_count" -gt 0 ]]; then
-				write_descendant_state active "$root_pid" "$known_file" "$state_path" || exit 1
-				sleep 0.01
-				continue
-			fi
-			write_descendant_state clean "$root_pid" "$known_file" "$state_path" || exit 1
-			exit 0
+			[[ "$live_count" -gt 0 ]] || tracker_status='clean'
 		fi
-		write_descendant_state active "$root_pid" "$known_file" "$state_path" || exit 1
-		sleep 0.01
+		current_signature="$tracker_status|$root_live|$lease_live|$(<"$known_file")"
+		write_descendant_state "$tracker_status" "$root_pid" "$known_file" "$state_path" || exit 1
+		[[ "$tracker_status" == 'clean' ]] && exit 0
+
+		if [[ "$current_signature" == "$last_observation_signature" ]]; then
+			stable_cycles=$((stable_cycles + 1))
+		else
+			stable_cycles=0
+		fi
+		last_observation_signature="$current_signature"
+		case "$stable_cycles" in
+		0) tracker_interval="$TRACKER_MIN_INTERVAL" ;;
+		1) tracker_interval="$TRACKER_STABLE_INTERVAL" ;;
+		*) tracker_interval="$TRACKER_MAX_INTERVAL" ;;
+		esac
+		sleep "$tracker_interval"
 	done
 }
 
@@ -515,9 +546,9 @@ require_real_child_directory() {
 artifact_link_count() {
 	local path="$1"
 	local count=''
-	if count="$(stat -f '%l' "$path" 2>/dev/null)"; then
+	if count="$(stat -c '%h' "$path" 2>/dev/null)"; then
 		:
-	elif count="$(stat -c '%h' "$path" 2>/dev/null)"; then
+	elif count="$(stat -f '%l' "$path" 2>/dev/null)"; then
 		:
 	else
 		return 1
@@ -535,6 +566,64 @@ require_owned_artifact_file() {
 	[[ "$link_count" -eq 1 ]] || die "$EXIT_RUNTIME_STATE" "$label must have exactly one hard link: $path."
 }
 
+artifact_identity() {
+	local path="$1"
+	local identity=''
+	if identity="$(stat -c '%d:%i' "$path" 2>/dev/null)"; then
+		:
+	elif identity="$(stat -f '%d:%i' "$path" 2>/dev/null)"; then
+		:
+	else
+		return 1
+	fi
+	[[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+	printf '%s\n' "$identity"
+}
+
+remember_prompt_staging() {
+	PROMPT_STAGING_PATH="$1"
+	PROMPT_STAGING_IDENTITY=''
+	PROMPT_STAGING_IDENTITY="$(artifact_identity "$PROMPT_STAGING_PATH")" || die "$EXIT_RUNTIME_STATE" "cannot record task prompt staging identity: $PROMPT_STAGING_PATH"
+}
+
+remove_prompt_staging() {
+	local current_identity=''
+	local link_count=''
+	[[ -n "$PROMPT_STAGING_PATH" ]] || return 0
+	if [[ ! -e "$PROMPT_STAGING_PATH" && ! -L "$PROMPT_STAGING_PATH" ]]; then
+		PROMPT_STAGING_PATH=''
+		PROMPT_STAGING_IDENTITY=''
+		return 0
+	fi
+	[[ -n "$PROMPT_STAGING_IDENTITY" ]] || return 1
+	[[ -f "$PROMPT_STAGING_PATH" && ! -L "$PROMPT_STAGING_PATH" ]] || return 1
+	link_count="$(artifact_link_count "$PROMPT_STAGING_PATH" 2>/dev/null)" || return 1
+	[[ "$link_count" -eq 1 ]] || return 1
+	current_identity="$(artifact_identity "$PROMPT_STAGING_PATH" 2>/dev/null)" || return 1
+	[[ "$current_identity" == "$PROMPT_STAGING_IDENTITY" ]] || return 1
+	rm "$PROMPT_STAGING_PATH" 2>/dev/null || return 1
+	PROMPT_STAGING_PATH=''
+	PROMPT_STAGING_IDENTITY=''
+}
+
+cleanup_prompt_staging() {
+	remove_prompt_staging || true
+}
+
+open_prompt_descriptor() {
+	local prompt_path="$1"
+	require_owned_artifact_file "$prompt_path" 'task prompt snapshot'
+	exec 8<"$prompt_path" || die "$EXIT_RUNTIME_STATE" "cannot open task prompt snapshot: $prompt_path"
+	PROMPT_DESCRIPTOR_OPEN=1
+}
+
+close_prompt_descriptor() {
+	if [[ "$PROMPT_DESCRIPTOR_OPEN" -eq 1 ]]; then
+		exec 8<&- || true
+		PROMPT_DESCRIPTOR_OPEN=0
+	fi
+}
+
 create_owned_artifact_file() {
 	local path="$1"
 	local label="$2"
@@ -545,11 +634,24 @@ create_owned_artifact_file() {
 	require_owned_artifact_file "$path" "$label"
 }
 
+snapshot_prompt_file() {
+	local source_path="$1"
+	local snapshot_path="$2"
+	create_owned_artifact_file "$snapshot_path" 'task prompt snapshot'
+	if [[ "$snapshot_path" == "$PROMPT_STAGING_PATH" ]]; then
+		remember_prompt_staging "$snapshot_path"
+	fi
+	if ! cat "$source_path" >"$snapshot_path"; then
+		die "$EXIT_RUNTIME_STATE" "cannot snapshot validated task prompt: $source_path"
+	fi
+	require_owned_artifact_file "$snapshot_path" 'task prompt snapshot'
+}
+
 run_gated_codex() {
 	local artifact_dir="$1"
 	local stream_log="$2"
 	local stream_stderr="$3"
-	local stdin_path="$4"
+	local stdin_source="$4"
 	local codex_cwd="$5"
 	shift 5
 	local gate_path="$artifact_dir/.start-$INVOCATION_TOKEN"
@@ -559,6 +661,9 @@ run_gated_codex() {
 	local child_status=0
 	local child_pid
 	local child_pgid
+	if [[ "$stdin_source" == "$PROMPT_DESCRIPTOR_SOURCE" ]]; then
+		[[ "$PROMPT_DESCRIPTOR_OPEN" -eq 1 ]] || return 1
+	fi
 	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
 	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
 	rm -f "$gate_path" "$lease_path" "$lease_ready_path"
@@ -582,9 +687,13 @@ run_gated_codex() {
 			kill -0 "$parent_pid" 2>/dev/null || exit 125
 			sleep 0.05
 		done
-		if [[ -n "$stdin_path" ]]; then
-			exec "$@" <"$stdin_path"
+		if [[ "$stdin_source" == "$PROMPT_DESCRIPTOR_SOURCE" ]]; then
+			exec "$@" <&8
+		elif [[ -n "$stdin_source" ]]; then
+			exec 8<&-
+			exec "$@" <"$stdin_source"
 		else
+			exec 8<&-
 			exec "$@" </dev/null
 		fi
 		) >>"$stream_log" 2>>"$stream_stderr" &
@@ -673,6 +782,7 @@ run_gated_codex() {
 
 trap 'stop_active_child_and_exit INT 130' INT
 trap 'stop_active_child_and_exit TERM 143' TERM
+trap 'stop_active_child_and_exit HUP 129' HUP
 
 extract_session_id() {
 	local log_path="$1"
@@ -699,6 +809,7 @@ validate_result() {
 
 resume_task() {
 	local artifact_dir="$1"
+	local resume_prompt_source="$2"
 	local attempt
 	local stream_log
 	local stream_stderr
@@ -721,7 +832,7 @@ resume_task() {
 	create_owned_artifact_file "$result_path" 'worker result artifact'
 
 	local codex_status=0
-	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$PROMPT_FILE" "$REPO_ROOT" "$CODEX_BIN" exec resume \
+	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$resume_prompt_source" "$REPO_ROOT" "$CODEX_BIN" exec resume \
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
@@ -730,6 +841,9 @@ resume_task() {
 		--output-schema "$RESULT_SCHEMA" \
 		--output-last-message "$result_path" \
 		-- "$SESSION_ID" - || codex_status=$?
+	if [[ "$resume_prompt_source" == "$PROMPT_DESCRIPTOR_SOURCE" ]]; then
+		close_prompt_descriptor
+	fi
 	if [[ "$codex_status" -ne 0 ]]; then
 		die "$EXIT_WORKER" "Codex resume failed for task $TASK_ID. Logs: $stream_log and $stream_stderr"
 	fi
@@ -762,12 +876,22 @@ resume_task() {
 }
 
 launch_worker() {
+	trap finish_on_error EXIT
 	[[ -n "$SCOPE" ]] || die "$EXIT_USAGE" 'launch requires non-empty --scope.'
 	validate_common
 	local registry_path
-	registry_path="$($REGISTRY_SCRIPT init --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" --print-path)"
+	local registry_dir
+	local artifact_root
+	local artifact_dir
+	local prompt_staging
+	local prompt_snapshot
 	prepare_invocation
-	trap finish_on_error EXIT
+	registry_path="$($REGISTRY_SCRIPT init --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" --print-path)"
+	registry_dir="$(dirname "$registry_path")"
+	artifact_root="$(create_real_child_directory "$registry_dir" artifacts 'artifact root')"
+	prompt_staging="$artifact_root/.prompt-$INVOCATION_TOKEN"
+	PROMPT_STAGING_PATH="$prompt_staging"
+	snapshot_prompt_file "$PROMPT_FILE" "$prompt_staging"
 	local reserve_args=(reserve --task-id "$TASK_ID" --scope "$SCOPE" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")
 	[[ -z "$RETRY_OF" ]] || reserve_args+=(--retry-of "$RETRY_OF")
 	[[ -z "$TASK_SANDBOX" ]] || reserve_args+=(--sandbox "$TASK_SANDBOX")
@@ -776,14 +900,16 @@ launch_worker() {
 	TASK_SANDBOX="$("$REGISTRY_SCRIPT" query --task-id "$TASK_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" | jq -r '.sandbox')"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
 
-	local registry_dir
-	local artifact_root
-	local artifact_dir
+	artifact_dir="$(create_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
+	prompt_snapshot="$artifact_dir/.task-prompt"
+	[[ ! -e "$prompt_snapshot" && ! -L "$prompt_snapshot" ]] || die "$EXIT_RUNTIME_STATE" 'task prompt snapshot already exists; refusing to overwrite it.'
+	snapshot_prompt_file "$prompt_staging" "$prompt_snapshot"
+	remove_prompt_staging || die "$EXIT_RUNTIME_STATE" "cannot safely release staged task prompt snapshot: $prompt_staging"
+	require_owned_artifact_file "$prompt_snapshot" 'task prompt snapshot'
+	open_prompt_descriptor "$prompt_snapshot"
+
 	local launch_log
 	local launch_stderr
-	registry_dir="$(dirname "$registry_path")"
-	artifact_root="$(create_real_child_directory "$registry_dir" artifacts 'artifact root')"
-	artifact_dir="$(create_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
 	launch_log="$artifact_dir/launch.jsonl"
 	launch_stderr="$artifact_dir/launch.stderr.log"
 	create_owned_artifact_file "$launch_log" 'handshake JSONL artifact'
@@ -807,7 +933,7 @@ launch_worker() {
 	[[ -n "$SESSION_ID" ]] || die "$EXIT_WORKER" "Codex handshake emitted no thread.started session ID. Log: $launch_log"
 	run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
 	run_registry_quiet activate --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
-	resume_task "$artifact_dir"
+	resume_task "$artifact_dir" "$PROMPT_DESCRIPTOR_SOURCE"
 }
 
 continue_worker() {
@@ -827,7 +953,7 @@ continue_worker() {
 	SESSION_ID="$(jq -r '.session_id' <<<"$worker")"
 	TASK_SANDBOX="$(jq -r '.sandbox' <<<"$worker")"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
-	resume_task "$artifact_dir"
+	resume_task "$artifact_dir" "$PROMPT_FILE"
 }
 
 finish_worker() {

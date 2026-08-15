@@ -32,7 +32,7 @@ readonly TEST_ROOT
 cleanup_test_root() {
 	local fixture_pid
 	local runner_pid
-	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}"; do
+	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}"; do
 		[[ -n "$runner_pid" ]] || continue
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
@@ -82,6 +82,10 @@ readonly CODEX_DESCENDANT_PID_FILE="$TEST_ROOT/codex-descendant.pid"
 readonly CODEX_DETACHED_PID_FILE="$TEST_ROOT/codex-detached.pid"
 readonly CODEX_DETACHED_OBSERVED_FILE="$TEST_ROOT/codex-detached-observed"
 readonly CODEX_FAST_REPARENT_PID_FILE="$TEST_ROOT/codex-fast-reparent.pid"
+readonly CODEX_PROMPT_CAPTURE="$TEST_ROOT/codex-prompt-capture"
+readonly PROMPT_RACE_MARKER="$TEST_ROOT/prompt-race-handshake"
+readonly PROMPT_RACE_RELEASE="$TEST_ROOT/prompt-race-release"
+readonly TRACKER_PS_COUNT_FILE="$TEST_ROOT/tracker-ps-count"
 readonly TRACKER_HANDSHAKE_COMPLETED_MARKER="$TEST_ROOT/tracker-handshake-completed"
 readonly TRACKER_LEASE_WRITER_READY_MARKER="$TEST_ROOT/tracker-lease-writer-ready"
 readonly TRACKER_LEASE_RELEASE_MARKER="$TEST_ROOT/tracker-lease-release"
@@ -111,6 +115,9 @@ if [[ " $* " == *' exec resume '* ]]; then
     previous="$argument"
   done
   prompt="$(cat)"
+  if [[ -n "${CODEX_PROMPT_CAPTURE:-}" ]]; then
+    printf '%s' "$prompt" >"$CODEX_PROMPT_CAPTURE"
+  fi
   if [[ "${FAKE_FAST_REPARENT_RESUME:-0}" == '1' ]]; then
     (
       nohup sleep 300 >/dev/null 2>&1 &
@@ -188,6 +195,9 @@ if [[ " $* " == *' exec resume '* ]]; then
     else
       parent_action='"run approved validator"'
     fi
+  elif [[ "${FAKE_BLOCKED_RESUME:-0}" == '1' ]]; then
+    outcome='blocked'
+    parent_action='null'
   else
     outcome='completed'
     parent_action='null'
@@ -214,7 +224,14 @@ if [[ " $* " == *' exec resume '* ]]; then
   printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"large stream stays in log"}}'
 else
 	printf '%s\n' 'irrelevant connector warning' >&2
+	if [[ "${FAKE_REQUIRE_CLOSED_PROMPT_FD:-0}" == '1' ]] && (: <&8) 2>/dev/null; then
+		exit 92
+	fi
 	[[ -z "${TRACKER_HANDSHAKE_COMPLETED_MARKER:-}" ]] || : >"$TRACKER_HANDSHAKE_COMPLETED_MARKER"
+	if [[ "${FAKE_HANDSHAKE_PROMPT_RACE:-0}" == '1' ]]; then
+		: >"$PROMPT_RACE_MARKER"
+		while [[ ! -e "$PROMPT_RACE_RELEASE" ]]; do sleep 0.01; done
+	fi
 	if [[ "${FAKE_REQUIRE_READ_ONLY_HANDSHAKE:-0}" == '1' && " $* " != *' -s read-only '* ]]; then exit 91; fi
 	if [[ "${FAKE_FAIL_HANDSHAKE:-0}" == '1' ]]; then exit 23; fi
   count=0
@@ -241,6 +258,12 @@ if [[ "${LUNA_TEST_DELAY_REPARENT_PS:-0}" == '1' && "$*" == '-ax -o pid=,ppid=,s
 		: >"$FAST_REPARENT_PS_MARKER"
 	fi
 fi
+if [[ "$*" == '-ax -o pid=,ppid=,stat=' && -n "${TRACKER_PS_COUNT_FILE:-}" ]]; then
+	count=0
+	[[ ! -f "$TRACKER_PS_COUNT_FILE" ]] || count="$(cat "$TRACKER_PS_COUNT_FILE")"
+	count=$((count + 1))
+	printf '%s\n' "$count" >"$TRACKER_PS_COUNT_FILE"
+fi
 exec "$(command -p -v ps)" "$@"
 EOF
 chmod +x "$SLOW_BIN_DIR/ps"
@@ -252,6 +275,9 @@ export CODEX_DESCENDANT_PID_FILE
 export CODEX_DETACHED_PID_FILE
 export CODEX_DETACHED_OBSERVED_FILE
 export CODEX_FAST_REPARENT_PID_FILE
+export CODEX_PROMPT_CAPTURE
+export PROMPT_RACE_MARKER PROMPT_RACE_RELEASE
+export TRACKER_PS_COUNT_FILE
 export CODEX_HOME="$CODEX_STATE"
 export LUNA_AUTHORITY_ROOT="$AUTHORITY_ROOT"
 
@@ -1047,12 +1073,31 @@ if CODEX_HOME="$INVALID_CODEX_STATE" CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT"
 fi
 jq -e 'all(.identity_ledger[]; .task_id != "denied-runtime")' "$registry_path" >/dev/null || fail 'runtime permission failure burned a task reservation'
 
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id rejected-launch-staging --scope 'reject launch after prompt staging' >/dev/null
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id rejected-launch-staging --scope 'reject launch after prompt staging' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/rejected-launch-staging.out" 2>&1; then
+	fail 'reservation-conflict launch unexpectedly succeeded'
+fi
+for staged_prompt_path in "$registry_dir"/artifacts/.prompt-*; do
+	[[ -e "$staged_prompt_path" || -L "$staged_prompt_path" ]] || continue
+	fail 'rejected launch left a staged prompt copy'
+done
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id rejected-launch-staging --status interrupted --evidence 'rejected launch staging cleanup test complete' >/dev/null
+
 if FAKE_FAIL_HANDSHAKE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-runner --scope 'runner retry scope' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/failed-runner.out" 2>&1; then
 	fail 'failed handshake unexpectedly succeeded'
 fi
 jq -e 'any(.identity_ledger[]; .task_id == "failed-runner" and .session_id == null and .status == "retired" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'failed pre-bind launch was not atomically retired'
 retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-runner-retry --scope 'runner retry scope' --retry-of failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/retry.err")"
 jq -e '.outcome == "completed"' <<<"$retry_output" >/dev/null || fail 'runner retry did not complete'
+
+printf '%s\n' 'blocked worker' >"$PROMPT_FILE"
+blocked_output="$(FAKE_BLOCKED_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id blocked-runner --scope 'blocked runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/blocked-runner.err")"
+jq -e '.outcome == "blocked"' <<<"$blocked_output" >/dev/null || fail 'runner did not return a blocked result'
+jq -e 'any(.identity_ledger[]; .task_id == "blocked-runner" and .status == "retired" and .terminal_status == "blocked")' "$registry_path" >/dev/null || fail 'blocked runner result was not retired as blocked'
+blocked_retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id blocked-runner-retry --scope 'blocked runner retry scope' --retry-of blocked-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/blocked-retry.err")"
+jq -e '.outcome == "completed"' <<<"$blocked_retry_output" >/dev/null || fail 'retired blocked task did not resume through exact-scope retry'
+jq -e 'any(.identity_ledger[]; .task_id == "blocked-runner-retry" and .retry_of == "blocked-runner" and .sandbox == "read-only" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'blocked retry did not preserve linkage and sandbox'
+"$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'init validation rejected a valid blocked retry chain'
 
 if FAKE_FAIL_HANDSHAKE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id read-only-failed-runner --scope 'read-only runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/read-only-failed.out" 2>&1; then
 	fail 'read-only failed handshake unexpectedly succeeded'
@@ -1069,6 +1114,35 @@ handshake_sandbox_output="$(FAKE_REQUIRE_READ_ONLY_HANDSHAKE=1 FAKE_REQUIRE_WORK
 jq -e '.outcome == "completed"' <<<"$handshake_sandbox_output" >/dev/null || fail 'workspace-write task did not use read-only handshake and registered resume sandbox'
 jq -e 'any(.identity_ledger[]; .task_id == "handshake-sandbox-contract" and .sandbox == "workspace-write" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'workspace-write task did not retain its registered resume sandbox'
 
+prompt_race_original='immutable task prompt before handshake'
+printf '%s\n' "$prompt_race_original" >"$PROMPT_FILE"
+rm -f "$PROMPT_RACE_MARKER" "$PROMPT_RACE_RELEASE" "$CODEX_PROMPT_CAPTURE"
+prompt_race_status=0
+FAKE_HANDSHAKE_PROMPT_RACE=1 FAKE_REQUIRE_CLOSED_PROMPT_FD=1 FAKE_REQUIRE_WORKSPACE_WRITE_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id prompt-race-worker --scope 'open immutable prompt before workspace-write resume' --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/prompt-race.out" 2>"$TEST_ROOT/prompt-race.err" &
+prompt_race_runner_pid=$!
+poll_attempt=0
+while [[ ! -e "$PROMPT_RACE_MARKER" && "$poll_attempt" -lt 200 ]]; do
+	sleep 0.01
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$PROMPT_RACE_MARKER" ]] || fail 'prompt race handshake did not reach its controlled pause'
+prompt_snapshot_path="$registry_dir/artifacts/prompt-race-worker/.task-prompt"
+[[ -f "$prompt_snapshot_path" && ! -L "$prompt_snapshot_path" ]] || fail 'launch did not create a private prompt snapshot before handshake'
+[[ "$(cat "$prompt_snapshot_path")" == "$prompt_race_original" ]] || fail 'prompt snapshot did not preserve validated prompt contents before handshake'
+jq -e 'any(.workers[]; .task_id == "prompt-race-worker" and .status == "reserved")' "$registry_path" >/dev/null || fail 'prompt race did not prove snapshot creation preceded registry reservation'
+printf '%s\n' 'caller replacement during handshake' >"$PROMPT_FILE"
+printf '%s\n' 'task artifact replacement during handshake' >"$TEST_ROOT/prompt-race-replacement"
+mv "$TEST_ROOT/prompt-race-replacement" "$prompt_snapshot_path"
+: >"$PROMPT_RACE_RELEASE"
+prompt_race_status=0
+wait "$prompt_race_runner_pid" || prompt_race_status=$?
+prompt_race_runner_pid=''
+[[ "$prompt_race_status" -eq 0 ]] || fail 'prompt snapshot race worker did not complete'
+jq -e '.outcome == "completed"' <"$TEST_ROOT/prompt-race.out" >/dev/null || fail 'prompt snapshot race worker returned invalid result'
+[[ "$(cat "$CODEX_PROMPT_CAPTURE")" == "$prompt_race_original" ]] || fail 'first workspace-write resume consumed a task-artifact replacement during handshake'
+snapshot_link_count="$(stat -c '%h' "$prompt_snapshot_path" 2>/dev/null || stat -f '%l' "$prompt_snapshot_path" 2>/dev/null)"
+[[ "$snapshot_link_count" == '1' ]] || fail 'prompt snapshot did not retain single-link ownership'
+
 relative_codex_output="$(cd "$TEST_ROOT" && PATH="bin:$PATH" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id relative-codex-worker --scope 'canonicalize relative codex path' --prompt-file task.txt 2>"$TEST_ROOT/relative-codex.err")"
 jq -e '.outcome == "completed"' <<<"$relative_codex_output" >/dev/null || fail 'runner did not canonicalize a Codex executable found through a relative PATH entry'
 
@@ -1083,6 +1157,21 @@ slow_ps_marker="$TEST_ROOT/slow-ps.ready"
 slow_tracker_output="$(PATH="$SLOW_BIN_DIR:$PATH" LUNA_TEST_SLOW_PS=1 SLOW_PS_MARKER="$slow_ps_marker" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id slow-tracker-worker --scope 'wait for slow tracker readiness' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/slow-tracker.err")"
 jq -e '.outcome == "completed"' <<<"$slow_tracker_output" >/dev/null || fail 'runner imposed a fixed deadline on tracker readiness'
 [[ -e "$slow_ps_marker" ]] || fail 'slow tracker fixture did not delay its initial process snapshot'
+
+rm -f "$TRACKER_PS_COUNT_FILE" "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE"
+printf '%s\n' 'stable tracker cadence' >"$PROMPT_FILE"
+FAKE_BLOCK_RESUME=1 PATH="$SLOW_BIN_DIR:$PATH" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id adaptive-tracker-worker --scope 'use adaptive ancestry tracker cadence' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/adaptive-tracker.out" 2>"$TEST_ROOT/adaptive-tracker.err" &
+cadence_runner_pid=$!
+wait_for_blocking_fixture "$cadence_runner_pid" "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE" 'adaptive tracker Codex process group did not start'
+sleep 1
+cadence_snapshot_count="$(cat "$TRACKER_PS_COUNT_FILE")"
+[[ "$cadence_snapshot_count" -lt 40 ]] || fail "adaptive tracker kept 10 ms full-table churn: $cadence_snapshot_count snapshots in one second"
+kill -TERM "$cadence_runner_pid"
+cadence_status=0
+wait "$cadence_runner_pid" || cadence_status=$?
+cadence_runner_pid=''
+[[ "$cadence_status" -ne 0 ]] || fail 'adaptive tracker termination unexpectedly succeeded'
+jq -e 'any(.identity_ledger[]; .task_id == "adaptive-tracker-worker" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'adaptive tracker termination did not preserve failed lifecycle evidence'
 
 runner_output="$(cd "$TEST_ROOT" && CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-worker --scope 'one fast task' --prompt-file task.txt 2>"$TEST_ROOT/runner.err")"
 jq -e '.outcome == "completed" and .summary == "worker concise result" and (.validators | length == 1) and .validators[0].status == "passed"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output with valid completion evidence'
@@ -1209,15 +1298,15 @@ fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
 resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 16 ]] || fail "expected sixteen exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 20 ]] || fail "expected twenty exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 32 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 40 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
-[[ "$read_only_count" -eq 16 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
+[[ "$read_only_count" -eq 20 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 16 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 20 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
-[[ "$read_only_resume_count" -eq 3 ]] || fail "expected read-only sandbox on retry and both continued-session resumes, got $read_only_resume_count"
+[[ "$read_only_resume_count" -eq 5 ]] || fail "expected read-only sandbox on retry, blocked retry, and both continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then
 	fail 'a resumed Codex session ran outside the canonical target repository'
 fi
@@ -1329,7 +1418,7 @@ while [[ ! -e "$TRACKER_LEASE_WRITER_READY_MARKER" ]] && process_is_live_non_zom
 	poll_attempt=$((poll_attempt + 1))
 done
 [[ -e "$TRACKER_LEASE_WRITER_READY_MARKER" ]] || fail 'unproven-cleanup lease writer did not retain lease evidence'
-kill -TERM "$unproven_runner_pid"
+kill -HUP "$unproven_runner_pid"
 unproven_status=0
 wait "$unproven_runner_pid" || unproven_status=$?
 unproven_runner_pid=''
