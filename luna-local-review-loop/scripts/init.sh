@@ -594,6 +594,33 @@ refuse_live_external_registry_for_path() {
 	done
 }
 
+refuse_first_initialization_external_state() {
+	local candidate
+	local candidate_root
+	local candidate_checkout_identity
+	for candidate in "$STATE_ROOT"/*/registry.json; do
+		[[ -e "$candidate" ]] || continue
+		[[ -f "$candidate" && ! -L "$candidate" ]] || die "$EXIT_SCHEMA" "external registry candidate is not a regular file: $candidate. Preserve it for inspection."
+		jq -e '(.schema_version == 2 or .schema_version == 3) and (.registry == "luna-local-review-loop") and (.repository_root | type == "string" and length > 0) and (.workers | type == "array")' "$candidate" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "external registry candidate cannot be validated safely during first-initialization recovery: $candidate. Preserve it for inspection."
+		candidate_root="$(jq -r '.repository_root' "$candidate")" || die "$EXIT_SCHEMA" "cannot inspect external registry repository root: $candidate."
+		candidate_checkout_identity="$(jq -r '.repository_checkout_identity // empty' "$candidate")" || die "$EXIT_SCHEMA" "cannot inspect external registry checkout identity: $candidate."
+		if [[ "$candidate_root" == "$REPO_ROOT" || "$candidate_checkout_identity" == "$REPO_CHECKOUT_IDENTITY" ]]; then
+			die "$EXIT_REPOSITORY" "first-initialization recovery found external registry state without its authoritative Git locator: $candidate. Restore the locator from recovery evidence; normal initialization will not guess ownership."
+		fi
+	done
+}
+
+resume_first_initialization_without_locator() {
+	[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_FILESYSTEM" "the Git-directory instance marker exists but its authoritative registry locator is missing: $REGISTRY_LOCATOR_PATH. Recovery-only initialization will not invent a locator or registry; restore the locator from recovery evidence or use normal initialization after authority inspection proves no durable state owns this checkout."
+	[[ ! -e "$AUTHORITY_PATH" && ! -L "$AUTHORITY_PATH" ]] || die "$EXIT_FILESYSTEM" "the Git-directory instance marker exists but its authoritative registry locator is missing: $REGISTRY_LOCATOR_PATH. Durable checkout authority already exists; restore the locator and registry relationship from recovery evidence before retrying."
+	require_project_skills
+	REPO_IDENTITY="$(repository_instance_identity 0)" || die "$EXIT_REPOSITORY" "cannot read the Git-directory instance marker while recovering first initialization for $REPO_ROOT. Preserve external state and inspect the repository before retrying."
+	resolve_state_root
+	refuse_first_initialization_external_state
+	refuse_live_external_registry_for_path
+	refuse_live_legacy_registry
+}
+
 resolve_registry_location() {
 	local candidate
 	local candidate_dir
@@ -833,10 +860,14 @@ REPO_CHECKOUT_IDENTITY="$(repository_checkout_identity)" || die "$EXIT_REPOSITOR
 resolve_authority_root
 inspect_checkout_authority
 if ! read_registry_locator; then
-	if [[ ! -e "$REGISTRY_LOCATOR_PATH" ]] && [[ -e "$INSTANCE_MARKER_PATH" || -L "$INSTANCE_MARKER_PATH" ]]; then
-		die "$EXIT_FILESYSTEM" "the Git-directory instance marker exists but its authoritative registry locator is missing: $REGISTRY_LOCATOR_PATH. Restore the locator from recovery evidence; do not initialize another state root for this checkout."
+	if [[ ! -e "$REGISTRY_LOCATOR_PATH" && ! -L "$REGISTRY_LOCATOR_PATH" ]] && [[ -e "$INSTANCE_MARKER_PATH" || -L "$INSTANCE_MARKER_PATH" ]]; then
+		if [[ -f "$INSTANCE_MARKER_PATH" && ! -L "$INSTANCE_MARKER_PATH" && ! -e "$AUTHORITY_PATH" && ! -L "$AUTHORITY_PATH" ]]; then
+			resume_first_initialization_without_locator
+		else
+			die "$EXIT_FILESYSTEM" "the Git-directory instance marker exists but its authoritative registry locator is missing: $REGISTRY_LOCATOR_PATH. Restore the locator from recovery evidence; do not initialize another state root for this checkout."
+		fi
 	fi
-	resolve_state_root
+	[[ -n "$STATE_ROOT" ]] || resolve_state_root
 else
 	STATE_ROOT_INPUT="$STATE_ROOT"
 	validate_state_root_candidate

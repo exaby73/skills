@@ -192,7 +192,17 @@ if [[ " $* " == *' exec resume '* ]]; then
     outcome='completed'
     parent_action='null'
   fi
-  validators='[]'
+	validators='[]'
+	if [[ "$outcome" == 'completed' ]]; then
+		validators='[{"command":"validator","status":"passed","evidence":"passed evidence"}]'
+		if [[ "${FAKE_EMPTY_COMPLETED_VALIDATORS:-0}" == '1' ]]; then
+			validators='[]'
+		elif [[ "${FAKE_BLANK_COMPLETED_COMMAND:-0}" == '1' ]]; then
+			validators='[{"command":"","status":"passed","evidence":"passed evidence"}]'
+		elif [[ "${FAKE_BLANK_COMPLETED_EVIDENCE:-0}" == '1' ]]; then
+			validators='[{"command":"validator","status":"passed","evidence":""}]'
+		fi
+	fi
   unresolved='[]'
   if [[ "${FAKE_FAILED_COMPLETED:-0}" == '1' ]]; then
     validators='[{"command":"validator","status":"failed","evidence":"failed evidence"}]'
@@ -388,6 +398,50 @@ chmod 0600 "$pending_git_dir/luna-local-review-loop.registry"
 resolved_pending_registry="$($INIT_SCRIPT --repo "$pending_repo" --state-root "$pending_state" --print-path)"
 [[ "$resolved_pending_registry" == "$pending_registry" && -f "$pending_registry" ]] || fail 'pending locator did not recover its interrupted initial registry creation'
 jq -e '.registry_state == "ready"' "$pending_git_dir/luna-local-review-loop.registry" >/dev/null || fail 'recovered pending locator was not promoted to ready'
+
+interrupted_repo="$TEST_ROOT/interrupted-initialization-repo"
+interrupted_state="$TEST_ROOT/interrupted-initialization-state"
+mkdir -p "$interrupted_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$interrupted_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$interrupted_repo/.agents/skills/caveman"
+git -C "$interrupted_repo" init -q
+interrupted_git_dir="$(git -C "$interrupted_repo" rev-parse --absolute-git-dir)"
+interrupted_marker="$interrupted_git_dir/luna-local-review-loop.instance"
+interrupted_locator="$interrupted_git_dir/luna-local-review-loop.registry"
+printf '%064d\n' 1 >"$interrupted_marker"
+interrupted_marker_contents="$(cat "$interrupted_marker")"
+if "$INIT_SCRIPT" --existing-path --repo "$interrupted_repo" --state-root "$interrupted_state" >"$TEST_ROOT/interrupted-existing-only.out" 2>&1; then
+	fail 'recovery-only init invented state for a marker-only interrupted initialization'
+fi
+rg -F 'instance marker exists but its authoritative registry locator is missing' "$TEST_ROOT/interrupted-existing-only.out" >/dev/null || fail 'recovery-only marker-only refusal lacked locator evidence'
+[[ ! -e "$interrupted_locator" && ! -e "$interrupted_state" ]] || fail 'recovery-only marker-only init created state'
+interrupted_repo_real="$(cd -P "$interrupted_repo" && pwd -P)"
+interrupted_authority_key="$(printf '%s\n' "$interrupted_repo_real" | shasum -a 256 | awk '{print $1}')"
+interrupted_authority="$AUTHORITY_ROOT/$interrupted_authority_key.json"
+interrupted_missing_target="$interrupted_state/damaged/registry.json"
+jq -nc --arg root "$interrupted_repo_real" --arg registry_path "$interrupted_missing_target" '{registry_path:$registry_path, repository_root:$root}' >"$interrupted_authority"
+chmod 0600 "$interrupted_authority"
+if "$INIT_SCRIPT" --repo "$interrupted_repo" --state-root "$interrupted_state" >"$TEST_ROOT/interrupted-damaged-authority.out" 2>&1; then
+	fail 'normal init resumed marker-only initialization despite damaged durable authority'
+fi
+rg -F 'checkout authority registry target is missing' "$TEST_ROOT/interrupted-damaged-authority.out" >/dev/null || fail 'damaged marker-only authority refusal lacked recovery evidence'
+[[ ! -e "$interrupted_locator" && ! -e "$interrupted_state" ]] || fail 'damaged marker-only authority refusal created state'
+rm "$interrupted_authority"
+interrupted_conflict_dir="$interrupted_state/conflicting-registry"
+mkdir -p "$interrupted_conflict_dir"
+chmod 0700 "$interrupted_state" "$interrupted_conflict_dir"
+interrupted_conflict_registry="$interrupted_conflict_dir/registry.json"
+jq --arg root "$interrupted_repo_real" '.repository_root = $root | .workers = []' "$registry_path" >"$interrupted_conflict_registry"
+if "$INIT_SCRIPT" --repo "$interrupted_repo" --state-root "$interrupted_state" >"$TEST_ROOT/interrupted-conflicting-state.out" 2>&1; then
+	fail 'normal init guessed ownership of conflicting marker-only external state'
+fi
+rg -F 'first-initialization recovery found external registry state without its authoritative Git locator' "$TEST_ROOT/interrupted-conflicting-state.out" >/dev/null || fail 'conflicting marker-only state refusal lacked recovery evidence'
+[[ ! -e "$interrupted_locator" ]] || fail 'conflicting marker-only state refusal published a locator'
+rm -rf "$interrupted_state"
+interrupted_registry="$($INIT_SCRIPT --repo "$interrupted_repo" --state-root "$interrupted_state" --print-path)"
+[[ -f "$interrupted_registry" && -f "$interrupted_locator" ]] || fail 'normal init did not resume a safe marker-only first initialization'
+jq -e '.registry_state == "ready"' "$interrupted_locator" >/dev/null || fail 'resumed marker-only initialization did not publish a ready locator'
+[[ "$(cat "$interrupted_marker")" == "$interrupted_marker_contents" ]] || fail 'marker-only recovery replaced the real instance marker'
 
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy --scope 'recover external state after legacy registry reappears' >/dev/null
 registry_checkout_identity="$(jq -r '.repository_checkout_identity' "$registry_path")"
@@ -1031,7 +1085,7 @@ jq -e '.outcome == "completed"' <<<"$slow_tracker_output" >/dev/null || fail 'ru
 [[ -e "$slow_ps_marker" ]] || fail 'slow tracker fixture did not delay its initial process snapshot'
 
 runner_output="$(cd "$TEST_ROOT" && CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-worker --scope 'one fast task' --prompt-file task.txt 2>"$TEST_ROOT/runner.err")"
-jq -e '.outcome == "completed" and .summary == "worker concise result"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output'
+jq -e '.outcome == "completed" and .summary == "worker concise result" and (.validators | length == 1) and .validators[0].status == "passed"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output with valid completion evidence'
 "$REGISTRY_SCRIPT" assert-no-active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'completed worker was not atomically retired'
 jq -e 'any(.identity_ledger[]; .task_id == "fast-worker" and (.session_id | startswith("01fake-session-")) and .status == "retired" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'fast worker identity/result was not retained'
 
@@ -1136,6 +1190,18 @@ if FAKE_UNRESOLVED_COMPLETED=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launc
 	fail 'runner retired a completed result with unresolved work'
 fi
 jq -e 'any(.identity_ledger[]; .task_id == "invalid-completed-unresolved" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'unresolved completed result was not left retryable as failed'
+if FAKE_EMPTY_COMPLETED_VALIDATORS=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-completed-empty-validators --scope 'reject completed result without validators' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/invalid-completed-empty-validators.out" 2>&1; then
+	fail 'runner retired a completed result without validators'
+fi
+jq -e 'any(.identity_ledger[]; .task_id == "invalid-completed-empty-validators" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'empty completed validators were not left retryable as failed'
+if FAKE_BLANK_COMPLETED_COMMAND=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-completed-blank-command --scope 'reject completed result with blank validator command' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/invalid-completed-blank-command.out" 2>&1; then
+	fail 'runner retired a completed result with a blank validator command'
+fi
+jq -e 'any(.identity_ledger[]; .task_id == "invalid-completed-blank-command" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'blank completed validator command was not left retryable as failed'
+if FAKE_BLANK_COMPLETED_EVIDENCE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id invalid-completed-blank-evidence --scope 'reject completed result with blank validator evidence' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/invalid-completed-blank-evidence.out" 2>&1; then
+	fail 'runner retired a completed result with blank validator evidence'
+fi
+jq -e 'any(.identity_ledger[]; .task_id == "invalid-completed-blank-evidence" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'blank completed validator evidence was not left retryable as failed'
 
 if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing --session-id nope --handle process-123 >/dev/null 2>&1; then
 	fail 'ambiguous process handle argument was accepted'
@@ -1143,13 +1209,13 @@ fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
 resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 13 ]] || fail "expected thirteen exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 16 ]] || fail "expected sixteen exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 26 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 32 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
-[[ "$read_only_count" -eq 13 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
+[[ "$read_only_count" -eq 16 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 13 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 16 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
 [[ "$read_only_resume_count" -eq 3 ]] || fail "expected read-only sandbox on retry and both continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then

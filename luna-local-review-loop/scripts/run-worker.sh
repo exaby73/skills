@@ -686,12 +686,12 @@ validate_result() {
     and (.outcome == "completed" or .outcome == "blocked" or .outcome == "needs_parent_action")
     and (.summary | type == "string" and length > 0)
     and (.changedFiles | type == "array" and all(.[]; type == "string"))
-    and (.validators | type == "array" and all(.[]; (.command | type == "string") and (.status == "passed" or .status == "failed" or .status == "not_run") and (.evidence | type == "string")))
+    and (.validators | type == "array" and all(.[]; (.command | type == "string" and length > 0) and (.status == "passed" or .status == "failed" or .status == "not_run") and (.evidence | type == "string" and length > 0)))
     and (.unresolved | type == "array" and all(.[]; type == "string"))
     and (if .outcome == "needs_parent_action"
          then (.parentAction | type == "string" and length > 0)
          elif .outcome == "completed"
-         then .parentAction == null and (.unresolved | length == 0) and all(.validators[]; .status == "passed")
+         then .parentAction == null and (.unresolved | length == 0) and (.validators | length > 0) and all(.validators[]; .status == "passed")
          else .parentAction == null
          end)
   ' "$result_path" >/dev/null
