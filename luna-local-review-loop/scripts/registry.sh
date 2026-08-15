@@ -10,7 +10,10 @@ readonly EXIT_NOT_FOUND=7
 readonly EXIT_LOCK=9
 readonly EXIT_FILESYSTEM=10
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || SCRIPT_DIR='.'
+[[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR='/'
+SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd -P)"
 readonly SCRIPT_DIR
 readonly INIT_SCRIPT="$SCRIPT_DIR/init.sh"
 
@@ -67,9 +70,9 @@ readonly TRANSITION_SCHEMA_FILTER='
       and (($worker.retry_of == null) or ($worker.retry_of | safe_identity))
       and (.status == "reserved" or .status == "bound" or .status == "active")
       and (($worker.invocation_pid == null and $worker.invocation_token == null and $worker.invocation_instance == null)
-           or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | process_instance)))
+           or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | safe_identity) and ($worker.invocation_instance | process_instance)))
       and (($worker.active_child_pgid == null and $worker.active_child_instance == null)
-           or (($worker.active_child_pgid | positive_pid) and ($worker.active_child_instance | process_instance) and ($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | process_instance)))
+           or (($worker.active_child_pgid | positive_pid) and ($worker.active_child_instance | process_instance) and ($worker.invocation_pid | positive_pid) and ($worker.invocation_token | safe_identity) and ($worker.invocation_instance | process_instance)))
       and any($root.identity_ledger[];
         .task_id == $worker.task_id
         and .scope == $worker.scope

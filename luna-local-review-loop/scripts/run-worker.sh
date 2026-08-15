@@ -8,7 +8,10 @@ readonly EXIT_PREREQUISITE=3
 readonly EXIT_RUNTIME_STATE=11
 readonly EXIT_WORKER=12
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || SCRIPT_DIR='.'
+[[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR='/'
+SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd -P)"
 readonly SCRIPT_DIR
 readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
 readonly RESULT_SCHEMA="$SCRIPT_DIR/../references/worker-result.schema.json"

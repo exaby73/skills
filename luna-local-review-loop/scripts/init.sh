@@ -3,7 +3,10 @@
 set -euo pipefail
 umask 077
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || SCRIPT_DIR='.'
+[[ -n "$SCRIPT_DIR" ]] || SCRIPT_DIR='/'
+SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd -P)"
 readonly SCRIPT_DIR
 
 readonly EXIT_OK=0
@@ -103,9 +106,9 @@ readonly SCHEMA_FILTER='
         and ((.activated_at == null) or (.activated_at | nonempty_string))
         and (.checkpoint_evidence | type == "string")
         and ((.invocation_pid == null and .invocation_token == null and .invocation_instance == null)
-             or ((.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | process_instance)))
+             or ((.invocation_pid | positive_pid) and (.invocation_token | safe_identity) and (.invocation_instance | process_instance)))
         and ((.active_child_pgid == null and .active_child_instance == null)
-             or ((.active_child_pgid | positive_pid) and (.active_child_instance | process_instance) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | process_instance)))
+             or ((.active_child_pgid | positive_pid) and (.active_child_instance | process_instance) and (.invocation_pid | positive_pid) and (.invocation_token | safe_identity) and (.invocation_instance | process_instance)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
@@ -175,7 +178,7 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed)
+	local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
 		required_commands+=(od tr sort head)
 	fi

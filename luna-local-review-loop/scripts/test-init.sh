@@ -345,6 +345,11 @@ if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_s
 	fail 'schema accepted a malformed invocation process-start identity'
 fi
 cp "$pid_schema_registry.clean" "$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "invalid token" | .workers[0].invocation_instance = "ps:Thu Jan 1 00:00:00 1970"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-invocation-token.out" 2>&1; then
+	fail 'schema accepted an invocation token rejected by registry commands'
+fi
+cp "$pid_schema_registry.clean" "$pid_schema_registry"
 jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "ps:Thu Jan 1 00:00:00 1970" | .workers[0].active_child_pgid = "not-a-pgid" | .workers[0].active_child_instance = "ps:Thu Jan 1 00:00:00 1970"' "$pid_schema_registry.clean" >"$pid_schema_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-child-pgid.out" 2>&1; then
 	fail 'schema accepted a nonnumeric child process-group ID'
@@ -460,6 +465,16 @@ for recovery_optional_dependency in sort head; do
 	done
 	PATH="$dependency_bin" CODEX_BIN=codex "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$alternate_state_root" >/dev/null || fail "recovery required launch-only dependency: $recovery_optional_dependency"
 done
+rm -rf "$dependency_bin"
+mkdir "$dependency_bin"
+for dependency_command in "${dependency_commands[@]}"; do
+	[[ "$dependency_command" == dirname ]] && continue
+	ln -s "$(command -v "$dependency_command")" "$dependency_bin/$dependency_command"
+done
+if PATH="$dependency_bin" CODEX_BIN=codex "$REGISTRY_SCRIPT" path --repo "$REPO_ROOT" --state-root "$alternate_state_root" >"$TEST_ROOT/missing-dirname.out" 2>&1; then
+	fail 'registry recovery accepted a missing dirname prerequisite'
+fi
+rg -F 'missing runtime prerequisite(s): dirname' "$TEST_ROOT/missing-dirname.out" >/dev/null || fail 'registry recovery did not report its missing dirname prerequisite'
 
 if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$REPO_ROOT/.runtime/luna" >"$TEST_ROOT/project-state.out" 2>&1; then
 	fail 'init accepted a state root inside the repository'
