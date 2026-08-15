@@ -23,9 +23,9 @@
         "additionalProperties": false,
         "required": ["command", "status", "evidence"],
         "properties": {
-          "command": { "type": "string" },
+          "command": { "type": "string", "minLength": 1 },
           "status": { "type": "string", "enum": ["passed", "failed", "not_run"] },
-          "evidence": { "type": "string" }
+          "evidence": { "type": "string", "minLength": 1 }
         }
       }
     },
