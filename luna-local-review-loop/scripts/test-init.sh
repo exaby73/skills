@@ -39,10 +39,6 @@ cleanup_test_root() {
 	if [[ -n "${hard_killed_child_pgid:-}" ]]; then
 		kill -TERM -- "-$hard_killed_child_pgid" 2>/dev/null || true
 	fi
-	if [[ -n "${fixture_watchdog_pid:-}" ]]; then
-		kill -TERM "$fixture_watchdog_pid" 2>/dev/null || true
-		wait "$fixture_watchdog_pid" 2>/dev/null || true
-	fi
 	if [[ "${KEEP_TEST_ROOT:-0}" == '1' ]]; then
 		printf 'Preserved test root: %s\n' "$TEST_ROOT" >&2
 	else
@@ -56,17 +52,9 @@ wait_for_blocking_fixture() {
 	local child_pid_file="$2"
 	local descendant_pid_file="$3"
 	local label="$4"
-	(
-		sleep 30
-		kill -TERM "$runner_pid" 2>/dev/null || true
-	) &
-	fixture_watchdog_pid=$!
 	while process_is_live_non_zombie "$runner_pid" && [[ ! -s "$child_pid_file" || ! -s "$descendant_pid_file" ]]; do
 		sleep 0.05
 	done
-	kill -TERM "$fixture_watchdog_pid" 2>/dev/null || true
-	wait "$fixture_watchdog_pid" 2>/dev/null || true
-	fixture_watchdog_pid=''
 	if [[ ! -s "$child_pid_file" || ! -s "$descendant_pid_file" ]]; then
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
