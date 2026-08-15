@@ -25,6 +25,7 @@ REPO_IDENTITY=''
 REPO_CHECKOUT_IDENTITY=''
 GIT_DIR_REAL=''
 REGISTRY_LOCATOR_PATH=''
+INSTANCE_MARKER_PATH=''
 STATE_ROOT=''
 REGISTRY_DIR=''
 REGISTRY_PATH=''
@@ -211,6 +212,7 @@ resolve_git_admin() {
 	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || die "$EXIT_REPOSITORY" "cannot locate the Git administration directory for $REPO_ROOT."
 	GIT_DIR_REAL="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve the Git administration directory for $REPO_ROOT."
 	REGISTRY_LOCATOR_PATH="$GIT_DIR_REAL/luna-local-review-loop.registry"
+	INSTANCE_MARKER_PATH="$GIT_DIR_REAL/luna-local-review-loop.instance"
 }
 
 resolve_state_root() {
@@ -320,6 +322,7 @@ repository_checkout_identity() {
 	local backlink_name=''
 	local backlink_real=''
 	local expected_backlink=''
+	local ordinary_git_dir=''
 	local checkout_identity=''
 	if [[ -e "$GIT_DIR_REAL/gitdir" || -L "$GIT_DIR_REAL/gitdir" ]]; then
 		[[ -f "$GIT_DIR_REAL/gitdir" && ! -L "$GIT_DIR_REAL/gitdir" ]] || return 1
@@ -336,6 +339,10 @@ repository_checkout_identity() {
 		backlink_real="$backlink_parent/$backlink_name"
 		expected_backlink="$REPO_ROOT/.git"
 		[[ -f "$expected_backlink" && ! -L "$expected_backlink" && "$backlink_real" == "$expected_backlink" ]] || return 1
+	else
+		[[ -d "$REPO_ROOT/.git" && ! -L "$REPO_ROOT/.git" ]] || return 1
+		ordinary_git_dir="$(cd -P "$REPO_ROOT/.git" 2>/dev/null && pwd -P)" || return 1
+		[[ "$ordinary_git_dir" == "$GIT_DIR_REAL" ]] || return 1
 	fi
 	if checkout_identity="$(stat -f '%d:%i' "$GIT_DIR_REAL" 2>/dev/null)"; then
 		:
@@ -352,7 +359,7 @@ repository_instance_identity() {
 	local allow_create="$1"
 	local marker_path
 	local nonce=''
-	marker_path="$GIT_DIR_REAL/luna-local-review-loop.instance"
+	marker_path="$INSTANCE_MARKER_PATH"
 	[[ ! -L "$marker_path" ]] || return 1
 	if [[ ! -e "$marker_path" ]]; then
 		[[ "$allow_create" -eq 1 ]] || return 1
@@ -633,6 +640,9 @@ resolve_git_admin
 validate_state_root_candidate
 REPO_CHECKOUT_IDENTITY="$(repository_checkout_identity)" || die "$EXIT_REPOSITORY" "cannot identify the physical Git checkout for $REPO_ROOT. Preserve external state and inspect the repository before retrying."
 if ! read_registry_locator; then
+	if [[ ! -e "$REGISTRY_LOCATOR_PATH" ]] && [[ -e "$INSTANCE_MARKER_PATH" || -L "$INSTANCE_MARKER_PATH" ]]; then
+		die "$EXIT_FILESYSTEM" "the Git-directory instance marker exists but its authoritative registry locator is missing: $REGISTRY_LOCATOR_PATH. Restore the locator from recovery evidence; do not initialize another state root for this checkout."
+	fi
 	resolve_state_root
 fi
 if [[ "$EXISTING_ONLY" -eq 0 ]]; then

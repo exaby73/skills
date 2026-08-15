@@ -233,6 +233,18 @@ mv "$registry_path.tmp" "$registry_path"
 jq -e '.schema_version == 3 and .workers == []' "$registry_path" >/dev/null || fail 'empty schema version 2 registry was not migrated safely'
 instance_marker="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/luna-local-review-loop.instance"
 [[ -f "$instance_marker" && ! -L "$instance_marker" ]] || fail 'init did not create a durable Git-directory instance marker'
+registry_locator="${instance_marker%/*}/luna-local-review-loop.registry"
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-locator-worker --scope 'refuse missing authoritative locator fallback' >/dev/null
+cp "$registry_locator" "$TEST_ROOT/registry-locator.backup"
+rm "$registry_locator"
+missing_locator_state="$TEST_ROOT/missing-locator-state"
+if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$missing_locator_state" >"$TEST_ROOT/missing-locator.out" 2>&1; then
+	fail 'init replaced a missing authoritative locator with a second registry'
+fi
+rg -F 'instance marker exists but its authoritative registry locator is missing' "$TEST_ROOT/missing-locator.out" >/dev/null || fail 'missing locator refusal lacked recovery evidence'
+[[ ! -e "$missing_locator_state" ]] || fail 'missing locator fallback created a second state root'
+mv "$TEST_ROOT/registry-locator.backup" "$registry_locator"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-locator-worker --status interrupted --evidence 'missing locator test complete' >/dev/null
 [[ "$(cat "$instance_marker")" =~ ^[0-9a-f]{64}$ ]] || fail 'repository instance marker is malformed'
 
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy --scope 'recover external state after legacy registry reappears' >/dev/null
@@ -417,6 +429,26 @@ fi
 linked_worktree_real="$(cd -P "$linked_worktree" && pwd -P)"
 jq -e --arg root "$linked_worktree_real" '.repository_root == $root and any(.workers[]; .task_id == "linked-live-worker")' "$linked_registry" >/dev/null || fail 'copied linked-worktree alias rewrote or abandoned original live state'
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$linked_worktree" --state-root "$linked_state" --task-id linked-live-worker --status interrupted --evidence 'linked-worktree alias test complete' >/dev/null
+
+ordinary_repo="$TEST_ROOT/ordinary-repo"
+ordinary_alias="$TEST_ROOT/ordinary-alias"
+ordinary_state="$TEST_ROOT/ordinary-state"
+mkdir -p "$ordinary_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$ordinary_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$ordinary_repo/.agents/skills/caveman"
+git -C "$ordinary_repo" init -q
+ordinary_registry="$($INIT_SCRIPT --repo "$ordinary_repo" --state-root "$ordinary_state" --print-path)"
+"$REGISTRY_SCRIPT" reserve --repo "$ordinary_repo" --state-root "$ordinary_state" --task-id ordinary-live-worker --scope 'reject ordinary checkout Git-directory aliases' >/dev/null
+mkdir -p "$ordinary_alias"
+cp -R "$ordinary_repo/.agents" "$ordinary_alias/.agents"
+ln -s "$ordinary_repo/.git" "$ordinary_alias/.git"
+if "$INIT_SCRIPT" --repo "$ordinary_alias" --state-root "$ordinary_state" >"$TEST_ROOT/ordinary-git-alias.out" 2>&1; then
+	fail 'init accepted an ordinary checkout alias to another repository Git directory'
+fi
+rg -F 'cannot identify the physical Git checkout' "$TEST_ROOT/ordinary-git-alias.out" >/dev/null || fail 'ordinary Git-directory alias refusal lacked checkout evidence'
+ordinary_repo_real="$(cd -P "$ordinary_repo" && pwd -P)"
+jq -e --arg root "$ordinary_repo_real" '.repository_root == $root and any(.workers[]; .task_id == "ordinary-live-worker")' "$ordinary_registry" >/dev/null || fail 'ordinary Git-directory alias rewrote or abandoned original live state'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$ordinary_repo" --state-root "$ordinary_state" --task-id ordinary-live-worker --status interrupted --evidence 'ordinary Git-directory alias test complete' >/dev/null
 
 identity_repo="$TEST_ROOT/identity-repo"
 identity_state="$TEST_ROOT/identity-state"
