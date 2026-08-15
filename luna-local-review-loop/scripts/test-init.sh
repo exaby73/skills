@@ -209,8 +209,8 @@ state_root_real="$(cd "$STATE_ROOT" && pwd -P)"
 [[ ! -e "$REPO_ROOT/.agents/agent-registry" ]] || fail 'init created project-local registry state'
 [[ ! -e "$REPO_ROOT/.gitignore" ]] || fail 'init modified repository ignore rules'
 [[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'init modified repository files'
-jq -e '.schema_version == 3 and (.repository_identity | type == "string" and length > 0) and .workers == [] and .identity_ledger == []' "$registry_path" >/dev/null || fail 'new registry schema is invalid'
-jq '.schema_version = 2' "$registry_path" >"$registry_path.tmp"
+jq -e '.schema_version == 3 and (.repository_identity | type == "string" and length > 0) and (.repository_checkout_identity | type == "string" and length > 0) and .workers == [] and .identity_ledger == []' "$registry_path" >/dev/null || fail 'new registry schema is invalid'
+jq '.schema_version = 2 | del(.repository_checkout_identity)' "$registry_path" >"$registry_path.tmp"
 mv "$registry_path.tmp" "$registry_path"
 "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null
 jq -e '.schema_version == 3 and .workers == []' "$registry_path" >/dev/null || fail 'empty schema version 2 registry was not migrated safely'
@@ -219,13 +219,14 @@ instance_marker="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/luna-local-
 [[ "$(cat "$instance_marker")" =~ ^[0-9a-f]{64}$ ]] || fail 'repository instance marker is malformed'
 
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id external-recovery-with-legacy --scope 'recover external state after legacy registry reappears' >/dev/null
-jq '.schema_version = 2' "$registry_path" >"$registry_path.tmp"
+registry_checkout_identity="$(jq -r '.repository_checkout_identity' "$registry_path")"
+jq '.schema_version = 2 | del(.repository_checkout_identity)' "$registry_path" >"$registry_path.tmp"
 mv "$registry_path.tmp" "$registry_path"
 if "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/live-v2-migration.out" 2>&1; then
 	fail 'schema migration abandoned a live version 2 worker'
 fi
 rg -F 'schema version 2 registry contains 1 live worker' "$TEST_ROOT/live-v2-migration.out" >/dev/null || fail 'live version 2 migration refusal lacked recovery evidence'
-jq '.schema_version = 3' "$registry_path" >"$registry_path.tmp"
+jq --arg checkout_identity "$registry_checkout_identity" '.schema_version = 3 | .repository_checkout_identity = $checkout_identity' "$registry_path" >"$registry_path.tmp"
 mv "$registry_path.tmp" "$registry_path"
 mkdir -p "$REPO_ROOT/.agents/agent-registry"
 cat >"$REPO_ROOT/.agents/agent-registry/registry.json" <<EOF
@@ -276,7 +277,7 @@ duplicate_scope_registry="$($INIT_SCRIPT --repo "$duplicate_scope_repo" --state-
 "$REGISTRY_SCRIPT" reserve --repo "$duplicate_scope_repo" --state-root "$duplicate_scope_state" --task-id scope-owner-a --scope 'duplicate live scope' >/dev/null
 jq --arg timestamp "$schema_timestamp" '
   .identity_ledger += [{task_id:"scope-owner-b", scope:"duplicate live scope", sandbox:"workspace-write", retry_of:null, session_id:null, status:"reserved", reserved_at:$timestamp, bound_at:null, activated_at:null, terminal_at:null, retired_at:null, terminal_status:null, terminal_evidence:""}]
-  | .workers += [{task_id:"scope-owner-b", scope:"duplicate live scope", sandbox:"workspace-write", retry_of:null, session_id:null, status:"reserved", created_at:$timestamp, updated_at:$timestamp, bound_at:null, activated_at:null, checkpoint_evidence:"", invocation_pid:null, invocation_token:null, invocation_instance:null, active_child_pgid:null}]
+  | .workers += [{task_id:"scope-owner-b", scope:"duplicate live scope", sandbox:"workspace-write", retry_of:null, session_id:null, status:"reserved", created_at:$timestamp, updated_at:$timestamp, bound_at:null, activated_at:null, checkpoint_evidence:"", invocation_pid:null, invocation_token:null, invocation_instance:null, active_child_pgid:null, active_child_instance:null}]
 ' "$duplicate_scope_registry" >"$duplicate_scope_registry.tmp"
 mv "$duplicate_scope_registry.tmp" "$duplicate_scope_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$duplicate_scope_repo" --state-root "$duplicate_scope_state" >"$TEST_ROOT/duplicate-scope.out" 2>&1; then
@@ -302,9 +303,14 @@ if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_s
 	fail 'schema accepted an invocation claim without process-start identity'
 fi
 cp "$pid_schema_registry.clean" "$pid_schema_registry"
-jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "instance" | .workers[0].active_child_pgid = "not-a-pgid"' "$pid_schema_registry.clean" >"$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "instance" | .workers[0].active_child_pgid = "not-a-pgid" | .workers[0].active_child_instance = "instance"' "$pid_schema_registry.clean" >"$pid_schema_registry"
 if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/malformed-child-pgid.out" 2>&1; then
 	fail 'schema accepted a nonnumeric child process-group ID'
+fi
+cp "$pid_schema_registry.clean" "$pid_schema_registry"
+jq '.workers[0].invocation_pid = "123" | .workers[0].invocation_token = "owner" | .workers[0].invocation_instance = "instance" | .workers[0].active_child_pgid = "123" | .workers[0].active_child_instance = null' "$pid_schema_registry.clean" >"$pid_schema_registry"
+if "$INIT_SCRIPT" --existing-path --repo "$pid_schema_repo" --state-root "$pid_schema_state" >"$TEST_ROOT/missing-child-instance.out" 2>&1; then
+	fail 'schema accepted a child process group without leader process-start identity'
 fi
 cp "$pid_schema_registry.clean" "$pid_schema_registry"
 
@@ -317,7 +323,15 @@ cp -R "$REPO_ROOT/.agents/skills/caveman" "$moved_repo/.agents/skills/caveman"
 git -C "$moved_repo" init -q
 moved_registry="$($INIT_SCRIPT --repo "$moved_repo" --state-root "$moved_state" --print-path)"
 "$REGISTRY_SCRIPT" reserve --repo "$moved_repo" --state-root "$moved_state" --task-id moved-checkout-worker --scope 'preserve live state across repository move' >/dev/null
+moved_marker_contents="$(cat "$moved_repo/.git/luna-local-review-loop.instance")"
 mv "$moved_repo" "$moved_repo_new"
+rm "$moved_repo_new/.git/luna-local-review-loop.instance"
+if "$INIT_SCRIPT" --repo "$moved_repo_new" --state-root "$moved_state" >"$TEST_ROOT/moved-missing-marker.out" 2>&1; then
+	fail 'moved checkout with a missing marker abandoned its live external registry'
+fi
+rg -F 'instance marker is missing while 1 live worker(s) remain for this checkout' "$TEST_ROOT/moved-missing-marker.out" >/dev/null || fail 'moved missing-marker refusal lacked path-independent checkout evidence'
+[[ ! -e "$moved_repo_new/.git/luna-local-review-loop.instance" ]] || fail 'moved missing-marker refusal created a replacement marker'
+printf '%s\n' "$moved_marker_contents" >"$moved_repo_new/.git/luna-local-review-loop.instance"
 moved_registry_after="$($INIT_SCRIPT --existing-path --repo "$moved_repo_new" --state-root "$moved_state")"
 [[ "$moved_registry_after" == "$moved_registry" ]] || fail 'repository move selected a new external registry'
 moved_repo_new_real="$(cd -P "$moved_repo_new" && pwd -P)"
@@ -376,6 +390,21 @@ fi
 rg -F 'Codex CLI not found' "$TEST_ROOT/missing-codex.out" >/dev/null || fail 'normal init did not report the missing Codex CLI'
 CODEX_BIN="$TEST_ROOT/missing-codex" "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'recovery-only init unexpectedly required Codex'
 
+dependency_bin="$TEST_ROOT/dependency-bin"
+dependency_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sort head sed od tr codex)
+for missing_dependency in sort head sed; do
+	rm -rf "$dependency_bin"
+	mkdir "$dependency_bin"
+	for dependency_command in "${dependency_commands[@]}"; do
+		[[ "$dependency_command" == "$missing_dependency" ]] && continue
+		ln -s "$(command -v "$dependency_command")" "$dependency_bin/$dependency_command"
+	done
+	if PATH="$dependency_bin" CODEX_BIN=codex "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/missing-$missing_dependency.out" 2>&1; then
+		fail "normal init accepted missing runner dependency: $missing_dependency"
+	fi
+	rg -F "missing runtime prerequisite(s): $missing_dependency" "$TEST_ROOT/missing-$missing_dependency.out" >/dev/null || fail "init did not report missing runner dependency: $missing_dependency"
+done
+
 if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$REPO_ROOT/.runtime/luna" >"$TEST_ROOT/project-state.out" 2>&1; then
 	fail 'init accepted a state root inside the repository'
 fi
@@ -418,6 +447,10 @@ rm -rf "$lock_symlink_target"
 : >"$registry_dir/.lock"
 "$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'registry could not reclaim an ownerless atomic lock file'
 [[ ! -e "$registry_dir/.lock" ]] || fail 'ownerless atomic lock remained after recovery'
+
+printf '%s|%s\n' "$$" 'ps:stale-lock-owner-instance' >"$registry_dir/.lock"
+"$REGISTRY_SCRIPT" active --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >/dev/null || fail 'registry could not reclaim a lock after PID reuse'
+[[ ! -e "$registry_dir/.lock" ]] || fail 'PID-reused stale lock remained after recovery'
 
 sleep 0.01 &
 stale_lock_pid=$!
@@ -680,11 +713,13 @@ stale_owner_pid=$!
 kill "$stale_owner_pid" 2>/dev/null || true
 wait "$stale_owner_pid" 2>/dev/null || true
 stale_owner_pid=''
-stale_child_pid=99999999
-if process_is_live_non_zombie "$stale_child_pid"; then
-	fail 'chosen stale child PID unexpectedly belongs to a live process'
-fi
-"$REGISTRY_SCRIPT" record-child --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pgid "$stale_child_pid" --token stale-owner >/dev/null
+jq --arg pgid "$$" '
+  .workers |= map(if .task_id == "continued-worker"
+    then .active_child_pgid = $pgid | .active_child_instance = "ps:stale-child-group-instance"
+    else .
+    end)
+' "$registry_path" >"$registry_path.tmp"
+mv "$registry_path.tmp" "$registry_path"
 stale_tracker="$registry_dir/artifacts/continued-worker/.descendants-stale-owner.json"
 printf '%s\n' '{"status":"active","root_pid":99999999,"processes":[]}' >"$stale_tracker"
 if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token premature-reclaimer >"$TEST_ROOT/active-stale-tracker.out" 2>&1; then
@@ -714,7 +749,7 @@ if [[ "$claim_status_a" -eq 0 ]]; then
 else
 	winning_claim_token='contender-b'
 fi
-jq -e --arg token "$winning_claim_token" 'any(.workers[]; .task_id == "continued-worker" and .invocation_token == $token and .active_child_pgid == null)' "$registry_path" >/dev/null || fail 'atomic stale claim winner was not recorded or stale child process-group identity was retained'
+jq -e --arg token "$winning_claim_token" 'any(.workers[]; .task_id == "continued-worker" and .invocation_token == $token and .active_child_pgid == null and .active_child_instance == null)' "$registry_path" >/dev/null || fail 'atomic stale claim winner was not recorded or stale child process-group identity was retained'
 if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --prompt-file "$CONTINUE_FILE" >"$TEST_ROOT/concurrent.out" 2>&1; then
 	fail 'concurrent continuation bypassed the registry-backed invocation claim'
 fi
@@ -817,7 +852,7 @@ kill -KILL "$hard_killed_runner_pid"
 wait "$hard_killed_runner_pid" 2>/dev/null || true
 hard_killed_runner_pid=''
 process_group_has_live_non_zombie "$hard_killed_child_pgid" || fail 'hard-killed runner did not leave a live Codex process group for recovery test'
-jq -e --arg runner_pid "$hard_killed_owner_pid" --arg child_pgid "$hard_killed_child_pgid" 'any(.workers[]; .task_id == "hard-killed-worker" and .status == "active" and .invocation_pid == $runner_pid and .active_child_pgid == $child_pgid)' "$registry_path" >/dev/null || fail 'registry lost durable process-group identity after hard kill'
+jq -e --arg runner_pid "$hard_killed_owner_pid" --arg child_pgid "$hard_killed_child_pgid" 'any(.workers[]; .task_id == "hard-killed-worker" and .status == "active" and .invocation_pid == $runner_pid and .active_child_pgid == $child_pgid and (.active_child_instance | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'registry lost durable process-group identity after hard kill'
 if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hard-killed-worker --status interrupted --evidence 'must not retire live child' >"$TEST_ROOT/live-child-finish.out" 2>&1; then
 	fail 'recovery retired a task while its hard-kill-surviving process group was live'
 fi

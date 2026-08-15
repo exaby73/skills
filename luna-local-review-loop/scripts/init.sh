@@ -19,6 +19,7 @@ STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${TMPDIR:-/tmp}/luna-local-review-loop}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 REPO_ROOT=''
 REPO_IDENTITY=''
+REPO_CHECKOUT_IDENTITY=''
 STATE_ROOT=''
 REGISTRY_DIR=''
 REGISTRY_PATH=''
@@ -57,6 +58,7 @@ readonly SCHEMA_FILTER='
       and (.registry == "luna-local-review-loop")
       and (.repository_root | nonempty_string)
       and (.repository_identity | nonempty_string)
+      and (.repository_checkout_identity | nonempty_string)
       and (.created_at | nonempty_string)
       and (.updated_at | nonempty_string)
       and (.identity_ledger | type == "array")
@@ -96,8 +98,8 @@ readonly SCHEMA_FILTER='
         and (.checkpoint_evidence | type == "string")
         and ((.invocation_pid == null and .invocation_token == null and .invocation_instance == null)
              or ((.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | nonempty_string)))
-        and ((.active_child_pgid == null)
-             or ((.active_child_pgid | positive_pid) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | nonempty_string)))
+        and ((.active_child_pgid == null and .active_child_instance == null)
+             or ((.active_child_pgid | positive_pid) and (.active_child_instance | nonempty_string) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | nonempty_string)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
@@ -166,7 +168,7 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod)
+	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sort head sed)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
 		required_commands+=(od tr)
 	fi
@@ -211,8 +213,7 @@ resolve_paths() {
 	esac
 }
 
-repository_instance_identity() {
-	local allow_create="$1"
+repository_checkout_identity() {
 	local git_dir
 	local git_dir_real
 	local backlink=''
@@ -220,8 +221,6 @@ repository_instance_identity() {
 	local backlink_name=''
 	local backlink_real=''
 	local expected_backlink=''
-	local marker_path
-	local nonce=''
 	local checkout_identity=''
 	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
 	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
@@ -241,6 +240,25 @@ repository_instance_identity() {
 		expected_backlink="$REPO_ROOT/.git"
 		[[ -f "$expected_backlink" && ! -L "$expected_backlink" && "$backlink_real" == "$expected_backlink" ]] || return 1
 	fi
+	if checkout_identity="$(stat -f '%d:%i' "$git_dir_real" 2>/dev/null)"; then
+		:
+	elif checkout_identity="$(stat -c '%d:%i' "$git_dir_real" 2>/dev/null)"; then
+		:
+	else
+		return 1
+	fi
+	[[ "$checkout_identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+	printf '%s\n' "$checkout_identity"
+}
+
+repository_instance_identity() {
+	local allow_create="$1"
+	local git_dir
+	local git_dir_real
+	local marker_path
+	local nonce=''
+	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
 	marker_path="$git_dir_real/luna-local-review-loop.instance"
 	[[ ! -L "$marker_path" ]] || return 1
 	if [[ ! -e "$marker_path" ]]; then
@@ -256,15 +274,7 @@ repository_instance_identity() {
 	[[ -f "$marker_path" && ! -L "$marker_path" ]] || return 1
 	IFS= read -r nonce <"$marker_path" || return 1
 	[[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
-	if checkout_identity="$(stat -f '%d:%i' "$git_dir_real" 2>/dev/null)"; then
-		:
-	elif checkout_identity="$(stat -c '%d:%i' "$git_dir_real" 2>/dev/null)"; then
-		:
-	else
-		return 1
-	fi
-	[[ "$checkout_identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
-	printf '%s\n%s\n' "$nonce" "$checkout_identity" | shasum -a 256 | awk '{print $1}'
+	printf '%s\n%s\n' "$nonce" "$REPO_CHECKOUT_IDENTITY" | shasum -a 256 | awk '{print $1}'
 }
 
 refuse_live_legacy_registry() {
@@ -283,13 +293,16 @@ refuse_live_legacy_registry() {
 
 refuse_live_external_registry_for_path() {
 	local candidate
+	local candidate_checkout_identity
 	local live_count
 	for candidate in "$STATE_ROOT"/*/registry.json; do
 		[[ -e "$candidate" ]] || continue
 		[[ -f "$candidate" && ! -L "$candidate" ]] || die "$EXIT_SCHEMA" "external registry candidate is not a regular file: $candidate. Preserve it for inspection."
-		if jq -e --arg root "$REPO_ROOT" '(.schema_version == 2 or .schema_version == 3) and .repository_root == $root and (.workers | type == "array")' "$candidate" >/dev/null 2>&1; then
+		candidate_checkout_identity="$(jq -r '.repository_checkout_identity // empty' "$candidate" 2>/dev/null)" || die "$EXIT_SCHEMA" "cannot inspect external registry checkout identity: $candidate."
+		if jq -e --arg root "$REPO_ROOT" '(.schema_version == 2 or .schema_version == 3) and (.repository_root | type == "string") and (.workers | type == "array")' "$candidate" >/dev/null 2>&1 \
+			&& { [[ "$(jq -r '.repository_root' "$candidate")" == "$REPO_ROOT" ]] || [[ -n "$candidate_checkout_identity" && "$candidate_checkout_identity" == "$REPO_CHECKOUT_IDENTITY" ]]; }; then
 			live_count="$(jq '.workers | length' "$candidate")"
-			[[ "$live_count" -eq 0 ]] || die "$EXIT_REPOSITORY" "the Git-directory instance marker is missing while $live_count live worker(s) remain for $REPO_ROOT in $candidate. Restore the original marker or retire those workers before initializing a replacement repository."
+			[[ "$live_count" -eq 0 ]] || die "$EXIT_REPOSITORY" "the Git-directory instance marker is missing while $live_count live worker(s) remain for this checkout in $candidate. Restore the original marker or retire those workers before initializing a replacement repository."
 		fi
 	done
 }
@@ -457,8 +470,9 @@ write_new_registry() {
 	jq -n \
 		--arg root "$REPO_ROOT" \
 		--arg identity "$REPO_IDENTITY" \
+		--arg checkout_identity "$REPO_CHECKOUT_IDENTITY" \
 		--arg timestamp "$timestamp" \
-		'{schema_version: 3, registry: "luna-local-review-loop", repository_root: $root, repository_identity: $identity, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' >"$temp_path"
+		'{schema_version: 3, registry: "luna-local-review-loop", repository_root: $root, repository_identity: $identity, repository_checkout_identity: $checkout_identity, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' >"$temp_path"
 	jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" 'new registry failed schema validation.'
 	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry permissions: $temp_path."
 	mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish registry: $REGISTRY_PATH."
@@ -480,7 +494,7 @@ migrate_v2_registry_if_safe() {
 	[[ "$live_count" -eq 0 ]] || die "$EXIT_SCHEMA" "schema version 2 registry contains $live_count live worker(s): $REGISTRY_PATH. Reinstall the previous skill version, retire those workers, verify the registry is empty, then rerun this version. The registry was not changed."
 	timestamp="$(now_utc)"
 	temp_path="$(mktemp "$REGISTRY_DIR/.registry-migration.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create registry migration file in $REGISTRY_DIR."
-	if ! jq --arg timestamp "$timestamp" '.schema_version = 3 | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
+	if ! jq --arg timestamp "$timestamp" --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" '.schema_version = 3 | .repository_checkout_identity = $checkout_identity | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
 		rm -f "$temp_path"
 		die "$EXIT_SCHEMA" "cannot prepare schema version 3 migration: $REGISTRY_PATH."
 	fi
@@ -526,6 +540,7 @@ if [[ "$EXISTING_ONLY" -eq 0 ]]; then
 	ALLOW_INSTANCE_MARKER_CREATE=1
 	require_project_skills
 fi
+REPO_CHECKOUT_IDENTITY="$(repository_checkout_identity)" || die "$EXIT_REPOSITORY" "cannot identify the physical Git checkout for $REPO_ROOT. Preserve external state and inspect the repository before retrying."
 REPO_IDENTITY="$(repository_instance_identity "$ALLOW_INSTANCE_MARKER_CREATE")" || die "$EXIT_REPOSITORY" "cannot read or safely create the Git-directory instance marker for $REPO_ROOT. This may be a different Git repository instance at the same path; preserve external state and inspect the repository before retrying."
 resolve_registry_location
 if [[ "$EXISTING_ONLY" -eq 0 && ! -e "$REGISTRY_PATH" ]]; then
@@ -542,6 +557,7 @@ if [[ -e "$REGISTRY_PATH" ]]; then
 	migrate_v2_registry_if_safe
 	jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 3 validation: $REGISTRY_PATH. Preserve it for investigation."
 	[[ "$(jq -r '.repository_identity' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_SCHEMA" "registry belongs to a different Git repository instance at $REPO_ROOT: $REGISTRY_PATH. Preserve live state and recover it only with the original checkout; after proving no live workers remain, remove or archive this external registry before initializing the replacement checkout."
+	[[ "$(jq -r '.repository_checkout_identity' "$REGISTRY_PATH")" == "$REPO_CHECKOUT_IDENTITY" ]] || die "$EXIT_SCHEMA" "registry belongs to a different physical Git checkout at $REPO_ROOT: $REGISTRY_PATH. Preserve live state and inspect the checkout before recovery."
 	if [[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" != "$REPO_ROOT" ]]; then
 		publish_repository_root_update
 	fi
