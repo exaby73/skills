@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2016 # jq programs intentionally use single-quoted $variables.
+# shellcheck disable=SC2016,SC2034,SC1091 # jq uses literal variables; sourced lock helpers consume shared globals.
 set -euo pipefail
 umask 077
 
@@ -29,9 +29,10 @@ ALLOW_INSTANCE_MARKER_CREATE=0
 
 readonly SCHEMA_FILTER='
   def nonempty_string: type == "string" and length > 0;
+  def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
-  def nullable_string: . == null or (. | nonempty_string);
+  def nullable_identity: . == null or (. | safe_identity);
   def nullable_session: . == null or (. | safe_session);
   def valid_status($status): ["reserved", "bound", "active", "retired"] | index($status) != null;
   def valid_terminal($status): ["completed", "failed", "blocked", "interrupted"] | index($status) != null;
@@ -52,7 +53,7 @@ readonly SCHEMA_FILTER='
     );
   . as $root
   | try (
-      (.schema_version == 2)
+      (.schema_version == 3)
       and (.registry == "luna-local-review-loop")
       and (.repository_root | nonempty_string)
       and (.repository_identity | nonempty_string)
@@ -61,10 +62,10 @@ readonly SCHEMA_FILTER='
       and (.identity_ledger | type == "array")
       and (.workers | type == "array")
       and all($root.identity_ledger[];
-        (.task_id | nonempty_string)
+        (.task_id | safe_identity)
         and (.scope | nonempty_string)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
-        and (.retry_of | nullable_string)
+        and (.retry_of | nullable_identity)
         and (.session_id | nullable_session)
         and (valid_status(.status))
         and (.reserved_at | nonempty_string)
@@ -81,10 +82,10 @@ readonly SCHEMA_FILTER='
              end)
       )
       and all($root.workers[];
-        (.task_id | nonempty_string)
+        (.task_id | safe_identity)
         and (.scope | nonempty_string)
         and (.sandbox == "read-only" or .sandbox == "workspace-write")
-        and (.retry_of | nullable_string)
+        and (.retry_of | nullable_identity)
         and (.session_id | nullable_session)
         and (valid_status(.status))
         and (.status != "retired")
@@ -93,10 +94,10 @@ readonly SCHEMA_FILTER='
         and ((.bound_at == null) or (.bound_at | nonempty_string))
         and ((.activated_at == null) or (.activated_at | nonempty_string))
         and (.checkpoint_evidence | type == "string")
-        and ((.invocation_pid == null and .invocation_token == null)
-             or ((.invocation_pid | positive_pid) and (.invocation_token | nonempty_string)))
+        and ((.invocation_pid == null and .invocation_token == null and .invocation_instance == null)
+             or ((.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | nonempty_string)))
         and ((.active_child_pgid == null)
-             or ((.active_child_pgid | positive_pid) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string)))
+             or ((.active_child_pgid | positive_pid) and (.invocation_pid | positive_pid) and (.invocation_token | nonempty_string) and (.invocation_instance | nonempty_string)))
       )
       and (([$root.identity_ledger[].task_id] | length) == ([$root.identity_ledger[].task_id] | unique | length))
       and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
@@ -165,9 +166,9 @@ now_utc() {
 require_commands() {
 	local missing=''
 	local command_name
-	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat)
+	local required_commands=(bash git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod)
 	if [[ "$EXISTING_ONLY" -eq 0 ]]; then
-		required_commands+=(mktemp date chmod od tr)
+		required_commands+=(od tr)
 	fi
 
 	for command_name in "${required_commands[@]}"; do
@@ -286,7 +287,7 @@ refuse_live_external_registry_for_path() {
 	for candidate in "$STATE_ROOT"/*/registry.json; do
 		[[ -e "$candidate" ]] || continue
 		[[ -f "$candidate" && ! -L "$candidate" ]] || die "$EXIT_SCHEMA" "external registry candidate is not a regular file: $candidate. Preserve it for inspection."
-		if jq -e --arg root "$REPO_ROOT" '.schema_version == 2 and .repository_root == $root and (.workers | type == "array")' "$candidate" >/dev/null 2>&1; then
+		if jq -e --arg root "$REPO_ROOT" '(.schema_version == 2 or .schema_version == 3) and .repository_root == $root and (.workers | type == "array")' "$candidate" >/dev/null 2>&1; then
 			live_count="$(jq '.workers | length' "$candidate")"
 			[[ "$live_count" -eq 0 ]] || die "$EXIT_REPOSITORY" "the Git-directory instance marker is missing while $live_count live worker(s) remain for $REPO_ROOT in $candidate. Restore the original marker or retire those workers before initializing a replacement repository."
 		fi
@@ -457,10 +458,38 @@ write_new_registry() {
 		--arg root "$REPO_ROOT" \
 		--arg identity "$REPO_IDENTITY" \
 		--arg timestamp "$timestamp" \
-		'{schema_version: 2, registry: "luna-local-review-loop", repository_root: $root, repository_identity: $identity, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' >"$temp_path"
+		'{schema_version: 3, registry: "luna-local-review-loop", repository_root: $root, repository_identity: $identity, created_at: $timestamp, updated_at: $timestamp, identity_ledger: [], workers: []}' >"$temp_path"
 	jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || die "$EXIT_SCHEMA" 'new registry failed schema validation.'
 	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry permissions: $temp_path."
 	mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish registry: $REGISTRY_PATH."
+}
+
+migrate_v2_registry_if_safe() {
+	local live_count
+	local temp_path
+	local timestamp
+	jq -e '
+    .schema_version == 2
+    and .registry == "luna-local-review-loop"
+    and (.repository_root | type == "string" and length > 0)
+    and (.repository_identity | type == "string" and length > 0)
+    and (.identity_ledger | type == "array")
+    and (.workers | type == "array")
+  ' "$REGISTRY_PATH" >/dev/null 2>&1 || return 0
+	live_count="$(jq '.workers | length' "$REGISTRY_PATH")"
+	[[ "$live_count" -eq 0 ]] || die "$EXIT_SCHEMA" "schema version 2 registry contains $live_count live worker(s): $REGISTRY_PATH. Reinstall the previous skill version, retire those workers, verify the registry is empty, then rerun this version. The registry was not changed."
+	timestamp="$(now_utc)"
+	temp_path="$(mktemp "$REGISTRY_DIR/.registry-migration.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create registry migration file in $REGISTRY_DIR."
+	if ! jq --arg timestamp "$timestamp" '.schema_version = 3 | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
+		rm -f "$temp_path"
+		die "$EXIT_SCHEMA" "cannot prepare schema version 3 migration: $REGISTRY_PATH."
+	fi
+	if ! jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1; then
+		rm -f "$temp_path"
+		die "$EXIT_SCHEMA" "schema version 2 registry cannot be safely migrated: $REGISTRY_PATH. Preserve it for investigation."
+	fi
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry migration permissions: $temp_path."
+	mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish schema version 3 migration: $REGISTRY_PATH."
 }
 
 PRINT_PATH=0
@@ -510,7 +539,8 @@ chmod 0700 "$REGISTRY_DIR" 2>/dev/null || die "$EXIT_FILESYSTEM" "cannot restric
 acquire_lock
 if [[ -e "$REGISTRY_PATH" ]]; then
 	[[ -f "$REGISTRY_PATH" && ! -L "$REGISTRY_PATH" ]] || die "$EXIT_SCHEMA" "registry is not a regular file: $REGISTRY_PATH."
-	jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 2 validation: $REGISTRY_PATH. Preserve it for investigation."
+	migrate_v2_registry_if_safe
+	jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 3 validation: $REGISTRY_PATH. Preserve it for investigation."
 	[[ "$(jq -r '.repository_identity' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_SCHEMA" "registry belongs to a different Git repository instance at $REPO_ROOT: $REGISTRY_PATH. Preserve live state and recover it only with the original checkout; after proving no live workers remain, remove or archive this external registry before initializing the replacement checkout."
 	if [[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" != "$REPO_ROOT" ]]; then
 		publish_repository_root_update

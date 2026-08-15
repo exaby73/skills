@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2016 # jq programs intentionally use single-quoted $variables.
+# shellcheck disable=SC2016,SC2034,SC1091 # jq uses literal variables; sourced lock helpers consume shared globals.
 set -euo pipefail
 umask 077
 
@@ -24,6 +24,7 @@ PARSE_SHIFT=0
 
 readonly TRANSITION_SCHEMA_FILTER='
   def nonempty: type == "string" and length > 0;
+  def safe_identity: type == "string" and test("^[A-Za-z0-9._:/-]+$");
   def safe_session: type == "string" and length > 0 and (startswith("-") | not);
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
   def valid_retry_chain($ledger):
@@ -42,12 +43,13 @@ readonly TRANSITION_SCHEMA_FILTER='
         end
     );
   . as $root
-  | (.schema_version == 2 and .registry == "luna-local-review-loop")
+  | (.schema_version == 3 and .registry == "luna-local-review-loop")
   and (.identity_ledger | type == "array")
   and (.workers | type == "array")
   and all($root.identity_ledger[];
     . as $row
-    | (.task_id | nonempty) and (.scope | nonempty)
+    | (.task_id | safe_identity) and (.scope | nonempty)
+    and (($row.retry_of == null) or ($row.retry_of | safe_identity))
     and ($row.sandbox == "read-only" or $row.sandbox == "workspace-write")
     and (["reserved", "bound", "active", "retired"] | index($row.status) != null)
     and (if $row.status == "reserved" then $row.session_id == null
@@ -58,13 +60,14 @@ readonly TRANSITION_SCHEMA_FILTER='
   )
   and all($root.workers[];
     . as $worker
-    | (.task_id | nonempty) and (.scope | nonempty)
+    | (.task_id | safe_identity) and (.scope | nonempty)
       and ($worker.sandbox == "read-only" or $worker.sandbox == "workspace-write")
+      and (($worker.retry_of == null) or ($worker.retry_of | safe_identity))
       and (.status == "reserved" or .status == "bound" or .status == "active")
-      and (($worker.invocation_pid == null and $worker.invocation_token == null)
-           or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty)))
+      and (($worker.invocation_pid == null and $worker.invocation_token == null and $worker.invocation_instance == null)
+           or (($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | nonempty)))
       and (($worker.active_child_pgid == null)
-           or (($worker.active_child_pgid | positive_pid) and ($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty)))
+           or (($worker.active_child_pgid | positive_pid) and ($worker.invocation_pid | positive_pid) and ($worker.invocation_token | nonempty) and ($worker.invocation_instance | nonempty)))
       and any($root.identity_ledger[];
         .task_id == $worker.task_id
         and .scope == $worker.scope
@@ -134,23 +137,54 @@ pid_is_confirmed_nonexistent() {
 
 	if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
 		case "$process_state" in
-		Z*) return 0 ;;
+		Z* | '') return 0 ;;
 		?*) return 1 ;;
 		esac
 	fi
 	if kill_error="$(LC_ALL=C kill -0 "$owner_pid" 2>&1)"; then
-		if process_state="$(ps -p "$owner_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
-			case "$process_state" in
-			Z*) return 0 ;;
-			?*) return 1 ;;
-			esac
-		fi
 		return 1
 	fi
 	case "$kill_error" in
 	*[Nn]o\ such\ process* | *[Nn]o\ such\ file* | *[Nn]o\ process*) return 0 ;;
 	*) return 1 ;;
 	esac
+}
+
+process_instance_identity() {
+	local pid="$1"
+	local start=''
+	case "$pid" in '' | 0 | *[!0-9]*) return 1 ;; esac
+	if [[ -r "/proc/$pid/stat" ]]; then
+		start="$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk 'NF >= 20 {print $20; exit}')" || return 1
+		[[ "$start" =~ ^[0-9]+$ ]] || return 1
+		printf 'proc:%s\n' "$start"
+		return 0
+	fi
+	start="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null | awk 'NF {$1=$1; print; exit}')" || return 1
+	[[ -n "$start" ]] || return 1
+	printf 'ps:%s\n' "$start"
+}
+
+recorded_process_instance_blocks_recovery() {
+	local pid="$1"
+	local expected="$2"
+	local current=''
+	local process_state=''
+	[[ -n "$expected" ]] || return 0
+	if ! current="$(process_instance_identity "$pid")"; then
+		pid_is_confirmed_nonexistent "$pid" && return 1
+		return 0
+	fi
+	[[ "$current" == "$expected" ]] || return 1
+	if ! process_state="$(ps -p "$pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"; then
+		pid_is_confirmed_nonexistent "$pid" && return 1
+		return 0
+	fi
+	case "$process_state" in
+	Z*) return 1 ;;
+	'') pid_is_confirmed_nonexistent "$pid" && return 1 ;;
+	esac
+	return 0
 }
 
 process_group_is_confirmed_empty() {
@@ -166,8 +200,10 @@ require_invocation_authority() {
 	local provided_token="$2"
 	local owner_pid=''
 	local owner_token=''
+	local owner_instance=''
 	owner_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_pid // empty' "$REGISTRY_PATH")"
 	owner_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
+	owner_instance="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_instance // empty' "$REGISTRY_PATH")"
 	if [[ -z "$owner_token" ]]; then
 		[[ -z "$provided_token" ]] || die "$EXIT_CONFLICT" "task has no invocation owner for the supplied token: $task_id."
 		return 0
@@ -176,7 +212,7 @@ require_invocation_authority() {
 		[[ "$provided_token" == "$owner_token" ]] || die "$EXIT_CONFLICT" "invocation token does not own task: $task_id."
 		return 0
 	fi
-	if [[ -z "$owner_pid" ]] || ! pid_is_confirmed_nonexistent "$owner_pid"; then
+	if [[ -z "$owner_pid" ]] || recorded_process_instance_blocks_recovery "$owner_pid" "$owner_instance"; then
 		die "$EXIT_CONFLICT" "task has a live invocation owner; supply its exact token: $task_id."
 	fi
 }
@@ -282,6 +318,7 @@ command_reserve() {
 	local sandbox=''
 	local owner_pid=''
 	local token=''
+	local owner_instance=''
 	while [[ $# -gt 0 ]]; do
 		if parse_common "$@"; then
 			shift "$PARSE_SHIFT"
@@ -327,6 +364,7 @@ command_reserve() {
 		[[ -n "$owner_pid" && -n "$token" ]] || die "$EXIT_USAGE" 'reserve requires both --pid and --token when claiming the initial invocation.'
 		case "$owner_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "invocation PID must be a positive integer: $owner_pid." ;; esac
 		validate_identity 'invocation-token' "$token"
+		owner_instance="$(process_instance_identity "$owner_pid")" || die "$EXIT_CONFLICT" "cannot identify invocation process instance for PID $owner_pid."
 	fi
 	resolve_registry
 	acquire_lock
@@ -355,8 +393,8 @@ command_reserve() {
 	atomic_write '
     .updated_at = $timestamp
     | .identity_ledger += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", reserved_at: $timestamp, bound_at: null, activated_at: null, terminal_at: null, retired_at: null, terminal_status: null, terminal_evidence: ""}]
-    | .workers += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: (($owner_pid | select(length > 0)) // null), invocation_token: (($token | select(length > 0)) // null), active_child_pgid: null}]
-  ' --arg task_id "$task_id" --arg scope "$scope" --arg sandbox "$sandbox" --arg retry_of "${retry_of:-}" --arg owner_pid "${owner_pid:-}" --arg token "${token:-}" --arg timestamp "$timestamp"
+    | .workers += [{task_id: $task_id, scope: $scope, sandbox: $sandbox, retry_of: (($retry_of | select(length > 0)) // null), session_id: null, status: "reserved", created_at: $timestamp, updated_at: $timestamp, bound_at: null, activated_at: null, checkpoint_evidence: "", invocation_pid: (($owner_pid | select(length > 0)) // null), invocation_token: (($token | select(length > 0)) // null), invocation_instance: (($owner_instance | select(length > 0)) // null), active_child_pgid: null}]
+  ' --arg task_id "$task_id" --arg scope "$scope" --arg sandbox "$sandbox" --arg retry_of "${retry_of:-}" --arg owner_pid "${owner_pid:-}" --arg token "${token:-}" --arg owner_instance "${owner_instance:-}" --arg timestamp "$timestamp"
 	printf 'Reserved task=%s\n' "$task_id"
 }
 
@@ -484,8 +522,10 @@ command_claim_invocation() {
 	local token=''
 	local current_pid=''
 	local current_token=''
+	local current_instance=''
 	local current_child_pid=''
 	local required_status=''
+	local owner_instance=''
 	while [[ $# -gt 0 ]]; do
 		if parse_common "$@"; then
 			shift "$PARSE_SHIFT"
@@ -516,6 +556,7 @@ command_claim_invocation() {
 	validate_identity 'invocation-token' "$token"
 	case "$required_status" in '' | active) ;; *) die "$EXIT_USAGE" 'require-status must be active when provided.' ;; esac
 	case "$owner_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "invocation PID must be a positive integer: $owner_pid." ;; esac
+	owner_instance="$(process_instance_identity "$owner_pid")" || die "$EXIT_CONFLICT" "cannot identify invocation process instance for PID $owner_pid."
 	resolve_registry
 	acquire_lock
 	jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_NOT_FOUND" "live task not found: $task_id."
@@ -524,13 +565,14 @@ command_claim_invocation() {
 	fi
 	current_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_pid // empty' "$REGISTRY_PATH")"
 	current_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
+	current_instance="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_instance // empty' "$REGISTRY_PATH")"
 	current_child_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .active_child_pgid // empty' "$REGISTRY_PATH")"
 	if [[ -n "$current_pid" ]]; then
-		if [[ "$current_pid" == "$owner_pid" && "$current_token" == "$token" ]]; then
+		if [[ "$current_pid" == "$owner_pid" && "$current_token" == "$token" && "$current_instance" == "$owner_instance" ]]; then
 			printf 'Invocation already claimed task=%s token=%s\n' "$task_id" "$token"
 			return "$EXIT_OK"
 		fi
-		pid_is_confirmed_nonexistent "$current_pid" || die "$EXIT_CONFLICT" "another invocation already owns task $task_id with live PID $current_pid."
+		recorded_process_instance_blocks_recovery "$current_pid" "$current_instance" && die "$EXIT_CONFLICT" "another invocation already owns task $task_id with live or unverifiable PID $current_pid."
 		if [[ -n "$current_child_pid" ]] && ! process_group_is_confirmed_empty "$current_child_pid"; then
 			die "$EXIT_CONFLICT" "Codex process group $current_child_pid remains live for task $task_id; stop and verify that group before reclaiming the invocation."
 		fi
@@ -542,8 +584,8 @@ command_claim_invocation() {
 	timestamp="$(now_utc)"
 	atomic_write '
     .updated_at = $timestamp
-    | .workers |= map(if .task_id == $task_id then .invocation_pid = $owner_pid | .invocation_token = $token | .active_child_pgid = null | .updated_at = $timestamp else . end)
-  ' --arg task_id "$task_id" --arg owner_pid "$owner_pid" --arg token "$token" --arg timestamp "$timestamp"
+    | .workers |= map(if .task_id == $task_id then .invocation_pid = $owner_pid | .invocation_token = $token | .invocation_instance = $owner_instance | .active_child_pgid = null | .updated_at = $timestamp else . end)
+  ' --arg task_id "$task_id" --arg owner_pid "$owner_pid" --arg token "$token" --arg owner_instance "$owner_instance" --arg timestamp "$timestamp"
 	printf 'Claimed invocation task=%s token=%s\n' "$task_id" "$token"
 }
 
@@ -625,7 +667,7 @@ command_release_invocation() {
 	timestamp="$(now_utc)"
 	atomic_write '
     .updated_at = $timestamp
-    | .workers |= map(if .task_id == $task_id then .invocation_pid = null | .invocation_token = null | .updated_at = $timestamp else . end)
+    | .workers |= map(if .task_id == $task_id then .invocation_pid = null | .invocation_token = null | .invocation_instance = null | .updated_at = $timestamp else . end)
   ' --arg task_id "$task_id" --arg timestamp "$timestamp"
 	printf 'Released invocation task=%s token=%s\n' "$task_id" "$token"
 }
@@ -675,9 +717,11 @@ command_complete_and_retire() {
 	else
 		jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_NOT_FOUND" "live task not found: $task_id."
 		local invocation_pid
+		local invocation_instance
 		invocation_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_pid // empty' "$REGISTRY_PATH")"
-		if [[ -n "$invocation_pid" ]] && ! pid_is_confirmed_nonexistent "$invocation_pid"; then
-			die "$EXIT_CONFLICT" "invocation PID $invocation_pid remains live for task $task_id; use its invocation token or stop and verify that owner before retirement."
+		invocation_instance="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_instance // empty' "$REGISTRY_PATH")"
+		if [[ -n "$invocation_pid" ]] && recorded_process_instance_blocks_recovery "$invocation_pid" "$invocation_instance"; then
+			die "$EXIT_CONFLICT" "invocation PID $invocation_pid remains live or unverifiable for task $task_id; use its invocation token or stop and verify that owner before retirement."
 		fi
 	fi
 	local active_child_pgid
