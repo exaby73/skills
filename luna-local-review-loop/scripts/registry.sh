@@ -25,6 +25,21 @@ PARSE_SHIFT=0
 readonly TRANSITION_SCHEMA_FILTER='
   def nonempty: type == "string" and length > 0;
   def positive_pid: type == "string" and test("^[1-9][0-9]*$");
+  def valid_retry_chain($ledger):
+    all($ledger | to_entries[];
+      . as $entry
+      | $entry.value as $row
+      | if $row.retry_of == null then true
+        else any($ledger | to_entries[];
+          .key < $entry.key
+          and .value.task_id == $row.retry_of
+          and .value.scope == $row.scope
+          and .value.sandbox == $row.sandbox
+          and .value.status == "retired"
+          and (.value.terminal_status == "failed" or .value.terminal_status == "interrupted")
+        )
+        end
+    );
   . as $root
   | (.schema_version == 2 and .registry == "luna-local-review-loop")
   and (.identity_ledger | type == "array")
@@ -73,6 +88,7 @@ readonly TRANSITION_SCHEMA_FILTER='
   and (([$root.workers[].scope] | length) == ([$root.workers[].scope] | unique | length))
   and (([$root.identity_ledger[] | select(.session_id != null) | .session_id] | length) == ([$root.identity_ledger[] | select(.session_id != null) | .session_id] | unique | length))
   and (([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | length) == ([$root.identity_ledger[] | select(.retry_of != null) | .retry_of] | unique | length))
+  and valid_retry_chain($root.identity_ledger)
 '
 
 usage() {
@@ -157,11 +173,14 @@ descendant_state_is_confirmed_clean() {
 	state_path="$(descendant_state_path "$task_id" "$token")"
 	[[ -f "$state_path" && ! -L "$state_path" ]] || return 1
 	jq -e '
-    .status == "clean"
-    and (.root_pid | type == "number" and . > 0 and floor == .)
-    and (.pids | type == "array")
-    and all(.pids[]; type == "number" and . > 0 and floor == .)
-  ' "$state_path" >/dev/null 2>&1
+	    .status == "clean"
+	    and (.root_pid | type == "number" and . > 0 and floor == .)
+	    and (.processes | type == "array")
+	    and all(.processes[];
+	      (.pid | type == "number" and . > 0 and floor == .)
+	      and (.instance | type == "string" and length > 0)
+	    )
+	  ' "$state_path" >/dev/null 2>&1
 }
 
 # shellcheck source=registry-lock.sh
@@ -471,6 +490,9 @@ command_claim_invocation() {
 		pid_is_confirmed_nonexistent "$current_pid" || die "$EXIT_CONFLICT" "another invocation already owns task $task_id with live PID $current_pid."
 		if [[ -n "$current_child_pid" ]] && ! process_group_is_confirmed_empty "$current_child_pid"; then
 			die "$EXIT_CONFLICT" "Codex process group $current_child_pid remains live for task $task_id; stop and verify that group before reclaiming the invocation."
+		fi
+		if [[ -n "$current_token" && (-e "$(descendant_state_path "$task_id" "$current_token")" || -L "$(descendant_state_path "$task_id" "$current_token")") ]] && ! descendant_state_is_confirmed_clean "$task_id" "$current_token"; then
+			die "$EXIT_CONFLICT" "Codex descendant tracker remains active for the previous invocation of task $task_id; stop and verify its recorded processes before reclaiming."
 		fi
 	fi
 	local timestamp

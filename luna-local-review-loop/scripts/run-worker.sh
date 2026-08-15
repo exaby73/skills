@@ -124,11 +124,51 @@ write_descendant_state() {
 	local state_path="$4"
 	local temp_path
 	temp_path="$(mktemp "${state_path}.tmp.XXXXXX")" || return 1
-	if ! jq -Rn --arg status "$status" --arg root "$root_pid" '[inputs | select(test("^[1-9][0-9]*$")) | tonumber] | {status:$status, root_pid:($root | tonumber), pids:.}' <"$known_file" >"$temp_path"; then
+	if ! jq -Rn --arg status "$status" --arg root "$root_pid" '
+      [inputs
+        | capture("^(?<pid>[1-9][0-9]*)[|](?<instance>.+)$")
+        | {pid:(.pid | tonumber), instance:.instance}]
+      | {status:$status, root_pid:($root | tonumber), processes:.}
+    ' <"$known_file" >"$temp_path"; then
 		rm -f "$temp_path"
 		return 1
 	fi
 	mv "$temp_path" "$state_path"
+}
+
+process_instance_identity() {
+	local pid="$1"
+	local start=''
+	case "$pid" in '' | 0 | *[!0-9]*) return 1 ;; esac
+	if [[ -r "/proc/$pid/stat" ]]; then
+		start="$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk 'NF >= 20 {print $20; exit}')" || return 1
+		[[ "$start" =~ ^[0-9]+$ ]] || return 1
+		printf 'proc:%s\n' "$start"
+		return 0
+	fi
+	start="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null | awk 'NF {$1=$1; print; exit}')" || return 1
+	[[ -n "$start" ]] || return 1
+	printf 'ps:%s\n' "$start"
+}
+
+process_instance_matches() {
+	local pid="$1"
+	local expected="$2"
+	local current=''
+	local process_state=''
+	current="$(process_instance_identity "$pid")" || return 1
+	[[ "$current" == "$expected" ]] || return 1
+	process_state="$(ps -p "$pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"
+	case "$process_state" in '' | Z*) return 1 ;; esac
+	return 0
+}
+
+record_process_instance() {
+	local pid="$1"
+	local destination="$2"
+	local instance=''
+	instance="$(process_instance_identity "$pid")" || return 1
+	printf '%s|%s\n' "$pid" "$instance" >>"$destination"
 }
 
 monitor_descendant_tree() {
@@ -139,24 +179,39 @@ monitor_descendant_tree() {
 	local additions
 	local live_count
 	local root_live
+	local root_instance
+	local pid
+	local instance
+	local recorded_count
 	known_file="$(mktemp "${state_path}.known.XXXXXX")" || exit 1
 	snapshot="$(mktemp "${state_path}.snapshot.XXXXXX")" || exit 1
 	additions="$(mktemp "${state_path}.additions.XXXXXX")" || exit 1
 	trap 'rm -f "$known_file" "$snapshot" "$additions"' EXIT
-	printf '%s\n' "$root_pid" >"$known_file"
+	root_instance="$(process_instance_identity "$root_pid")" || exit 1
+	printf '%s|%s\n' "$root_pid" "$root_instance" >"$known_file"
 	while true; do
-		ps -ax -o pid=,ppid=,stat= >"$snapshot" 2>/dev/null || exit 1
+		ps -ax -o pid=,ppid=,stat= 2>/dev/null | awk 'NF >= 3 {print $1 "|" $2 "|" $3}' >"$snapshot" || exit 1
 		while true; do
-			awk 'NR == FNR { known[$1] = 1; next } $3 !~ /^Z/ && known[$2] && !known[$1] { print $1 }' "$known_file" "$snapshot" >"$additions"
+			awk -F '|' 'NR == FNR { known[$1] = 1; next } $3 !~ /^Z/ && known[$2] && !known[$1] { print $1 }' "$known_file" "$snapshot" >"$additions"
 			[[ -s "$additions" ]] || break
-			cat "$additions" >>"$known_file"
-			sort -nu -o "$known_file" "$known_file"
+			recorded_count=0
+			while IFS= read -r pid; do
+				if record_process_instance "$pid" "$known_file"; then
+					recorded_count=$((recorded_count + 1))
+				fi
+			done <"$additions"
+			[[ "$recorded_count" -gt 0 ]] || break
+			sort -t '|' -k1,1n -u -o "$known_file" "$known_file"
 		done
-		awk 'NR == FNR { known[$1] = 1; next } $3 !~ /^Z/ && known[$1] { print $1 }' "$known_file" "$snapshot" >"$additions"
+		: >"$additions"
+		while IFS='|' read -r pid instance; do
+			process_instance_matches "$pid" "$instance" && printf '%s|%s\n' "$pid" "$instance" >>"$additions"
+		done <"$known_file"
 		mv "$additions" "$known_file"
 		additions="$(mktemp "${state_path}.additions.XXXXXX")" || exit 1
 		live_count="$(awk 'END { print NR + 0 }' "$known_file")"
-		root_live="$(awk -v root="$root_pid" '$1 == root && $3 !~ /^Z/ { found=1 } END { print found + 0 }' "$snapshot")"
+		root_live=0
+		process_instance_matches "$root_pid" "$root_instance" && root_live=1
 		if [[ "$root_live" -eq 0 && "$live_count" -eq 0 ]]; then
 			write_descendant_state clean "$root_pid" "$known_file" "$state_path" || exit 1
 			exit 0
@@ -166,20 +221,19 @@ monitor_descendant_tree() {
 	done
 }
 
-tracked_worker_pids() {
+tracked_worker_processes() {
 	local state_path="$1"
 	[[ -f "$state_path" && ! -L "$state_path" ]] || return 1
-	jq -r '.pids[]' "$state_path" 2>/dev/null
+	jq -r '.processes[] | "\(.pid)|\(.instance)"' "$state_path" 2>/dev/null
 }
 
 tracked_worker_processes_are_empty() {
 	local state_path="$1"
 	local pid
-	local process_state
-	while IFS= read -r pid; do
-		process_state="$(ps -p "$pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"
-		case "$process_state" in '' | Z*) ;; *) return 1 ;; esac
-	done < <(tracked_worker_pids "$state_path") || return 1
+	local instance
+	while IFS='|' read -r pid instance; do
+		process_instance_matches "$pid" "$instance" && return 1
+	done < <(tracked_worker_processes "$state_path") || return 1
 	return 0
 }
 
@@ -187,18 +241,19 @@ stop_tracked_worker_processes() {
 	local signal_name="$1"
 	local attempt=0
 	local pid
+	local instance
 	[[ -n "$ACTIVE_TRACKER_STATE" ]] || return 0
 	while ! tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE" && [[ "$attempt" -lt 50 ]]; do
-		while IFS= read -r pid; do
-			[[ -z "$pid" ]] || kill -s "$signal_name" "$pid" 2>/dev/null || true
-		done < <(tracked_worker_pids "$ACTIVE_TRACKER_STATE")
+		while IFS='|' read -r pid instance; do
+			process_instance_matches "$pid" "$instance" && kill -s "$signal_name" "$pid" 2>/dev/null || true
+		done < <(tracked_worker_processes "$ACTIVE_TRACKER_STATE")
 		sleep 0.05
 		attempt=$((attempt + 1))
 	done
 	if ! tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE"; then
-		while IFS= read -r pid; do
-			[[ -z "$pid" ]] || kill -KILL "$pid" 2>/dev/null || true
-		done < <(tracked_worker_pids "$ACTIVE_TRACKER_STATE")
+		while IFS='|' read -r pid instance; do
+			process_instance_matches "$pid" "$instance" && kill -KILL "$pid" 2>/dev/null || true
+		done < <(tracked_worker_processes "$ACTIVE_TRACKER_STATE")
 		sleep 0.05
 	fi
 	tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE" || return 1
@@ -294,11 +349,37 @@ require_real_child_directory() {
 	printf '%s\n' "$resolved"
 }
 
-require_safe_artifact_target() {
+artifact_link_count() {
+	local path="$1"
+	local count=''
+	if count="$(stat -f '%l' "$path" 2>/dev/null)"; then
+		:
+	elif count="$(stat -c '%h' "$path" 2>/dev/null)"; then
+		:
+	else
+		return 1
+	fi
+	[[ "$count" =~ ^[0-9]+$ ]] || return 1
+	printf '%s\n' "$count"
+}
+
+require_owned_artifact_file() {
 	local path="$1"
 	local label="$2"
-	[[ ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must not be a symlink: $path."
-	[[ ! -e "$path" || -f "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must be a regular file target: $path."
+	local link_count=''
+	[[ -f "$path" && ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must be a real regular file: $path."
+	link_count="$(artifact_link_count "$path")" || die "$EXIT_RUNTIME_STATE" "cannot inspect $label link count: $path."
+	[[ "$link_count" -eq 1 ]] || die "$EXIT_RUNTIME_STATE" "$label must have exactly one hard link: $path."
+}
+
+create_owned_artifact_file() {
+	local path="$1"
+	local label="$2"
+	[[ ! -e "$path" && ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label already exists; refusing to overwrite it: $path."
+	if ! (set -o noclobber; : >"$path") 2>/dev/null; then
+		die "$EXIT_RUNTIME_STATE" "cannot exclusively create $label: $path."
+	fi
+	require_owned_artifact_file "$path" "$label"
 }
 
 run_gated_codex() {
@@ -313,8 +394,8 @@ run_gated_codex() {
 	local child_pid
 	local child_pgid
 	local tracker_attempt=0
-	require_safe_artifact_target "$stream_log" 'Codex JSONL artifact'
-	require_safe_artifact_target "$stream_stderr" 'Codex stderr artifact'
+	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
+	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
 	rm -f "$gate_path"
 	set -m
 	(
@@ -328,7 +409,7 @@ run_gated_codex() {
 		else
 			exec "$@" </dev/null
 		fi
-	) >"$stream_log" 2>"$stream_stderr" &
+		) >>"$stream_log" 2>>"$stream_stderr" &
 	set +m
 	ACTIVE_CODEX_PID=$!
 	child_pid="$ACTIVE_CODEX_PID"
@@ -342,7 +423,8 @@ run_gated_codex() {
 		return 1
 	fi
 	ACTIVE_TRACKER_STATE="$artifact_dir/.descendants-$INVOCATION_TOKEN.json"
-	require_safe_artifact_target "$ACTIVE_TRACKER_STATE" 'descendant tracker state'
+	[[ ! -L "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must not be a symlink: $ACTIVE_TRACKER_STATE."
+	[[ ! -e "$ACTIVE_TRACKER_STATE" || -f "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must be a regular file target: $ACTIVE_TRACKER_STATE."
 	rm -f "$ACTIVE_TRACKER_STATE"
 	monitor_descendant_tree "$child_pid" "$ACTIVE_TRACKER_STATE" &
 	ACTIVE_TRACKER_PID=$!
@@ -371,6 +453,8 @@ run_gated_codex() {
 		stop_codex_process_group TERM || return 1
 	fi
 	stop_tracked_worker_processes TERM || return 1
+	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
+	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
 	if ! run_registry_quiet clear-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
 		ACTIVE_CODEX_PGID=''
 		return 1
@@ -409,21 +493,22 @@ resume_task() {
 	local stream_log
 	local stream_stderr
 	local result_path
-	local existing_stream
 	local existing_artifact
 	attempt=0
 	for existing_artifact in "$artifact_dir"/stream-*.jsonl "$artifact_dir"/stream-*.stderr.log "$artifact_dir"/result-*.json; do
-		[[ ! -L "$existing_artifact" ]] || die "$EXIT_RUNTIME_STATE" "worker artifact must not be a symlink: $existing_artifact."
-	done
-	for existing_stream in "$artifact_dir"/stream-*.jsonl; do
-		[[ -f "$existing_stream" ]] || continue
-		attempt=$((attempt + 1))
+		[[ -e "$existing_artifact" || -L "$existing_artifact" ]] || continue
+		require_owned_artifact_file "$existing_artifact" 'existing worker artifact'
+		if [[ "${existing_artifact##*/}" =~ ^(stream|result)-([0-9]+)(\.jsonl|\.stderr\.log|\.json)$ ]]; then
+			[[ "${BASH_REMATCH[2]}" -le "$attempt" ]] || attempt="${BASH_REMATCH[2]}"
+		fi
 	done
 	attempt=$((attempt + 1))
 	stream_log="$artifact_dir/stream-$attempt.jsonl"
 	stream_stderr="$artifact_dir/stream-$attempt.stderr.log"
 	result_path="$artifact_dir/result-$attempt.json"
-	require_safe_artifact_target "$result_path" 'worker result artifact'
+	create_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
+	create_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
+	create_owned_artifact_file "$result_path" 'worker result artifact'
 
 	local codex_status=0
 	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$PROMPT_FILE" "$CODEX_BIN" exec resume \
@@ -438,6 +523,7 @@ resume_task() {
 		die "$EXIT_WORKER" "Codex resume failed for task $TASK_ID. Logs: $stream_log and $stream_stderr"
 	fi
 	validate_result "$result_path" || die "$EXIT_WORKER" "worker returned invalid structured output: $result_path."
+	require_owned_artifact_file "$result_path" 'worker result artifact'
 
 	local outcome
 	local evidence
@@ -489,8 +575,8 @@ launch_worker() {
 	artifact_dir="$(create_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
 	launch_log="$artifact_dir/launch.jsonl"
 	launch_stderr="$artifact_dir/launch.stderr.log"
-	require_safe_artifact_target "$launch_log" 'handshake JSONL artifact'
-	require_safe_artifact_target "$launch_stderr" 'handshake stderr artifact'
+	create_owned_artifact_file "$launch_log" 'handshake JSONL artifact'
+	create_owned_artifact_file "$launch_stderr" 'handshake stderr artifact'
 
 	local codex_status=0
 	run_gated_codex "$artifact_dir" "$launch_log" "$launch_stderr" '' "$CODEX_BIN" exec \

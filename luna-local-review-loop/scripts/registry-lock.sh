@@ -26,7 +26,7 @@ remove_stale_lock_file() {
 
 	[[ -f "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] || return 1
 	rm -f "$witness" 2>/dev/null || true
-	ln -h "$LOCK_DIR" "$witness" 2>/dev/null || return 1
+	ln -n "$LOCK_DIR" "$witness" 2>/dev/null || return 1
 	if [[ ! "$LOCK_DIR" -ef "$witness" ]]; then
 		rm -f "$witness" 2>/dev/null || true
 		return 1
@@ -57,7 +57,7 @@ acquire_lock() {
 	trap 'exit 143' TERM
 	while true; do
 		[[ ! -L "$LOCK_DIR" ]] || die "$EXIT_FILESYSTEM" "registry lock must not be a symlink: $LOCK_DIR."
-		if ln -h "$LOCK_OWNER_FILE" "$LOCK_DIR" 2>/dev/null; then
+		if ln -n "$LOCK_OWNER_FILE" "$LOCK_DIR" 2>/dev/null; then
 			break
 		fi
 		[[ ! -L "$LOCK_DIR" ]] || die "$EXIT_FILESYSTEM" "registry lock must not be a symlink: $LOCK_DIR."

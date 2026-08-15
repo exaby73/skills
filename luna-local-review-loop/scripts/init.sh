@@ -33,6 +33,21 @@ readonly SCHEMA_FILTER='
   def nullable_string: . == null or (. | nonempty_string);
   def valid_status($status): ["reserved", "bound", "active", "retired"] | index($status) != null;
   def valid_terminal($status): ["completed", "failed", "blocked", "interrupted"] | index($status) != null;
+  def valid_retry_chain($ledger):
+    all($ledger | to_entries[];
+      . as $entry
+      | $entry.value as $row
+      | if $row.retry_of == null then true
+        else any($ledger | to_entries[];
+          .key < $entry.key
+          and .value.task_id == $row.retry_of
+          and .value.scope == $row.scope
+          and .value.sandbox == $row.sandbox
+          and .value.status == "retired"
+          and (.value.terminal_status == "failed" or .value.terminal_status == "interrupted")
+        )
+        end
+    );
   . as $root
   | try (
       (.schema_version == 2)
@@ -87,12 +102,7 @@ readonly SCHEMA_FILTER='
       and (([$root.workers[].task_id] | length) == ([$root.workers[].task_id] | unique | length))
       and (([$root.workers[].scope] | length) == ([$root.workers[].scope] | unique | length))
       and (([$root.workers[] | select(.session_id != null) | .session_id] | length) == ([$root.workers[] | select(.session_id != null) | .session_id] | unique | length))
-      and all($root.identity_ledger[];
-        . as $row
-        | if .retry_of == null then true
-          else any($root.identity_ledger[]; .task_id == $row.retry_of and .scope == $row.scope and .sandbox == $row.sandbox)
-          end
-      )
+      and valid_retry_chain($root.identity_ledger)
       and all($root.workers[];
         . as $worker
         | any($root.identity_ledger[];
@@ -204,6 +214,7 @@ repository_instance_identity() {
 	local git_dir_real
 	local marker_path
 	local nonce=''
+	local checkout_identity=''
 	git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
 	git_dir_real="$(cd -P "$git_dir" 2>/dev/null && pwd -P)" || return 1
 	marker_path="$git_dir_real/luna-local-review-loop.instance"
@@ -221,7 +232,15 @@ repository_instance_identity() {
 	[[ -f "$marker_path" && ! -L "$marker_path" ]] || return 1
 	IFS= read -r nonce <"$marker_path" || return 1
 	[[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
-	printf '%s' "$nonce" | shasum -a 256 | awk '{print $1}'
+	if checkout_identity="$(stat -f '%d:%i' "$git_dir_real" 2>/dev/null)"; then
+		:
+	elif checkout_identity="$(stat -c '%d:%i' "$git_dir_real" 2>/dev/null)"; then
+		:
+	else
+		return 1
+	fi
+	[[ "$checkout_identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+	printf '%s\n%s\n' "$nonce" "$checkout_identity" | shasum -a 256 | awk '{print $1}'
 }
 
 refuse_live_legacy_registry() {

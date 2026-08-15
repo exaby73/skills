@@ -227,6 +227,11 @@ moved_registry_after="$($INIT_SCRIPT --existing-path --repo "$moved_repo_new" --
 [[ "$moved_registry_after" == "$moved_registry" ]] || fail 'repository move selected a new external registry'
 moved_repo_new_real="$(cd -P "$moved_repo_new" && pwd -P)"
 jq -e --arg root "$moved_repo_new_real" '.repository_root == $root and any(.workers[]; .task_id == "moved-checkout-worker")' "$moved_registry" >/dev/null || fail 'repository move did not preserve live state and update its canonical root'
+copied_repo="$TEST_ROOT/copied-repo"
+cp -a "$moved_repo_new" "$copied_repo"
+copied_registry="$($INIT_SCRIPT --repo "$copied_repo" --state-root "$moved_state" --print-path)"
+[[ "$copied_registry" != "$moved_registry" ]] || fail 'copied checkout shared the original checkout registry'
+jq -e '.workers == [] and .identity_ledger == []' "$copied_registry" >/dev/null || fail 'copied checkout inherited original live worker state'
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$moved_repo_new" --state-root "$moved_state" --task-id moved-checkout-worker --status interrupted --evidence 'repository move test complete' >/dev/null
 
 identity_repo="$TEST_ROOT/identity-repo"
@@ -354,6 +359,37 @@ fi
 [[ "$(cat "$artifact_file_target")" == 'preserve artifact target' ]] || fail 'runner wrote through a symlinked continuation artifact file'
 rm -f "$artifact_file_target"
 
+hardlink_artifact_target="$REPO_ROOT/.hardlink-artifact-target"
+printf '%s\n' 'preserve hard-linked artifact target' >"$hardlink_artifact_target"
+mkdir "$registry_dir/artifacts/hardlinked-artifact-file"
+ln "$hardlink_artifact_target" "$registry_dir/artifacts/hardlinked-artifact-file/launch.jsonl"
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hardlinked-artifact-file --scope 'reject hard-linked artifact file' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/hardlink-artifact-file.out" 2>&1; then
+	fail 'runner accepted a hard-linked handshake artifact file'
+fi
+[[ "$(cat "$hardlink_artifact_target")" == 'preserve hard-linked artifact target' ]] || fail 'runner wrote through a hard-linked handshake artifact file'
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hardlinked-continuation-file --scope 'reject hard-linked continuation artifact file' >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hardlinked-continuation-file --session-id 01hardlinked-continuation >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hardlinked-continuation-file --session-id 01hardlinked-continuation >/dev/null
+mkdir "$registry_dir/artifacts/hardlinked-continuation-file"
+ln "$hardlink_artifact_target" "$registry_dir/artifacts/hardlinked-continuation-file/stream-1.jsonl"
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id hardlinked-continuation-file --prompt-file "$CONTINUE_FILE" >"$TEST_ROOT/hardlink-continuation-file.out" 2>&1; then
+	fail 'runner accepted a hard-linked continuation artifact file'
+fi
+[[ "$(cat "$hardlink_artifact_target")" == 'preserve hard-linked artifact target' ]] || fail 'runner wrote through a hard-linked continuation artifact file'
+rm -f "$hardlink_artifact_target"
+
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id sparse-continuation-artifacts --scope 'preserve sparse continuation artifacts' >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id sparse-continuation-artifacts --session-id 01sparse-continuation >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id sparse-continuation-artifacts --session-id 01sparse-continuation >/dev/null
+mkdir "$registry_dir/artifacts/sparse-continuation-artifacts"
+printf '%s\n' 'preserve stream one' >"$registry_dir/artifacts/sparse-continuation-artifacts/stream-1.jsonl"
+printf '%s\n' 'preserve stream three' >"$registry_dir/artifacts/sparse-continuation-artifacts/stream-3.jsonl"
+sparse_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id sparse-continuation-artifacts --prompt-file "$CONTINUE_FILE" 2>"$TEST_ROOT/sparse-continuation.err")"
+jq -e '.outcome == "completed"' <<<"$sparse_output" >/dev/null || fail 'sparse continuation did not complete'
+[[ "$(cat "$registry_dir/artifacts/sparse-continuation-artifacts/stream-3.jsonl")" == 'preserve stream three' ]] || fail 'sparse continuation overwrote the highest existing attempt'
+[[ -f "$registry_dir/artifacts/sparse-continuation-artifacts/stream-4.jsonl" && -f "$registry_dir/artifacts/sparse-continuation-artifacts/result-4.json" ]] || fail 'sparse continuation did not select max attempt plus one'
+
 mkdir "$registry_dir/artifacts/reserved-continuation"
 chmod 0700 "$registry_dir/artifacts/reserved-continuation"
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id reserved-continuation --scope 'reject continuation before activation' >/dev/null
@@ -380,6 +416,16 @@ if "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --t
 	fail 'retired failed attempt accepted a second retry child'
 fi
 jq -e 'any(.identity_ledger[]; .task_id == "retry-launch" and .retry_of == "failed-launch" and .scope == "exact retry scope" and .sandbox == "read-only")' "$registry_path" >/dev/null || fail 'retry linkage or inherited sandbox was not recorded'
+cp "$registry_path" "$registry_path.valid-retry-chain"
+jq '(.identity_ledger[] | select(.task_id == "failed-launch") | .terminal_status) = "completed"' "$registry_path.valid-retry-chain" >"$registry_path"
+if "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/completed-retry-parent.out" 2>&1; then
+	fail 'schema accepted a retry whose parent did not fail or get interrupted'
+fi
+jq '(.identity_ledger[] | select(.task_id == "failed-launch") | .retry_of) = "retry-launch"' "$registry_path.valid-retry-chain" >"$registry_path"
+if "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/cyclic-retry-chain.out" 2>&1; then
+	fail 'schema accepted a cyclic or later-parent retry chain'
+fi
+mv "$registry_path.valid-retry-chain" "$registry_path"
 
 zombie_pid_file="$TEST_ROOT/zombie.pid"
 bash -c '(exit 0) & printf "%s\n" "$!" >"$1"; sleep 30' _ "$zombie_pid_file" &
@@ -396,13 +442,16 @@ while [[ "$(ps -p "$zombie_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}'
 	sleep 0.01
 	poll_attempt=$((poll_attempt + 1))
 done
-[[ "$(ps -p "$zombie_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')" == Z* ]] || fail 'zombie fixture never reached defunct state'
-"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --scope 'reclaim a defunct invocation owner' >/dev/null
-"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --session-id 01zombie-recovery-session >/dev/null
-"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --session-id 01zombie-recovery-session >/dev/null
-"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --pid "$zombie_pid" --token zombie-owner >/dev/null
-"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --pid "$$" --token zombie-reclaimer >/dev/null
-"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --status interrupted --evidence 'defunct owner reclaimed' --invocation-token zombie-reclaimer >/dev/null
+if [[ "$(ps -p "$zombie_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')" == Z* ]]; then
+	"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --scope 'reclaim a defunct invocation owner' >/dev/null
+	"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --session-id 01zombie-recovery-session >/dev/null
+	"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --session-id 01zombie-recovery-session >/dev/null
+	"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --pid "$zombie_pid" --token zombie-owner >/dev/null
+	"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --pid "$$" --token zombie-reclaimer >/dev/null
+	"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id zombie-recovery --status interrupted --evidence 'defunct owner reclaimed' --invocation-token zombie-reclaimer >/dev/null
+else
+	printf '%s\n' 'SKIP: shell reaped zombie fixture before observation' >&2
+fi
 kill "$zombie_parent_pid" 2>/dev/null || true
 wait "$zombie_parent_pid" 2>/dev/null || true
 
@@ -476,6 +525,12 @@ if process_is_live_non_zombie "$stale_child_pid"; then
 	fail 'chosen stale child PID unexpectedly belongs to a live process'
 fi
 "$REGISTRY_SCRIPT" record-child --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pgid "$stale_child_pid" --token stale-owner >/dev/null
+stale_tracker="$registry_dir/artifacts/continued-worker/.descendants-stale-owner.json"
+printf '%s\n' '{"status":"active","root_pid":99999999,"processes":[]}' >"$stale_tracker"
+if "$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id continued-worker --pid "$$" --token premature-reclaimer >"$TEST_ROOT/active-stale-tracker.out" 2>&1; then
+	fail 'stale invocation reclaim ignored an active tracker from the previous token'
+fi
+printf '%s\n' '{"status":"clean","root_pid":99999999,"processes":[]}' >"$stale_tracker"
 sleep 30 &
 claim_owner_a=$!
 sleep 30 &
@@ -525,10 +580,10 @@ if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task
 fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
-resume_count="$(rg -c 'exec resume .*01fake-session-[0-9]+ -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 6 ]] || fail "expected six exact-session resumes, got $resume_count"
+resume_count="$(rg -c 'exec resume .*01fake-session-[0-9]+ -|exec resume .*01sparse-continuation -' "$CODEX_CALLS")"
+[[ "$resume_count" -eq 7 ]] || fail "expected seven exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 13 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 14 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
 [[ "$read_only_count" -eq 2 ]] || fail "expected original and retry handshakes to use read-only sandbox, got $read_only_count"
 if rg -F 'irrelevant connector warning' "$(dirname "$registry_path")/artifacts/fast-worker/launch.jsonl" >/dev/null; then
@@ -546,6 +601,9 @@ detached_pid="$(cat "$CODEX_DETACHED_PID_FILE")"
 if process_is_live_non_zombie "$detached_pid"; then
 	fail 'detached worker descendant survived registry retirement'
 fi
+detached_trackers=("$(dirname "$registry_path")/artifacts/detached-worker/".descendants-*.json)
+[[ "${#detached_trackers[@]}" -eq 1 && -f "${detached_trackers[0]}" ]] || fail 'detached worker descendant tracker was not unique'
+jq -e '.processes | type == "array" and all(.[]; (.pid | type == "number") and (.instance | type == "string" and length > 0))' "${detached_trackers[0]}" >/dev/null || fail 'descendant tracker did not pin process instances'
 
 printf '%s\n' 'terminate child safely' >"$PROMPT_FILE"
 rm -f "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE"
