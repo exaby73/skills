@@ -121,7 +121,7 @@ scripts/run-worker.sh finish \
   --evidence 'parent terminated failed invocation'
 ```
 
-Explicit finish accepts only `failed`, `blocked`, or `interrupted`; a completed task must come from a validated structured result. Because finish mutates only registry state, it remains usable when the worker never created artifacts or external artifacts were removed.
+Explicit finish accepts only `failed`, `blocked`, or `interrupted`; a completed task must come from a validated structured result. For a task with no recorded child, finish remains usable when worker artifacts are absent or removed. If a child was recorded, preserved descendant tracker and lease evidence remain required for safe finish and recovery; missing evidence blocks retirement.
 
 Retry a failed/interrupted exact scope:
 

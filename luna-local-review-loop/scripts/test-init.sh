@@ -122,6 +122,14 @@ if [[ " $* " == *' exec resume '* ]]; then
     wait "$fast_intermediate_pid"
   fi
   if [[ "${FAKE_DETACH_RESUME:-0}" == '1' ]]; then
+    fixture_process_is_live_non_zombie() {
+      local process_state=''
+      process_state="$(ps -p "$1" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"
+      case "$process_state" in
+      Z* | '') return 1 ;;
+      *) return 0 ;;
+      esac
+    }
     set -m
     (
       set -m
@@ -133,8 +141,7 @@ if [[ " $* " == *' exec resume '* ]]; then
       disown "$detached_pid"
       printf '%s\n' "$detached_pid" > "$CODEX_DETACHED_PID_FILE"
       observed=0
-      attempt=0
-      while [[ "$attempt" -lt 500 ]]; do
+      while [[ "$observed" -eq 0 ]]; do
         for tracker in "$CODEX_DETACHED_TRACKER_DIR"/.descendants-*.json; do
           [[ -f "$tracker" ]] || continue
           if jq -e --argjson pid "$detached_pid" 'any(.processes[]; .pid == $pid)' "$tracker" >/dev/null 2>&1; then
@@ -143,16 +150,15 @@ if [[ " $* " == *' exec resume '* ]]; then
           fi
         done
         [[ "$observed" -eq 0 ]] || break
+        fixture_process_is_live_non_zombie "$detached_pid" || exit 91
         sleep 0.01
-        attempt=$((attempt + 1))
       done
       [[ "$observed" -eq 0 ]] || printf '%s\n' observed > "$CODEX_DETACHED_OBSERVED_FILE"
     ) &
     detacher_pid=$!
     disown "$detacher_pid"
     observed=0
-    attempt=0
-    while [[ "$attempt" -lt 500 ]]; do
+    while [[ "$observed" -eq 0 ]]; do
       for tracker in "$CODEX_DETACHED_TRACKER_DIR"/.descendants-*.json; do
         [[ -f "$tracker" ]] || continue
         if jq -e --argjson pid "$detacher_pid" 'any(.processes[]; .pid == $pid)' "$tracker" >/dev/null 2>&1; then
@@ -161,10 +167,9 @@ if [[ " $* " == *' exec resume '* ]]; then
         fi
       done
       [[ "$observed" -eq 0 ]] || break
+      fixture_process_is_live_non_zombie "$detacher_pid" || exit 90
       sleep 0.01
-      attempt=$((attempt + 1))
     done
-    [[ "$observed" -eq 1 ]] || exit 90
     set +m
   fi
   if [[ "${FAKE_BLOCK_RESUME:-0}" == '1' ]]; then
@@ -302,6 +307,37 @@ jq -e '.schema_version == 3 and .workers == []' "$registry_path" >/dev/null || f
 instance_marker="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/luna-local-review-loop.instance"
 [[ -f "$instance_marker" && ! -L "$instance_marker" ]] || fail 'init did not create a durable Git-directory instance marker'
 registry_locator="${instance_marker%/*}/luna-local-review-loop.registry"
+locator_checkout_identity="$(jq -r '.repository_checkout_identity' "$registry_locator")"
+locator_backup="$TEST_ROOT/registry-locator.before-invalid-root-tests"
+cp "$registry_locator" "$locator_backup"
+locator_insecure_state="$TEST_ROOT/locator-insecure-state"
+locator_insecure_registry_dir="$locator_insecure_state/registry"
+mkdir -p "$locator_insecure_registry_dir"
+chmod 0777 "$locator_insecure_state"
+cp "$registry_path" "$locator_insecure_registry_dir/registry.json"
+locator_insecure_registry="$(cd -P "$locator_insecure_registry_dir" && pwd -P)/registry.json"
+jq -nc --arg checkout_identity "$locator_checkout_identity" --arg registry_path "$locator_insecure_registry" '{registry_path:$registry_path, registry_state:"ready", repository_checkout_identity:$checkout_identity}' >"$registry_locator.tmp"
+mv "$registry_locator.tmp" "$registry_locator"
+if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/locator-insecure-root.out" 2>&1; then
+	fail 'init trusted an authoritative locator state root with group or other permissions'
+fi
+rg -F 'state root must not grant group or other permissions' "$TEST_ROOT/locator-insecure-root.out" >/dev/null || fail 'authoritative locator insecure-root refusal lacked permission evidence'
+cp "$locator_backup" "$registry_locator"
+rm -rf "$locator_insecure_state"
+
+locator_authority_registry_dir="$TEST_ROOT/locator-registry"
+mkdir -p "$locator_authority_registry_dir"
+cp "$registry_path" "$locator_authority_registry_dir/registry.json"
+locator_authority_registry="$(cd -P "$locator_authority_registry_dir" && pwd -P)/registry.json"
+jq -nc --arg checkout_identity "$locator_checkout_identity" --arg registry_path "$locator_authority_registry" '{registry_path:$registry_path, registry_state:"ready", repository_checkout_identity:$checkout_identity}' >"$registry_locator.tmp"
+mv "$registry_locator.tmp" "$registry_locator"
+if "$INIT_SCRIPT" --repo "$REPO_ROOT" --state-root "$STATE_ROOT" >"$TEST_ROOT/locator-authority-overlap.out" 2>&1; then
+	fail 'init allowed authoritative locator state to contain durable checkout authority'
+fi
+rg -F 'checkout authority root must be outside the selectable registry state root' "$TEST_ROOT/locator-authority-overlap.out" >/dev/null || fail 'authoritative locator authority-separation refusal lacked evidence'
+cp "$locator_backup" "$registry_locator"
+rm -rf "$locator_authority_registry_dir" "$locator_backup"
+
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id missing-locator-worker --scope 'refuse missing authoritative locator fallback' >/dev/null
 cp "$registry_locator" "$TEST_ROOT/registry-locator.backup"
 rm "$registry_locator"
@@ -329,6 +365,7 @@ mv "$TEST_ROOT/registry-target.backup" "$registry_path"
 pending_repo="$TEST_ROOT/pending-repo"
 pending_state="$TEST_ROOT/pending-state"
 mkdir -p "$pending_repo/.agents/skills" "$pending_state/pending-registry"
+chmod 0700 "$pending_state"
 cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$pending_repo/.agents/skills/code-reviewer"
 cp -R "$REPO_ROOT/.agents/skills/caveman" "$pending_repo/.agents/skills/caveman"
 git -C "$pending_repo" init -q

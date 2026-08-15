@@ -102,7 +102,7 @@ Each structured worker result contains outcome, concise summary, changed files, 
 
 ## Close every lifecycle
 
-The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. Explicit `finish` accepts only `failed`, `blocked`, or `interrupted`; `completed` requires both a validated structured result and the token-owning active runner. Finish is registry-only and remains available if worker artifacts are missing. Tokenless low-level retirement is rejected while the recorded invocation owner is live; only that owner may retire with its exact token. Dead-process probes run in the C locale, count zombies as exited, and block on ambiguous access. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
+The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. Explicit `finish` accepts only `failed`, `blocked`, or `interrupted`; `completed` requires both a validated structured result and the token-owning active runner. For a task with no recorded child, finish remains usable when worker artifacts are absent or removed. If a child was recorded, preserved descendant tracker and lease evidence remain required for safe finish and recovery; missing evidence blocks retirement. Tokenless low-level retirement is rejected while the recorded invocation owner is live; only that owner may retire with its exact token. Dead-process probes run in the C locale, count zombies as exited, and block on ambiguous access. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
 
 ```sh
 "$skill_root/scripts/run-worker.sh" finish \
