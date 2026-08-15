@@ -40,6 +40,7 @@ ACTIVE_TRACKER_PID=''
 ACTIVE_TRACKER_STATE=''
 ACTIVE_LEASE_PID=''
 ACTIVE_LEASE_INSTANCE=''
+PRESERVE_REGISTRY_STATE=0
 
 usage() {
 	local exit_code="${1:-0}"
@@ -49,10 +50,10 @@ Usage:
   run-worker.sh continue --task-id ID --prompt-file FILE [--repo PATH] [--state-root PATH]
   run-worker.sh finish --task-id ID --status failed|blocked|interrupted --evidence TEXT [--repo PATH] [--state-root PATH]
 
-Launch atomically reserves, creates and binds a resumable Codex session,
-activates it, and sends the task without a PTY or manual EOF. Continue resumes
-the exact registered session. Structured final output is printed to stdout;
-streaming logs stay in the external registry state directory.
+Launch atomically reserves, creates and binds a resumable Codex session with a
+read-only handshake, activates it, and sends the task without a PTY or manual
+EOF. Continue resumes the exact registered session. Structured final output is
+printed to stdout; streaming logs stay in the external registry state directory.
 EOF
 	exit "$exit_code"
 }
@@ -70,6 +71,18 @@ runtime_state_is_writable() {
 	[[ -n "$codex_home" && -d "$codex_home" && -w "$codex_home" ]] || die "$EXIT_RUNTIME_STATE" "Codex runtime state is not writable: ${codex_home:-unknown}. The parent must allow the owning Codex state directory separately from the worker repository sandbox, then retry."
 	probe="$(mktemp "$codex_home/.luna-runtime-probe.XXXXXX" 2>/dev/null)" || die "$EXIT_RUNTIME_STATE" "Codex runtime state denied a real write probe: $codex_home. The parent must allow that exact runtime directory separately from the worker repository sandbox, then retry."
 	rm -f "$probe" || die "$EXIT_RUNTIME_STATE" "Codex runtime write probe could not be removed: $probe. Inspect it before retrying."
+}
+
+resolve_codex_home() {
+	local codex_home="${CODEX_HOME:-${HOME:-}/.codex}"
+	[[ -n "$codex_home" ]] || die "$EXIT_RUNTIME_STATE" 'Codex runtime state path is empty.'
+	case "$codex_home" in
+	/*) ;;
+	*) codex_home="$PWD/$codex_home" ;;
+	esac
+	codex_home="$(cd -P "$codex_home" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve Codex runtime state path: $codex_home."
+	CODEX_HOME="$codex_home"
+	export CODEX_HOME
 }
 
 validate_common() {
@@ -106,12 +119,13 @@ validate_common() {
 	prompt_parent="$(cd -P "$prompt_parent" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve prompt-file parent: $PROMPT_FILE."
 	PROMPT_FILE="$prompt_parent/$prompt_name"
 	case "$TASK_SANDBOX" in '' | read-only | workspace-write) ;; *) die "$EXIT_USAGE" 'sandbox must be read-only or workspace-write.' ;; esac
+	resolve_codex_home
 	runtime_state_is_writable
 }
 
 finish_on_error() {
 	local exit_code=$?
-	if [[ "$FINISHED" -eq 0 && -n "$TASK_ID" && -n "$INVOCATION_TOKEN" ]]; then
+	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && -n "$TASK_ID" && -n "$INVOCATION_TOKEN" ]]; then
 		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status failed --evidence "worker launcher exited $exit_code before a structured terminal result" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null 2>&1 || true
 	fi
 	INVOCATION_CLAIMED=0
@@ -149,12 +163,21 @@ stop_active_lease() {
 stop_active_child_and_exit() {
 	local signal_name="$1"
 	local exit_code="$2"
+	local cleanup_status=0
 	if [[ -n "$ACTIVE_HELPER_PID" ]] && kill -0 "$ACTIVE_HELPER_PID" 2>/dev/null; then
 		kill -s "$signal_name" "$ACTIVE_HELPER_PID" 2>/dev/null || true
 		wait "$ACTIVE_HELPER_PID" 2>/dev/null || true
 	fi
-	stop_codex_process_group "$signal_name" || true
-	stop_tracked_worker_processes "$signal_name" || true
+	if ! stop_codex_process_group "$signal_name"; then
+		cleanup_status=1
+	fi
+	if [[ "$cleanup_status" -eq 0 ]] && ! stop_tracked_worker_processes "$signal_name"; then
+		cleanup_status=1
+	fi
+	if [[ "$cleanup_status" -ne 0 ]]; then
+		PRESERVE_REGISTRY_STATE=1
+		exit "$exit_code"
+	fi
 	stop_active_lease
 	ACTIVE_HELPER_PID=''
 	ACTIVE_CODEX_PID=''
@@ -771,7 +794,7 @@ launch_worker() {
 		--ignore-user-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
-		-s "$TASK_SANDBOX" \
+		-s read-only \
 		-C "$REPO_ROOT" \
 		--json \
 		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' || codex_status=$?

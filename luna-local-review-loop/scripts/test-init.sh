@@ -32,12 +32,12 @@ readonly TEST_ROOT
 cleanup_test_root() {
 	local fixture_pid
 	local runner_pid
-	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}"; do
+	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}"; do
 		[[ -n "$runner_pid" ]] || continue
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
 	done
-	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}"; do
+	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}"; do
 		[[ -n "$fixture_pid" ]] || continue
 		kill -TERM "$fixture_pid" 2>/dev/null || true
 		wait "$fixture_pid" 2>/dev/null || true
@@ -82,6 +82,10 @@ readonly CODEX_DESCENDANT_PID_FILE="$TEST_ROOT/codex-descendant.pid"
 readonly CODEX_DETACHED_PID_FILE="$TEST_ROOT/codex-detached.pid"
 readonly CODEX_DETACHED_OBSERVED_FILE="$TEST_ROOT/codex-detached-observed"
 readonly CODEX_FAST_REPARENT_PID_FILE="$TEST_ROOT/codex-fast-reparent.pid"
+readonly TRACKER_HANDSHAKE_COMPLETED_MARKER="$TEST_ROOT/tracker-handshake-completed"
+readonly TRACKER_LEASE_WRITER_READY_MARKER="$TEST_ROOT/tracker-lease-writer-ready"
+readonly TRACKER_LEASE_RELEASE_MARKER="$TEST_ROOT/tracker-lease-release"
+export TRACKER_HANDSHAKE_COMPLETED_MARKER TRACKER_LEASE_WRITER_READY_MARKER TRACKER_LEASE_RELEASE_MARKER
 
 mkdir -p "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman" "$BIN_DIR" "$SLOW_BIN_DIR" "$CODEX_STATE"
 printf '%s\n' '# code reviewer' >"$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
@@ -97,8 +101,9 @@ git -C "$REPO_ROOT" commit -qm init
 cat >"$BIN_DIR/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'cwd=%s args=%s\n' "$PWD" "$*" >> "$CODEX_CALLS"
+printf 'cwd=%s codex_home=%s args=%s\n' "$PWD" "$CODEX_HOME" "$*" >> "$CODEX_CALLS"
 if [[ " $* " == *' exec resume '* ]]; then
+  if [[ "${FAKE_REQUIRE_WORKSPACE_WRITE_RESUME:-0}" == '1' && " $* " != *'sandbox_mode="workspace-write"'* ]]; then exit 92; fi
   result_path=''
   previous=''
   for argument in "$@"; do
@@ -194,7 +199,9 @@ if [[ " $* " == *' exec resume '* ]]; then
   printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"large stream stays in log"}}'
 else
 	printf '%s\n' 'irrelevant connector warning' >&2
-  if [[ "${FAKE_FAIL_HANDSHAKE:-0}" == '1' ]]; then exit 23; fi
+	[[ -z "${TRACKER_HANDSHAKE_COMPLETED_MARKER:-}" ]] || : >"$TRACKER_HANDSHAKE_COMPLETED_MARKER"
+	if [[ "${FAKE_REQUIRE_READ_ONLY_HANDSHAKE:-0}" == '1' && " $* " != *' -s read-only '* ]]; then exit 91; fi
+	if [[ "${FAKE_FAIL_HANDSHAKE:-0}" == '1' ]]; then exit 23; fi
   count=0
   [[ ! -f "$CODEX_COUNTER" ]] || count="$(cat "$CODEX_COUNTER")"
   count=$((count + 1))
@@ -516,6 +523,18 @@ copied_registry="$($INIT_SCRIPT --repo "$copied_repo" --state-root "$moved_state
 [[ "$copied_registry" != "$moved_registry" ]] || fail 'copied checkout shared the original checkout registry'
 jq -e '.workers == [] and .identity_ledger == []' "$copied_registry" >/dev/null || fail 'copied checkout inherited original live worker state'
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$moved_repo_new" --state-root "$moved_state" --task-id moved-checkout-worker --status interrupted --evidence 'repository move test complete' >/dev/null
+
+mkdir -p "$moved_repo/.agents/skills"
+cp -R "$REPO_ROOT/.agents/skills/code-reviewer" "$moved_repo/.agents/skills/code-reviewer"
+cp -R "$REPO_ROOT/.agents/skills/caveman" "$moved_repo/.agents/skills/caveman"
+git -C "$moved_repo" init -q
+replacement_repo_real="$(cd -P "$moved_repo" && pwd -P)"
+replacement_registry="$($INIT_SCRIPT --repo "$moved_repo" --state-root "$moved_state" --print-path)"
+[[ "$replacement_registry" != "$moved_registry" ]] || fail 'replacement repository reused moved checkout registry path'
+jq -e '.workers == [] and .identity_ledger == []' "$replacement_registry" >/dev/null || fail 'replacement repository inherited moved checkout lifecycle state'
+old_authority_key="$(printf '%s\n' "$replacement_repo_real" | shasum -a 256 | awk '{print $1}')"
+jq -e --arg root "$replacement_repo_real" --arg registry "$replacement_registry" '.repository_root == $root and .registry_path == $registry' "$AUTHORITY_ROOT/$old_authority_key.json" >/dev/null || fail 'stale old-path checkout authority was not replaced for the replacement repository'
+jq -e --arg root "$moved_repo_new_real" '.repository_root == $root and .workers == []' "$moved_registry" >/dev/null || fail 'moved checkout registry was not preserved while retiring stale old-path authority'
 
 linked_main_repo="$TEST_ROOT/linked-main-repo"
 linked_worktree="$TEST_ROOT/linked-worktree"
@@ -954,8 +973,20 @@ read_only_retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --r
 jq -e '.outcome == "completed"' <<<"$read_only_retry_output" >/dev/null || fail 'read-only runner retry did not complete'
 jq -e 'any(.identity_ledger[]; .task_id == "read-only-runner-retry" and .sandbox == "read-only" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'runner retry did not preserve read-only sandbox'
 
+printf '%s\n' 'workspace-write task after read-only handshake' >"$PROMPT_FILE"
+handshake_sandbox_output="$(FAKE_REQUIRE_READ_ONLY_HANDSHAKE=1 FAKE_REQUIRE_WORKSPACE_WRITE_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id handshake-sandbox-contract --scope 'read-only handshake before workspace-write resume' --sandbox workspace-write --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/handshake-sandbox.err")"
+jq -e '.outcome == "completed"' <<<"$handshake_sandbox_output" >/dev/null || fail 'workspace-write task did not use read-only handshake and registered resume sandbox'
+jq -e 'any(.identity_ledger[]; .task_id == "handshake-sandbox-contract" and .sandbox == "workspace-write" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'workspace-write task did not retain its registered resume sandbox'
+
 relative_codex_output="$(cd "$TEST_ROOT" && PATH="bin:$PATH" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id relative-codex-worker --scope 'canonicalize relative codex path' --prompt-file task.txt 2>"$TEST_ROOT/relative-codex.err")"
 jq -e '.outcome == "completed"' <<<"$relative_codex_output" >/dev/null || fail 'runner did not canonicalize a Codex executable found through a relative PATH entry'
+
+relative_codex_home="$TEST_ROOT/relative-codex-home"
+mkdir "$relative_codex_home"
+relative_codex_home_output="$(cd "$TEST_ROOT" && PATH="bin:$PATH" CODEX_HOME='relative-codex-home' CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id relative-codex-home-worker --scope 'preserve relative Codex home across repository-directory changes' --prompt-file task.txt 2>"$TEST_ROOT/relative-codex-home.err")"
+jq -e '.outcome == "completed"' <<<"$relative_codex_home_output" >/dev/null || fail 'runner did not complete with a relative CODEX_HOME'
+relative_codex_home_real="$(cd -P "$relative_codex_home" && pwd -P)"
+rg -F "codex_home=$relative_codex_home_real" "$CODEX_CALLS" >/dev/null || fail 'runner did not preserve relative CODEX_HOME as an absolute physical path after changing to --repo'
 
 slow_ps_marker="$TEST_ROOT/slow-ps.ready"
 slow_tracker_output="$(PATH="$SLOW_BIN_DIR:$PATH" LUNA_TEST_SLOW_PS=1 SLOW_PS_MARKER="$slow_ps_marker" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id slow-tracker-worker --scope 'wait for slow tracker readiness' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/slow-tracker.err")"
@@ -1075,13 +1106,13 @@ fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
 resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 11 ]] || fail "expected eleven exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 13 ]] || fail "expected thirteen exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 22 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 26 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
-[[ "$read_only_count" -eq 3 ]] || fail "expected original, retry, and continued-worker handshakes to use read-only sandbox, got $read_only_count"
+[[ "$read_only_count" -eq 13 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 11 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 13 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
 [[ "$read_only_resume_count" -eq 3 ]] || fail "expected read-only sandbox on retry and both continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then
@@ -1161,6 +1192,66 @@ else
 	jq -e '.status == "clean" and (.processes | length) == 0' "$fast_reparent_tracker" >/dev/null || fail 'fast-reparent tracker did not publish clean evidence after explicit cleanup'
 	CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id fast-reparent-worker --status interrupted --evidence 'non-procfs fast-reparented descendant required explicit cleanup' >"$TEST_ROOT/fast-reparent-finish.out"
 fi
+
+printf '%s\n' 'preserve lease when descendant cleanup is unproven' >"$PROMPT_FILE"
+rm -f "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE" "$TRACKER_HANDSHAKE_COMPLETED_MARKER" "$TRACKER_LEASE_WRITER_READY_MARKER" "$TRACKER_LEASE_RELEASE_MARKER"
+unproven_artifact_dir="$registry_dir/artifacts/unproven-signal-worker"
+unproven_lease_writer_pid=''
+(
+	writer_fd_opened=0
+	while [[ "$writer_fd_opened" -eq 0 ]]; do
+		if [[ ! -e "$TRACKER_HANDSHAKE_COMPLETED_MARKER" ]]; then
+			sleep 0.01
+			continue
+		fi
+		for lease_path in "$unproven_artifact_dir"/.lease-*; do
+			[[ -p "$lease_path" ]] || continue
+			if exec 8>"$lease_path"; then
+				writer_fd_opened=1
+				break
+			fi
+		done
+		[[ "$writer_fd_opened" -eq 1 ]] || sleep 0.01
+	done
+	: >"$TRACKER_LEASE_WRITER_READY_MARKER"
+	while [[ ! -e "$TRACKER_LEASE_RELEASE_MARKER" ]]; do sleep 0.01; done
+) &
+unproven_lease_writer_pid=$!
+FAKE_BLOCK_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id unproven-signal-worker --scope 'preserve active state when lease cleanup is unproven' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/unproven-signal.out" 2>"$TEST_ROOT/unproven-signal.err" &
+unproven_runner_pid=$!
+wait_for_blocking_fixture "$unproven_runner_pid" "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE" 'unproven-cleanup Codex process group did not start'
+poll_attempt=0
+while [[ ! -e "$TRACKER_LEASE_WRITER_READY_MARKER" ]] && process_is_live_non_zombie "$unproven_runner_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$TRACKER_LEASE_WRITER_READY_MARKER" ]] || fail 'unproven-cleanup lease writer did not retain lease evidence'
+kill -TERM "$unproven_runner_pid"
+unproven_status=0
+wait "$unproven_runner_pid" || unproven_status=$?
+unproven_runner_pid=''
+[[ "$unproven_status" -ne 0 ]] || fail 'runner with unproven descendant cleanup exited successfully'
+jq -e 'any(.workers[]; .task_id == "unproven-signal-worker" and .status == "active" and .invocation_pid != null and .active_child_pgid != null)' "$registry_path" >/dev/null || fail 'unproven descendant cleanup retired or cleared recoverable registry state'
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id unproven-signal-worker --status interrupted --evidence 'lease evidence still requires explicit cleanup' >"$TEST_ROOT/unproven-signal-finish.out" 2>&1; then
+	fail 'recovery retired a task while its lifecycle lease remained live'
+fi
+: >"$TRACKER_LEASE_RELEASE_MARKER"
+poll_attempt=0
+while process_is_live_non_zombie "$unproven_lease_writer_pid" && [[ "$poll_attempt" -lt 100 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+kill -TERM "$unproven_lease_writer_pid" 2>/dev/null || true
+wait "$unproven_lease_writer_pid" 2>/dev/null || true
+unproven_lease_writer_pid=''
+unproven_tracker="$unproven_artifact_dir/.descendants-$(jq -r '.workers[] | select(.task_id == "unproven-signal-worker") | .invocation_token' "$registry_path").json"
+poll_attempt=0
+while [[ ! -f "$unproven_tracker" || "$(jq -r '.status // empty' "$unproven_tracker" 2>/dev/null)" != clean ]] && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+jq -e '.status == "clean" and (.processes | length) == 0' "$unproven_tracker" >/dev/null || fail 'unproven-cleanup tracker did not publish clean evidence after explicit lease cleanup'
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id unproven-signal-worker --status interrupted --evidence 'lease evidence explicitly cleaned' >"$TEST_ROOT/unproven-signal-finish-clean.out"
 
 printf '%s\n' 'terminate child safely' >"$PROMPT_FILE"
 rm -f "$CODEX_CHILD_PID_FILE" "$CODEX_DESCENDANT_PID_FILE"
