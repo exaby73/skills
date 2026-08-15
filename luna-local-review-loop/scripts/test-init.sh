@@ -224,6 +224,9 @@ if [[ " $* " == *' exec resume '* ]]; then
   printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"large stream stays in log"}}'
 else
 	printf '%s\n' 'irrelevant connector warning' >&2
+	if [[ "${FAKE_REQUIRE_CLOSED_PROMPT_FD:-0}" == '1' ]] && (: <&8) 2>/dev/null; then
+		exit 92
+	fi
 	[[ -z "${TRACKER_HANDSHAKE_COMPLETED_MARKER:-}" ]] || : >"$TRACKER_HANDSHAKE_COMPLETED_MARKER"
 	if [[ "${FAKE_HANDSHAKE_PROMPT_RACE:-0}" == '1' ]]; then
 		: >"$PROMPT_RACE_MARKER"
@@ -1070,6 +1073,16 @@ if CODEX_HOME="$INVALID_CODEX_STATE" CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT"
 fi
 jq -e 'all(.identity_ledger[]; .task_id != "denied-runtime")' "$registry_path" >/dev/null || fail 'runtime permission failure burned a task reservation'
 
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id rejected-launch-staging --scope 'reject launch after prompt staging' >/dev/null
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id rejected-launch-staging --scope 'reject launch after prompt staging' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/rejected-launch-staging.out" 2>&1; then
+	fail 'reservation-conflict launch unexpectedly succeeded'
+fi
+for staged_prompt_path in "$registry_dir"/artifacts/.prompt-*; do
+	[[ -e "$staged_prompt_path" || -L "$staged_prompt_path" ]] || continue
+	fail 'rejected launch left a staged prompt copy'
+done
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id rejected-launch-staging --status interrupted --evidence 'rejected launch staging cleanup test complete' >/dev/null
+
 if FAKE_FAIL_HANDSHAKE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id failed-runner --scope 'runner retry scope' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/failed-runner.out" 2>&1; then
 	fail 'failed handshake unexpectedly succeeded'
 fi
@@ -1105,7 +1118,7 @@ prompt_race_original='immutable task prompt before handshake'
 printf '%s\n' "$prompt_race_original" >"$PROMPT_FILE"
 rm -f "$PROMPT_RACE_MARKER" "$PROMPT_RACE_RELEASE" "$CODEX_PROMPT_CAPTURE"
 prompt_race_status=0
-FAKE_HANDSHAKE_PROMPT_RACE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id prompt-race-worker --scope 'snapshot prompt before handshake mutation' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/prompt-race.out" 2>"$TEST_ROOT/prompt-race.err" &
+FAKE_HANDSHAKE_PROMPT_RACE=1 FAKE_REQUIRE_CLOSED_PROMPT_FD=1 FAKE_REQUIRE_WORKSPACE_WRITE_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id prompt-race-worker --scope 'open immutable prompt before workspace-write resume' --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/prompt-race.out" 2>"$TEST_ROOT/prompt-race.err" &
 prompt_race_runner_pid=$!
 poll_attempt=0
 while [[ ! -e "$PROMPT_RACE_MARKER" && "$poll_attempt" -lt 200 ]]; do
@@ -1118,14 +1131,16 @@ prompt_snapshot_path="$registry_dir/artifacts/prompt-race-worker/.task-prompt"
 [[ "$(cat "$prompt_snapshot_path")" == "$prompt_race_original" ]] || fail 'prompt snapshot did not preserve validated prompt contents before handshake'
 jq -e 'any(.workers[]; .task_id == "prompt-race-worker" and .status == "reserved")' "$registry_path" >/dev/null || fail 'prompt race did not prove snapshot creation preceded registry reservation'
 printf '%s\n' 'caller replacement during handshake' >"$PROMPT_FILE"
+printf '%s\n' 'task artifact replacement during handshake' >"$TEST_ROOT/prompt-race-replacement"
+mv "$TEST_ROOT/prompt-race-replacement" "$prompt_snapshot_path"
 : >"$PROMPT_RACE_RELEASE"
 prompt_race_status=0
 wait "$prompt_race_runner_pid" || prompt_race_status=$?
 prompt_race_runner_pid=''
 [[ "$prompt_race_status" -eq 0 ]] || fail 'prompt snapshot race worker did not complete'
 jq -e '.outcome == "completed"' <"$TEST_ROOT/prompt-race.out" >/dev/null || fail 'prompt snapshot race worker returned invalid result'
-[[ "$(cat "$CODEX_PROMPT_CAPTURE")" == "$prompt_race_original" ]] || fail 'first resume consumed caller-replaced prompt instead of immutable snapshot'
-snapshot_link_count="$(stat -f '%l' "$prompt_snapshot_path" 2>/dev/null || stat -c '%h' "$prompt_snapshot_path" 2>/dev/null)"
+[[ "$(cat "$CODEX_PROMPT_CAPTURE")" == "$prompt_race_original" ]] || fail 'first workspace-write resume consumed a task-artifact replacement during handshake'
+snapshot_link_count="$(stat -c '%h' "$prompt_snapshot_path" 2>/dev/null || stat -f '%l' "$prompt_snapshot_path" 2>/dev/null)"
 [[ "$snapshot_link_count" == '1' ]] || fail 'prompt snapshot did not retain single-link ownership'
 
 relative_codex_output="$(cd "$TEST_ROOT" && PATH="bin:$PATH" CODEX_BIN=codex "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id relative-codex-worker --scope 'canonicalize relative codex path' --prompt-file task.txt 2>"$TEST_ROOT/relative-codex.err")"
