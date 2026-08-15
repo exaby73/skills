@@ -145,8 +145,8 @@ The ancestry tracker is cooperative lifecycle safety, not a container or OS secu
 |---|---|
 | `init` / `path` | Validate prerequisites and initialize/print external registry path |
 | `reserve` | Append a fresh immutable task, optionally linked with `--retry-of` and an atomic initial invocation claim |
-| `bind` | Bind one globally unique Codex session to one reserved task |
-| `activate` | Activate the exact bound task/session |
+| `bind` | Bind one globally unique Codex session; a live invocation owner must supply its exact token |
+| `activate` | Activate the exact bound task/session under the same live-owner token rule |
 | `checkpoint` | Save evidence while keeping a task active |
 | `claim-invocation` / `release-invocation` | Atomically serialize one live runner per task, require active continuation state, and reclaim only a dead owner whose recorded child is gone |
 | `record-child` / `clear-child` | Persist and clear the gated Codex process-group ID after proving the group empty |
@@ -154,7 +154,7 @@ The ancestry tracker is cooperative lifecycle safety, not a container or OS secu
 | `query` / `active` | Read ledger task or live workers |
 | `assert-no-active` / `assert-empty` | Prove no reserved, bound, or active workers remain |
 
-Low-level commands exist for recovery and inspection. Tokenless retirement is allowed only when no invocation owns the task or the recorded owner is confirmed exited; a live owner must use its exact invocation token. `completed` additionally requires the token-owning active runner, so recovery commands cannot bypass structured-result validation. Process probes force the stable C locale, treat zombies as exited, and remain conservative when access is ambiguous. Normal launches should use `run-worker.sh` so registry and process state transition together.
+Low-level commands exist for recovery and inspection. Tokenless binding, activation, or retirement is allowed only when no invocation owns the task or the recorded owner is confirmed exited; a live owner must use its exact invocation token. `completed` additionally requires the token-owning active runner, so recovery commands cannot bypass structured-result validation. Process probes force the stable C locale, treat zombies as exited, and remain conservative when access is ambiguous. Normal launches should use `run-worker.sh` so registry and process state transition together.
 
 ## Permission brokerage
 
@@ -181,4 +181,4 @@ Run without network access:
 ./luna-local-review-loop/scripts/test-init.sh
 ```
 
-The test covers tracked-project-nonmutating init, repository moves, copied-checkout isolation and replacement-repository refusal, symlink-safe external state, lock, and artifact paths, first-creation legacy-registry refusal, external recovery when legacy state reappears, inverse ledger/worker consistency, duplicate-live-scope and malformed-process-ID rejection, external persistent state, conservative stale-process detection, ownerless/stale/concurrent atomic-lock recovery, schema-valid sandbox-preserving single-child retry chains, atomic initial reservation ownership, live-owner token enforcement, active-only continuation claims, previous-token tracker checks during stale reclaim, a fast handshake with no invocation handle, portable artifact counting, single-link artifact ownership, sparse attempt numbering, stale-group clearing during atomic reclaim, serialized exact-session continuation without PTY/EOF, normal, zombie, detached-descendant, descendant-group, and hard-kill recovery, process-instance pinning, strict completed-result ownership, artifact-independent recovery, structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.
+The test covers tracked-project-nonmutating init, repository moves, copied-checkout isolation and replacement-repository refusal, symlink-safe external state, lock, and artifact paths, first-creation legacy-registry refusal, external recovery when legacy state reappears, inverse ledger/worker consistency, duplicate-live-scope and malformed-process-ID rejection, external persistent state, conservative stale-process detection, ownerless/stale/concurrent atomic-lock recovery, schema-valid sandbox-preserving single-child retry chains, atomic initial reservation ownership, live-owner token enforcement for bind, activation, and retirement, active-only continuation claims, previous-token tracker checks during stale reclaim, a fast handshake with no invocation handle, portable artifact counting, single-link artifact ownership, sparse attempt numbering, stale-group clearing during atomic reclaim, serialized exact-session continuation without PTY/EOF, normal, zombie, synchronized detached-descendant, descendant-group, and hard-kill recovery, process-instance pinning, strict completed-result ownership, artifact-independent recovery, structured-output and stderr separation, disabled user MCP config, recovery without launch prerequisites, atomic retirement, and cleanup assertions.

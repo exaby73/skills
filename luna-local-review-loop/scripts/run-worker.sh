@@ -237,29 +237,39 @@ tracked_worker_processes_are_empty() {
 	return 0
 }
 
+tracker_process_is_live() {
+	local tracker_pid="$1"
+	local process_state=''
+	process_state="$(ps -p "$tracker_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"
+	case "$process_state" in '' | Z*) return 1 ;; *) return 0 ;; esac
+}
+
 stop_tracked_worker_processes() {
 	local signal_name="$1"
 	local attempt=0
+	local kill_attempt=0
 	local pid
 	local instance
 	[[ -n "$ACTIVE_TRACKER_STATE" ]] || return 0
-	while ! tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE" && [[ "$attempt" -lt 50 ]]; do
+	while [[ -n "$ACTIVE_TRACKER_PID" ]] && tracker_process_is_live "$ACTIVE_TRACKER_PID" && [[ "$attempt" -lt 100 ]]; do
 		while IFS='|' read -r pid instance; do
 			process_instance_matches "$pid" "$instance" && kill -s "$signal_name" "$pid" 2>/dev/null || true
 		done < <(tracked_worker_processes "$ACTIVE_TRACKER_STATE")
 		sleep 0.05
 		attempt=$((attempt + 1))
 	done
-	if ! tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE"; then
+	while [[ -n "$ACTIVE_TRACKER_PID" ]] && tracker_process_is_live "$ACTIVE_TRACKER_PID" && [[ "$kill_attempt" -lt 50 ]]; do
 		while IFS='|' read -r pid instance; do
 			process_instance_matches "$pid" "$instance" && kill -KILL "$pid" 2>/dev/null || true
 		done < <(tracked_worker_processes "$ACTIVE_TRACKER_STATE")
 		sleep 0.05
-	fi
-	tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE" || return 1
+		kill_attempt=$((kill_attempt + 1))
+	done
 	if [[ -n "$ACTIVE_TRACKER_PID" ]]; then
+		tracker_process_is_live "$ACTIVE_TRACKER_PID" && return 1
 		wait "$ACTIVE_TRACKER_PID" 2>/dev/null || return 1
 	fi
+	tracked_worker_processes_are_empty "$ACTIVE_TRACKER_STATE" || return 1
 	jq -e '.status == "clean"' "$ACTIVE_TRACKER_STATE" >/dev/null 2>&1 || return 1
 	ACTIVE_TRACKER_PID=''
 }
@@ -589,13 +599,13 @@ launch_worker() {
 		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' || codex_status=$?
 	if [[ "$codex_status" -ne 0 ]]; then
 		SESSION_ID="$(extract_session_id "$launch_log")"
-		[[ -z "$SESSION_ID" ]] || run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+		[[ -z "$SESSION_ID" ]] || run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
 		die "$EXIT_WORKER" "Codex handshake failed for task $TASK_ID. Logs: $launch_log and $launch_stderr"
 	fi
 	SESSION_ID="$(extract_session_id "$launch_log")"
 	[[ -n "$SESSION_ID" ]] || die "$EXIT_WORKER" "Codex handshake emitted no thread.started session ID. Log: $launch_log"
-	run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
-	run_registry_quiet activate --task-id "$TASK_ID" --session-id "$SESSION_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+	run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+	run_registry_quiet activate --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
 	resume_task "$artifact_dir"
 }
 

@@ -49,7 +49,7 @@ task_scope='owned paths: src/a.ts; task: implement validator; validator: pnpm ch
   --prompt-file '/absolute/path/to/task-prompt.txt'
 ```
 
-The launcher atomically reserves the task together with its initial invocation claim, starts a non-ephemeral handshake, captures the Codex session ID from JSONL even when the command exits immediately, binds and activates that session, resumes it with prompt-file stdin, and writes streaming logs outside the project. It returns only the final structured result on stdout. A signal or failure after reservation can retire only the task carrying that invocation token.
+The launcher atomically reserves the task together with its initial invocation claim, starts a non-ephemeral handshake, captures the Codex session ID from JSONL even when the command exits immediately, binds and activates that session with the same invocation token, resumes it with prompt-file stdin, and writes streaming logs outside the project. It returns only the final structured result on stdout. A live invocation owner exclusively controls binding, activation, and retirement through its exact token; tokenless recovery is allowed only after that owner is confirmed exited.
 
 Never add `--ephemeral` to a resumable worker. The durable identity is the Codex session ID (`01...`). A live `exec_command.session_id` integer is only a transient inner process-control handle. A `functions.exec` cell ID and a shell PID are neither worker identities nor accepted registry handles. The registry intentionally stores none of those process handles.
 

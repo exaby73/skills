@@ -48,6 +48,7 @@ readonly CODEX_COUNTER="$TEST_ROOT/codex-counter"
 readonly CODEX_CHILD_PID_FILE="$TEST_ROOT/codex-child.pid"
 readonly CODEX_DESCENDANT_PID_FILE="$TEST_ROOT/codex-descendant.pid"
 readonly CODEX_DETACHED_PID_FILE="$TEST_ROOT/codex-detached.pid"
+readonly CODEX_DETACHED_OBSERVED_FILE="$TEST_ROOT/codex-detached-observed"
 
 mkdir -p "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman" "$BIN_DIR" "$CODEX_STATE"
 printf '%s\n' '# code reviewer' >"$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md"
@@ -76,16 +77,47 @@ if [[ " $* " == *' exec resume '* ]]; then
     set -m
     (
       set -m
+      released=0
+      trap 'released=1' TERM
+      while [[ "$released" -eq 0 ]]; do sleep 0.01; done
       nohup sleep 300 >/dev/null 2>&1 &
       detached_pid=$!
       disown "$detached_pid"
       printf '%s\n' "$detached_pid" > "$CODEX_DETACHED_PID_FILE"
-      sleep 0.2
+      observed=0
+      attempt=0
+      while [[ "$attempt" -lt 500 ]]; do
+        for tracker in "$CODEX_DETACHED_TRACKER_DIR"/.descendants-*.json; do
+          [[ -f "$tracker" ]] || continue
+          if jq -e --argjson pid "$detached_pid" 'any(.processes[]; .pid == $pid)' "$tracker" >/dev/null 2>&1; then
+            observed=1
+            break
+          fi
+        done
+        [[ "$observed" -eq 0 ]] || break
+        sleep 0.01
+        attempt=$((attempt + 1))
+      done
+      [[ "$observed" -eq 0 ]] || printf '%s\n' observed > "$CODEX_DETACHED_OBSERVED_FILE"
     ) &
     detacher_pid=$!
     disown "$detacher_pid"
+    observed=0
+    attempt=0
+    while [[ "$attempt" -lt 500 ]]; do
+      for tracker in "$CODEX_DETACHED_TRACKER_DIR"/.descendants-*.json; do
+        [[ -f "$tracker" ]] || continue
+        if jq -e --argjson pid "$detacher_pid" 'any(.processes[]; .pid == $pid)' "$tracker" >/dev/null 2>&1; then
+          observed=1
+          break
+        fi
+      done
+      [[ "$observed" -eq 0 ]] || break
+      sleep 0.01
+      attempt=$((attempt + 1))
+    done
+    [[ "$observed" -eq 1 ]] || exit 90
     set +m
-    sleep 0.3
   fi
   if [[ "${FAKE_BLOCK_RESUME:-0}" == '1' ]]; then
     printf '%s\n' "$$" > "$CODEX_CHILD_PID_FILE"
@@ -127,6 +159,7 @@ export CODEX_COUNTER
 export CODEX_CHILD_PID_FILE
 export CODEX_DESCENDANT_PID_FILE
 export CODEX_DETACHED_PID_FILE
+export CODEX_DETACHED_OBSERVED_FILE
 export CODEX_HOME="$CODEX_STATE"
 
 before_status="$(git -C "$REPO_ROOT" status --short)"
@@ -455,6 +488,30 @@ fi
 kill "$zombie_parent_pid" 2>/dev/null || true
 wait "$zombie_parent_pid" 2>/dev/null || true
 
+sleep 30 &
+bind_owner_pid=$!
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-bind --scope 'require live invocation authority for bind and activate' --pid "$bind_owner_pid" --token bind-owner >/dev/null
+if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-bind --session-id 01owned-bind-session >/dev/null 2>&1; then
+	fail 'tokenless bind mutated a task owned by a live invocation'
+fi
+if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-bind --session-id 01owned-bind-session --invocation-token wrong-owner >/dev/null 2>&1; then
+	fail 'mismatched invocation token bound an owned task'
+fi
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-bind --session-id 01owned-bind-session --invocation-token bind-owner >/dev/null
+if "$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-bind --session-id 01owned-bind-session >/dev/null 2>&1; then
+	fail 'tokenless activation mutated a task owned by a live invocation'
+fi
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-bind --session-id 01owned-bind-session --invocation-token bind-owner >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-bind --status interrupted --evidence 'bind ownership test complete' --invocation-token bind-owner >/dev/null
+kill "$bind_owner_pid" 2>/dev/null || true
+wait "$bind_owner_pid" 2>/dev/null || true
+
+dead_bind_owner_pid=99999999
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id recovered-bind --scope 'allow tokenless bind after invocation owner exits' --pid "$dead_bind_owner_pid" --token dead-bind-owner >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id recovered-bind --session-id 01recovered-bind-session >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id recovered-bind --session-id 01recovered-bind-session >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id recovered-bind --status interrupted --evidence 'dead owner recovery complete' >/dev/null
+
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --scope 'atomic initial reservation ownership' --pid "$$" --token initial-owner >/dev/null
 if "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id owned-reservation --status interrupted --evidence 'tokenless live-owner retirement' >/dev/null 2>&1; then
 	fail 'tokenless recovery retired a task owned by a live invocation'
@@ -593,10 +650,12 @@ rg -F 'irrelevant connector warning' "$(dirname "$registry_path")/artifacts/fast
 [[ "$(git -C "$REPO_ROOT" status --short)" == "$before_status" ]] || fail 'worker lifecycle modified repository tooling state'
 
 printf '%s\n' 'drain detached descendant' >"$PROMPT_FILE"
-rm -f "$CODEX_DETACHED_PID_FILE"
-detached_output="$(FAKE_DETACH_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id detached-worker --scope 'drain detached worker descendant' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/detached.err")"
+rm -f "$CODEX_DETACHED_PID_FILE" "$CODEX_DETACHED_OBSERVED_FILE"
+detached_tracker_dir="$(dirname "$registry_path")/artifacts/detached-worker"
+detached_output="$(FAKE_DETACH_RESUME=1 CODEX_DETACHED_TRACKER_DIR="$detached_tracker_dir" CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --state-root "$STATE_ROOT" --task-id detached-worker --scope 'drain detached worker descendant' --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/detached.err")"
 jq -e '.outcome == "completed"' <<<"$detached_output" >/dev/null || fail 'worker with detached descendant did not complete'
 [[ -s "$CODEX_DETACHED_PID_FILE" ]] || fail 'detached descendant fixture did not publish its PID'
+[[ -s "$CODEX_DETACHED_OBSERVED_FILE" ]] || fail 'detached descendant fixture exited before tracker observation'
 detached_pid="$(cat "$CODEX_DETACHED_PID_FILE")"
 if process_is_live_non_zombie "$detached_pid"; then
 	fail 'detached worker descendant survived registry retirement'

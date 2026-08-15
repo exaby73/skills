@@ -97,8 +97,8 @@ usage() {
 Usage:
   registry.sh init|path [--repo PATH] [--state-root PATH]
   registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--sandbox read-only|workspace-write] [--pid PID --token TOKEN] [--repo PATH] [--state-root PATH]
-  registry.sh bind --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
-  registry.sh activate --task-id ID --session-id ID [--repo PATH] [--state-root PATH]
+  registry.sh bind --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH] [--state-root PATH]
+  registry.sh activate --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH] [--state-root PATH]
   registry.sh checkpoint --task-id ID --evidence TEXT [--repo PATH] [--state-root PATH]
   registry.sh claim-invocation --task-id ID --pid PID --token TOKEN [--require-status active] [--repo PATH] [--state-root PATH]
   registry.sh release-invocation --task-id ID --token TOKEN [--repo PATH] [--state-root PATH]
@@ -158,6 +158,26 @@ process_group_is_confirmed_empty() {
 	case "$pgid" in '' | 0 | *[!0-9]*) return 1 ;; esac
 	live_count="$(ps -ax -o pgid=,stat= 2>/dev/null | awk -v target="$pgid" '$1 == target && $2 !~ /^Z/ {count++} END {print count + 0}')" || return 1
 	[[ "$live_count" -eq 0 ]]
+}
+
+require_invocation_authority() {
+	local task_id="$1"
+	local provided_token="$2"
+	local owner_pid=''
+	local owner_token=''
+	owner_pid="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_pid // empty' "$REGISTRY_PATH")"
+	owner_token="$(jq -r --arg task_id "$task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token // empty' "$REGISTRY_PATH")"
+	if [[ -z "$owner_token" ]]; then
+		[[ -z "$provided_token" ]] || die "$EXIT_CONFLICT" "task has no invocation owner for the supplied token: $task_id."
+		return 0
+	fi
+	if [[ -n "$provided_token" ]]; then
+		[[ "$provided_token" == "$owner_token" ]] || die "$EXIT_CONFLICT" "invocation token does not own task: $task_id."
+		return 0
+	fi
+	if [[ -z "$owner_pid" ]] || ! pid_is_confirmed_nonexistent "$owner_pid"; then
+		die "$EXIT_CONFLICT" "task has a live invocation owner; supply its exact token: $task_id."
+	fi
 }
 
 descendant_state_path() {
@@ -334,6 +354,7 @@ command_reserve() {
 command_bind() {
 	local task_id=''
 	local session_id=''
+	local invocation_token=''
 	while [[ $# -gt 0 ]]; do
 		if parse_common "$@"; then
 			shift "$PARSE_SHIFT"
@@ -348,15 +369,21 @@ command_bind() {
 			session_id="${2:-}"
 			shift 2
 			;;
+		--invocation-token)
+			invocation_token="${2:-}"
+			shift 2
+			;;
 		*) die "$EXIT_USAGE" "unknown bind argument: $1." ;;
 		esac
 	done
 	[[ -n "$task_id" && -n "$session_id" ]] || die "$EXIT_USAGE" 'bind requires --task-id and --session-id.'
 	validate_identity 'task-id' "$task_id"
 	validate_identity 'session-id' "$session_id"
+	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
 	acquire_lock
 	jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id and .status == "reserved" and .session_id == null)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "task is not an unbound reservation: $task_id."
+	require_invocation_authority "$task_id" "$invocation_token"
 	jq -e --arg session_id "$session_id" 'all(.identity_ledger[]; .session_id != $session_id)' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" "Codex session is already bound: $session_id."
 	local timestamp
 	timestamp="$(now_utc)"
@@ -371,6 +398,7 @@ command_bind() {
 command_activate() {
 	local task_id=''
 	local session_id=''
+	local invocation_token=''
 	while [[ $# -gt 0 ]]; do
 		if parse_common "$@"; then
 			shift "$PARSE_SHIFT"
@@ -385,15 +413,21 @@ command_activate() {
 			session_id="${2:-}"
 			shift 2
 			;;
+		--invocation-token)
+			invocation_token="${2:-}"
+			shift 2
+			;;
 		*) die "$EXIT_USAGE" "unknown activate argument: $1." ;;
 		esac
 	done
 	[[ -n "$task_id" && -n "$session_id" ]] || die "$EXIT_USAGE" 'activate requires --task-id and --session-id.'
 	validate_identity 'task-id' "$task_id"
 	validate_identity 'session-id' "$session_id"
+	[[ -z "$invocation_token" ]] || validate_identity 'invocation-token' "$invocation_token"
 	resolve_registry
 	acquire_lock
 	jq -e --arg task_id "$task_id" --arg session_id "$session_id" 'any(.workers[]; .task_id == $task_id and .session_id == $session_id and .status == "bound")' "$REGISTRY_PATH" >/dev/null || die "$EXIT_CONFLICT" 'activation requires the exact bound task and Codex session.'
+	require_invocation_authority "$task_id" "$invocation_token"
 	local timestamp
 	timestamp="$(now_utc)"
 	atomic_write '
