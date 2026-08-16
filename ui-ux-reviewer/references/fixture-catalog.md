@@ -20,7 +20,7 @@ Linked `docs/interface-contract.md`
 # Interface contract
 
 - A route's primary action is visible and named in its main content without requiring a generic overflow menu.
-- Interactive text and controls meet the repository's contrast requirements, and every keyboard-focusable control has a visible focus indicator.
+- Interactive text and controls meet the repository's contrast requirements; normal text has a minimum contrast ratio of 4.5:1 against its background, and every keyboard-focusable control has a visible focus indicator.
 - Content in the main panel aligns to the shared content edge and uses the spacing scale.
 - Primary controls use the `action-primary` component, the `color-action-primary` token, and a minimum target height of 44px.
 ```
@@ -60,8 +60,10 @@ Source and rendered artifact
 .summary { margin-left: 24px; padding: 12px; }
 .finish {
   min-height: 32px;
-  background: #888;
-  color: #fff;
+  background: #fff;
+  color: #888;
+  font-size: 16px;
+  font-weight: normal;
 }
 button:focus { outline: none; }
 ```
@@ -71,8 +73,8 @@ The page is runnable. Activating `More actions` reveals the menu, and activating
 Rendered observations
 
 - At `/work-items/42`, viewport `390x844`, ready state, the main content exposes only the generic `More actions` icon. The `Finalize` name and action are absent from the visible content and accessibility tree until the menu is opened.
-- At the same route and viewport with the menu open, the `Finalize` button renders gray `#888` text on white with computed contrast `3.54:1`. Tabbing to it moves keyboard focus but produces no visible indicator because the focus rule removes the outline.
-- At viewport `1440x900`, the summary content begins `24px` from the panel edge while the heading begins `32px` from that edge; the related content therefore uses two alignment edges. The finalization control is `32px` tall.
+- At the same route and viewport with the menu open, the `Finalize` button renders `16px` normal-weight gray `#888` text on white `#fff` with computed contrast `3.54:1`. Tabbing to it moves keyboard focus but produces no visible indicator because the focus rule removes the outline.
+- At viewport `1440x900`, the `.content` and heading begin `32px` from the panel edge; the summary box begins at `56px` after its `24px` margin-left, and the summary text begins at `68px` after its `12px` padding. The related content therefore uses two alignment edges. The finalization control is `32px` tall.
 - The finalization control uses the local `.finish` class, a hard-coded background, and a `32px` target instead of the required `action-primary` component, `color-action-primary` token, and `44px` minimum.
 
 ## Fixture: preference-only-ui
@@ -115,7 +117,10 @@ Source and rendered artifact
   <h1>Collections</h1>
   <button class="action-primary" type="button"><span aria-hidden="true">+</span> Add collection</button>
 </header>
-<nav id="collection-nav" aria-label="Collection sections" hidden>Overview · Archived</nav>
+<nav id="collection-nav" aria-label="Collection sections" hidden>
+  <a href="/collections">Overview</a>
+  <a href="/collections/archived">Archived</a>
+</nav>
 <section class="cards" aria-label="Collection summaries">
   <article class="card"><h2>Recent</h2><p>12 items</p></article>
   <article class="card"><h2>Saved</h2><p>8 items</p></article>
@@ -126,7 +131,7 @@ Rendered observations
 
 - At viewport `390x844`, the title and labeled `Add collection` action are visible in the first viewport. The navigation disclosure is labeled, has an `aria-expanded` state, and opens without horizontal overflow. Cards form one column with 16px gaps.
 - At viewport `834x1112`, cards form two columns and the action remains reachable without overlap. At `1440x900`, the same top navigation remains clear and the card grid uses the shared 24px outer spacing.
-- The plus icon is paired with text, the action uses the shared primary control, and keyboard focus is visible on the toggle, action, and links.
+- The plus icon is paired with text, the action uses the shared primary control, and keyboard focus is visible on the toggle, action, and semantic Overview and Archived links.
 - The compact top navigation is an allowed alternative to side navigation. Text, hierarchy, spacing scale, and responsive behavior remain consistent with the linked guidance.
 
 ## Fixture: clean-ui

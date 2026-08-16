@@ -16,15 +16,15 @@
           "severity": "Major",
           "scenario": "A keyboard user opens the action menu and tries to read and operate the finalization control.",
           "impact": "Low-vision users cannot reliably read the control, and keyboard users cannot see which control has focus.",
-          "evidence": "At /work-items/42, 390x844, menu-open ready state, .finish renders #888 on #fff at computed contrast 3.54:1 and button:focus removes the visible focus indicator while tabbing.",
-          "governingCriterion": "The linked interface contract requires readable control contrast and a visible focus indicator for every keyboard-focusable control.",
+          "evidence": "At /work-items/42, 390x844, menu-open ready state, .finish renders 16px normal-weight #888 text on #fff at computed contrast 3.54:1, below the contract's 4.5:1 normal-text threshold, and button:focus removes the visible focus indicator while tabbing.",
+          "governingCriterion": "The linked interface contract requires normal text to meet a minimum contrast ratio of 4.5:1 against its background and requires a visible focus indicator for every keyboard-focusable control.",
           "fixBoundary": "Apply the repository's contrast-compliant control styling and restore a visible focus indicator for the affected controls."
         },
         {
           "severity": "Major",
           "scenario": "An operator scans the work-item summary and heading to understand the page hierarchy.",
           "impact": "Related content uses different alignment edges, weakening the established hierarchy and making the route harder to scan.",
-          "evidence": "At /work-items/42, 1440x900, routes/work-items/42.html starts .content at 32px while .summary adds a 24px margin-left; the rendered heading and summary begin on different edges.",
+          "evidence": "At /work-items/42, 1440x900, the .content and heading begin at 32px from the panel edge; the .summary box begins at 56px after its 24px margin-left and its text begins at 68px after its 12px padding, so related content does not share the 32px edge.",
           "governingCriterion": "The linked interface contract requires main-panel content to align to the shared content edge and use the spacing scale.",
           "fixBoundary": "Align the summary to the shared content edge and replace the one-off spacing with the applicable spacing token."
         },
@@ -57,11 +57,12 @@
       "blockingFindings": [],
       "nonBlockingSuggestions": [],
       "missingEvidence": [
+        "The route-specific acceptance notes referenced by Repository AGENTS.md",
         "A runnable rendered /profile route at the exact review revision",
         "Rendered DOM or accessibility-tree evidence and an interaction trace for save, pending, success, and error states",
         "Representative mobile, tablet, and desktop observations"
       ],
-      "requiredAction": "Provide a runnable preview or deterministic rendered artifact with the save journey and representative viewports, then repeat the review against the exact revision."
+      "requiredAction": "Provide the route-specific acceptance notes and a runnable rendered /profile preview at the exact review revision with the save journey and representative viewports, then repeat the review against the exact revision."
     }
   ]
 }
