@@ -1,0 +1,4 @@
+interface:
+  display_name: "UI/UX Reviewer"
+  short_description: "Evidence-based interface review without preference churn"
+  default_prompt: "Use $ui-ux-reviewer to review these interface changes and return an evidence-based conclusion."
