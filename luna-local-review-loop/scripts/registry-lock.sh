@@ -19,6 +19,23 @@ release_lock() {
 	fi
 }
 
+cleanup_unpublished_lock_candidate() {
+	if [[ -n "${LOCK_OWNER_FILE:-}" && -f "$LOCK_OWNER_FILE" && ! -L "$LOCK_OWNER_FILE" ]]; then
+		rm -f "$LOCK_OWNER_FILE" 2>/dev/null || true
+	fi
+}
+
+lock_exit_cleanup() {
+	# Release published lock first; candidate path may be the lock's only other
+	# hard link, so removing it before release would hide the owner identity.
+	release_lock
+	cleanup_unpublished_lock_candidate
+}
+
+# Shared callers inherit this trap before acquire_lock creates a candidate.
+# It remains installed through acquisition, so failures cannot clobber cleanup.
+trap lock_exit_cleanup EXIT
+
 remove_stale_lock_file() {
 	local attempt="$1"
 	local expected_record="$2"
@@ -112,7 +129,6 @@ acquire_lock() {
 	chmod 0600 "$LOCK_OWNER_FILE" || die "$EXIT_FILESYSTEM" "cannot restrict registry-lock owner candidate: $LOCK_OWNER_FILE."
 	owner_instance="$(lock_process_instance_identity "$$")" || die "$EXIT_LOCK" "cannot identify registry-lock owner process instance for PID $$."
 	printf '%s|%s\n' "$$" "$owner_instance" >"$LOCK_OWNER_FILE" || die "$EXIT_FILESYSTEM" "cannot record registry-lock owner in $LOCK_OWNER_FILE."
-	trap release_lock EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	while true; do

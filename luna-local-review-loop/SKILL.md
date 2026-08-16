@@ -13,6 +13,12 @@ Parent owns decomposition, permissions, durable goals/plans, validation judgment
 
 Both roles read target repository AGENTS.md hierarchy and project-local .agents/skills/caveman/SKILL.md. Use project-local Caveman for user-facing output. Parent alone invokes project-local code-reviewer.
 
+## Keep orchestration off the critical path
+
+- Never use this skill to modify, test, validate, or review its own installed files. Luna skill maintenance is parent-direct work.
+- Never make Luna maintenance a prerequisite for an unrelated delivery goal unless that maintenance is an explicit acceptance criterion or a proven safety requirement for the requested work.
+- Stop a worker when it repeats the same environment or tooling failure, or when continued execution produces no useful task progress. Do not retry the same unchanged blocker; the parent performs the remaining work directly or reports the blocker.
+
 ## Initialize
 
 Run from any path inside target Git checkout:
@@ -29,17 +35,17 @@ Authoritative registry path is always:
 <repository-root>/.agents/agent-registry/registry.json
 ~~~
 
-Every registry lock, prompt snapshot, JSONL stream, stderr log, structured result, descendant tracker, lease, and other skill-owned durable artifact stays below <repository-root>/.agents/agent-registry/. Never derive or read registry state from environment variables, temporary directories, home directories, runtime-state directories, Codex state directories, Git administration directories, or caller-provided paths.
+Every registry lock, prompt snapshot, JSONL stream, stderr log, structured result, descendant tracker, lease, and other skill-owned durable artifact stays below <repository-root>/.agents/agent-registry/. Launch, continue, and tracker paths derive from dirname of exact project-local registry authority; repository-root `artifacts/` is never created or accepted. Never derive or read registry state from environment variables, temporary directories, home directories, runtime-state directories, Codex state directories, Git administration directories, or caller-provided paths.
 
-Init is idempotent. It may create .agents/agent-registry/ with mode 0700, state files with mode 0600, and exactly one .agents/agent-registry/ line in a regular root .gitignore. Existing .gitignore mode stays unchanged when it is owned by the caller and not group- or world-writable; new .gitignore mode is 0644; all other lines stay unchanged. Init rejects symlinked or non-directory boundary ancestors, path escape, unsafe ownership or permissions, symlinked/non-regular or multiply-linked state files, and unsafe .gitignore.
+Init is idempotent. It may create `.agents/agent-registry/` with mode 0700, state files with mode 0600, and exactly one `.agents/agent-registry/` line in a regular root `.gitignore`. The registry-local `.gitignore` is private mode 0600 and ends with `*`. These ignore rules are for Git visibility/confidentiality, never write protection: workspace-write requires Codex CLI `>= 0.147.0` with its compiled recursive OS sandbox boundary protecting project `.agents`; malformed/older versions fail before reservation, while read-only remains supported. The parent separately grants Codex runtime state. Existing `.gitignore` mode stays unchanged when it is owned by the caller and not group- or world-writable; new `.gitignore` mode is 0644; all other lines stay unchanged. Init rejects symlinked or non-directory boundary ancestors, path escape, unsafe ownership or permissions, symlinked/non-regular or multiply-linked state files, unsafe `.gitignore`, and unsafe nested ignore negations. `--existing-path` validates only and never rewrites ignore files or other project metadata.
 
 registry.sh path --repo "$repo_root" deterministically resolves the same project-local path. No caller-selected alternate state path or second index is supported.
 
 ## Identity and migration
 
-Derive repository identity from canonical Git evidence: physical Git administration device/inode identity, Git common-directory identity, ordinary-checkout .git ownership, or linked-worktree .git and Git-admin backlinks. Do not use random markers or repository path hashes. A moved physical checkout keeps identity and updates stored repository_root; copied or replacement Git metadata has different identity and cannot attach to live or copied state. Copied linked-worktree aliases and ordinary .git aliases fail closed.
+Derive repository identity from canonical Git evidence: physical Git administration device/inode identity, Git common-directory identity, ordinary-checkout `.git` ownership, or linked-worktree `.git` and Git-admin backlinks. Init also atomically creates a private random 256-bit lowercase-hex `.luna-checkout-identity` seal in the physical Git administration directory. Record its digest and device/inode only as auxiliary evidence combined with Git identity; never treat it as registry authority, a locator, or a path. Missing, malformed, replaced, unsafe, or multiply-linked seals, copied/reinitialized metadata, device/inode reuse without the seal evidence, copied linked-worktree aliases, and ordinary `.git` aliases fail closed. Do not use repository path hashes. A moved physical checkout keeps identity and updates stored `repository_root`.
 
-Schema-v3 identity_ledger is append-only lifetime history. workers contains only reserved, bound, or active rows. Empty project-local schema-v1 state may migrate only when repository ownership is proven and every worker row is absent. Live, malformed, foreign, or non-empty legacy state remains unchanged and returns recovery instructions. Empty project-local schema-v2 state may migrate after root ownership is proven. This version never discovers or copies state from older installations stored outside the project; retire live workers with the previous version before installing this one.
+Schema-v3 identity_ledger is append-only lifetime history. workers contains only reserved, bound, or active rows. Empty project-local schema-v1 state may migrate only when repository ownership is proven and every worker row is absent. Live, malformed, foreign, or non-empty legacy state remains unchanged and returns recovery instructions. Empty project-local schema-v2 state may migrate after root ownership is proven only after its prospective schema-v3 transformation is fully validated before seal creation; malformed or unsafe v2 input leaves registry bytes and seal absence unchanged. This version never discovers or copies state from older installations stored outside the project; retire live workers with the previous version before installing this one.
 
 ## Route work
 
@@ -56,7 +62,7 @@ Use parent-direct handling only for clearly trivial work. For non-trivial work, 
   --prompt-file /absolute/path/to/task-prompt.txt
 ~~~
 
-Task IDs contain only letters, numbers, dot, underscore, and hyphen; . and .. are forbidden. Launch snapshots the prompt below the project-local registry, atomically reserves the task and invocation token, performs a read-only handshake, binds the durable Codex session ID, activates it, then resumes the exact session from canonical repository root with the registered sandbox. It prints only structured final JSON on stdout; streaming artifacts and stderr remain below the task artifact directory.
+Task IDs contain only letters, numbers, dot, underscore, and hyphen; . and .. are forbidden. Launch snapshots the prompt below the project-local registry, atomically reserves the task and invocation token, performs a read-only handshake, binds the durable Codex session ID, activates it, then resumes the exact session from canonical repository root with the registered sandbox. Before a workspace-write reservation it fail-closed parses `codex-cli X.Y.Z` and requires `>= 0.147.0`; read-only does not use this gate. Resume and continue pass `--ignore-user-config`, `--strict-config`, and explicit sandbox configuration. It prints only structured final JSON on stdout; streaming artifacts and stderr remain below the task artifact directory.
 
 Handshake always uses read-only mode and cannot consume the task prompt. First resume inherits the descriptor opened for the immutable .task-prompt; it does not reopen that pathname. Continuations read their supplied prompt normally. Never use --ephemeral, PTY, manual EOF, --last, replacement sessions, or process handles as worker identity.
 

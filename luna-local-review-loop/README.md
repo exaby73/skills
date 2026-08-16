@@ -14,20 +14,22 @@ Authoritative path is deterministic:
 <repository-root>/.agents/agent-registry/registry.json
 ~~~
 
-Registry locks, prompt snapshots, JSONL/stderr logs, results, descendant trackers, leases, and all other skill-owned durable artifacts stay below <repository-root>/.agents/agent-registry/. registry.sh path --repo ... always resolves this path. No environment-selected state root, temporary-directory registry, home-directory state record, or alternate path scan exists.
+Registry locks, prompt snapshots, JSONL/stderr logs, results, descendant trackers, leases, and all other skill-owned durable artifacts stay below <repository-root>/.agents/agent-registry/. `registry.sh path --repo ...` always resolves this path; launch, continue, and tracker paths derive from dirname of that exact authority. Repository-root `artifacts/` is never created or accepted. No environment-selected state root, temporary-directory registry, home-directory state record, or alternate path scan exists.
 
-Init may create the project-local boundary and add exactly one .agents/agent-registry/ line to root .gitignore. It rejects symlinked/non-directory ancestors, path escape, unsafe owner or permissions, symlinked/non-regular/multiply-linked registry files, and unsafe .gitignore. Registry directory is 0700; registry and other regular state files are 0600; new .gitignore is 0644; an existing caller-owned, non-group/world-writable .gitignore keeps its mode and unrelated lines remain unchanged.
+Init may create the project-local boundary and add exactly one `.agents/agent-registry/` line to root `.gitignore`. That Git rule and the private mode-0600 registry-local `.gitignore` (whose final rule is `*`) provide repository visibility/confidentiality only; Git ignore is not a write-protection boundary. Workspace-write workers require Codex CLI `>= 0.147.0`, whose compiled OS sandbox recursively protects project `.agents` metadata. Older or unparseable versions fail before reservation; read-only workers remain supported. The parent must grant the OS sandbox boundary and product-owned Codex runtime state separately.
+
+It rejects symlinked/non-directory ancestors, path escape, unsafe owner or permissions, symlinked/non-regular/multiply-linked registry files, unsafe `.gitignore`, and root ignore negations that expose representative registry, lock, candidate, or nested artifact paths. Registry directory is 0700; registry and other regular state files are 0600; new `.gitignore` is 0644; an existing caller-owned, non-group/world-writable `.gitignore` keeps its mode and unrelated lines remain unchanged. `--existing-path` is validation-only: it never repairs ignore files or project metadata.
 
 ## Identity and migrations
 
-Identity uses canonical Git evidence, including physical Git administration and common-directory device/inode identities plus ordinary or linked-worktree backlink checks. Repository path is not identity. Moving same physical checkout keeps registry ownership and updates repository_root. Copied/replacement repositories, copied linked-worktree aliases, and ordinary .git aliases cannot reuse state.
+Identity uses canonical Git evidence, including physical Git administration and common-directory device/inode identities plus ordinary or linked-worktree backlink checks. A private random 256-bit lowercase-hex `.luna-checkout-identity` seal is atomically created in the physical Git administration directory and recorded only as auxiliary checkout evidence; it is never registry authority, a locator, a path, or a replacement for Git identity. The seal's content digest and device/inode identity are combined with Git identity, so missing, malformed, replaced, unsafe, or multiply-linked seals fail closed. Repository path is not identity. Moving the same physical ordinary or linked checkout keeps registry ownership and updates `repository_root`; copied/replacement repositories, copied linked-worktree aliases, reinitialized Git metadata, and ordinary `.git` aliases cannot reuse state.
 
 Project-local schema-v3 registry contains:
 
 - identity_ledger: append-only task history with immutable scope, sandbox, retry linkage, session, timestamps, and terminal evidence.
 - workers: reserved, bound, or active rows only, including invocation PID/token/process identity and active child PGID/process identity.
 
-Empty schema-v1 state migrates only with proven current-root ownership and zero worker rows. Live, malformed, foreign, or non-empty v1 state remains unchanged and prints previous-version recovery instructions. Empty local v2 state migrates after root ownership is proven. Older installations may have state outside project; retire live workers with previous version before installing this skill. This version never finds, reads, copies, or repairs that state automatically.
+Empty schema-v1 state migrates only with proven current-root ownership and zero worker rows. Live, malformed, foreign, or non-empty v1 state remains unchanged and prints previous-version recovery instructions. Empty local v2 state migrates after root ownership is proven: its prospective schema-v3 transformation is fully validated before any checkout seal is created, then only the validated sealed transformation is published. Malformed or unsafe v2 state leaves registry bytes and seal absence unchanged. A pre-seal schema-v3 registry migrates only in normal init after exact root, repository identity, physical checkout identity, and zero active workers are proven; retired `identity_ledger` history is preserved. Existing-path recovery never performs that migration and a missing seal fails unchanged. Older installations may have state outside project; retire live workers with previous version before installing this skill. This version never finds, reads, copies, or repairs that state automatically.
 
 ## Launch and continue
 
@@ -40,7 +42,7 @@ Empty schema-v1 state migrates only with proven current-root ownership and zero 
   --prompt-file /absolute/path/to/task.txt
 ~~~
 
-Launch snapshots prompt into project-local artifacts, reserves task plus invocation, runs read-only handshake, binds and activates durable Codex session, resumes exact session from canonical repository root, and emits only final structured result on stdout. Handshake never consumes task prompt. First resume inherits pre-opened prompt descriptor; continuation reads supplied parent-result prompt.
+Launch snapshots prompt into project-local artifacts, reserves task plus invocation, runs read-only handshake, binds and activates durable Codex session, resumes exact session from canonical repository root, and emits only final structured result on stdout. Handshake never consumes task prompt. First resume inherits pre-opened prompt descriptor; continuation reads supplied parent-result prompt. Resume and continuation explicitly pass `--ignore-user-config`, `--strict-config`, and the registered sandbox mode; these flags do not replace the OS sandbox boundary.
 
 Use continue only for same active task after parent action:
 

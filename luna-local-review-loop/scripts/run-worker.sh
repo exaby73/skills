@@ -34,6 +34,7 @@ TASK_SANDBOX=''
 MODEL='gpt-5.6-luna'
 REASONING_EFFORT='max'
 CODEX_BIN="${CODEX_BIN:-codex}"
+CODEX_VERSION_VALIDATED=0
 FINISHED=0
 SESSION_ID=''
 INVOCATION_TOKEN=''
@@ -99,6 +100,45 @@ resolve_codex_home() {
 	export CODEX_HOME
 }
 
+require_workspace_write_boundary() {
+	local version_output=''
+	local version=''
+	local major=''
+	local minor=''
+	local patch=''
+	if [[ "$CODEX_VERSION_VALIDATED" -eq 1 ]]; then
+		return 0
+	fi
+	version_output="$( "$CODEX_BIN" --version 2>/dev/null )" || die "$EXIT_PREREQUISITE" "Codex CLI version probe failed; workspace-write reservation refused because the compiled recursive project .agents read-only metadata boundary cannot be proven."
+	[[ "$version_output" =~ ^codex-cli[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] || die "$EXIT_PREREQUISITE" "Codex CLI version is not fail-closed parseable as 'codex-cli X.Y.Z': ${version_output:-empty}. Workspace-write reservation refused."
+	version="${version_output#codex-cli }"
+	IFS='.' read -r major minor patch <<<"$version"
+	[[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || die "$EXIT_PREREQUISITE" "Codex CLI version is not fail-closed parseable as 'codex-cli X.Y.Z': $version_output. Workspace-write reservation refused."
+	if (( 10#$major < 0 || (10#$major == 0 && 10#$minor < 147) || (10#$major == 0 && 10#$minor == 147 && 10#$patch < 0) )); then
+		die "$EXIT_PREREQUISITE" "Codex CLI $version is too old for workspace-write registry protection; require >= 0.147.0 with the compiled recursive project .agents read-only metadata boundary. Read-only tasks remain supported."
+	fi
+	CODEX_VERSION_VALIDATED=1
+}
+
+preflight_workspace_write_launch() {
+	local effective_sandbox="$TASK_SANDBOX"
+	local retry_worker=''
+	if [[ -z "$effective_sandbox" ]]; then
+		if [[ -n "$RETRY_OF" ]]; then
+			retry_worker="$( "$REGISTRY_SCRIPT" query --task-id "$RETRY_OF" --repo "$REPO_INPUT" 2>/dev/null )" || die "$EXIT_RUNTIME_STATE" "cannot inspect retry sandbox before reservation: $RETRY_OF."
+			effective_sandbox="$(jq -r '.sandbox // empty' <<<"$retry_worker")"
+			case "$effective_sandbox" in
+			read-only | workspace-write) ;;
+			*) die "$EXIT_RUNTIME_STATE" "retry registry returned invalid sandbox before reservation: $RETRY_OF." ;;
+			esac
+		else
+			effective_sandbox='workspace-write'
+		fi
+	fi
+	[[ "$effective_sandbox" == workspace-write ]] || return 0
+	require_workspace_write_boundary
+}
+
 validate_common() {
 	local codex_discovered=''
 	local codex_parent=''
@@ -132,6 +172,9 @@ validate_common() {
 	*) die "$EXIT_USAGE" "Git recorded a different checkout root than the supplied path: $repo_candidate -> $REPO_ROOT." ;;
 	esac
 	[[ "$TASK_ID" =~ ^[A-Za-z0-9._-]+$ && "$TASK_ID" != . && "$TASK_ID" != .. ]] || die "$EXIT_USAGE" 'task-id must be an artifact-safe name containing only letters, numbers, dot, underscore, or hyphen, and must not be dot or dot-dot.'
+	if [[ -n "$RETRY_OF" ]]; then
+		[[ "$RETRY_OF" =~ ^[A-Za-z0-9._-]+$ && "$RETRY_OF" != . && "$RETRY_OF" != .. ]] || die "$EXIT_USAGE" 'retry-of must be an artifact-safe task ID.'
+	fi
 	[[ -f "$PROMPT_FILE" && ! -L "$PROMPT_FILE" ]] || die "$EXIT_USAGE" "prompt-file must be a regular non-symlink file: $PROMPT_FILE."
 	case "$PROMPT_FILE" in /*) ;; *) PROMPT_FILE="$PWD/$PROMPT_FILE" ;; esac
 	prompt_parent="${PROMPT_FILE%/*}"
@@ -574,6 +617,16 @@ require_real_child_directory() {
 	printf '%s\n' "$resolved"
 }
 
+resolve_registry_directory() {
+	local registry_path="$1"
+	local expected_registry_path="$REPO_ROOT/.agents/agent-registry/registry.json"
+	local registry_dir=''
+	[[ "$registry_path" == "$expected_registry_path" ]] || die "$EXIT_RUNTIME_STATE" "registry path is not the exact project-local authority: $registry_path."
+	registry_dir="$(dirname "$registry_path")" || die "$EXIT_RUNTIME_STATE" "cannot derive registry directory from authoritative registry path: $registry_path."
+	[[ "$registry_dir" == "$REPO_ROOT/.agents/agent-registry" ]] || die "$EXIT_RUNTIME_STATE" "registry directory is not the exact project-local authority directory: $registry_dir."
+	printf '%s\n' "$registry_dir"
+}
+
 artifact_link_count() {
 	local path="$1"
 	local count=''
@@ -897,6 +950,7 @@ resume_task() {
 	local codex_status=0
 	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$resume_prompt_source" "$REPO_ROOT" "$CODEX_BIN" exec resume \
 		--ignore-user-config \
+		--strict-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		-c "sandbox_mode=\"$TASK_SANDBOX\"" \
@@ -942,6 +996,7 @@ launch_worker() {
 	trap finish_on_error EXIT
 	[[ -n "$SCOPE" ]] || die "$EXIT_USAGE" 'launch requires non-empty --scope.'
 	validate_common
+	preflight_workspace_write_launch
 	local registry_path
 	local registry_dir
 	local artifact_root
@@ -950,7 +1005,7 @@ launch_worker() {
 	local prompt_snapshot
 	prepare_invocation
 	registry_path="$($REGISTRY_SCRIPT init --repo "$REPO_INPUT" --print-path)"
-	registry_dir="$(dirname "$registry_path")"
+	registry_dir="$(resolve_registry_directory "$registry_path")"
 	artifact_root="$(create_real_child_directory "$registry_dir" artifacts 'artifact root')"
 	prompt_staging="$artifact_root/.prompt-$INVOCATION_TOKEN"
 	PROMPT_STAGING_PATH="$prompt_staging"
@@ -981,6 +1036,7 @@ launch_worker() {
 	local codex_status=0
 	run_gated_codex "$artifact_dir" "$launch_log" "$launch_stderr" '' "$REPO_ROOT" "$CODEX_BIN" exec \
 		--ignore-user-config \
+		--strict-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		-s read-only \
@@ -1007,15 +1063,16 @@ continue_worker() {
 	local artifact_dir
 	local worker
 	registry_path="$($REGISTRY_SCRIPT path --repo "$REPO_INPUT")"
-	registry_dir="$(dirname "$registry_path")"
+	registry_dir="$(resolve_registry_directory "$registry_path")"
 	artifact_root="$(require_real_child_directory "$registry_dir" artifacts 'artifact root')"
 	artifact_dir="$(require_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
 	trap finish_on_error EXIT
-	claim_invocation
 	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT")"
 	SESSION_ID="$(jq -r '.session_id' <<<"$worker")"
 	TASK_SANDBOX="$(jq -r '.sandbox' <<<"$worker")"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
+	[[ "$TASK_SANDBOX" == read-only ]] || require_workspace_write_boundary
+	claim_invocation
 	resume_task "$artifact_dir" "$PROMPT_FILE"
 }
 

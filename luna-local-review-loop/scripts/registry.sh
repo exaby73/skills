@@ -49,6 +49,9 @@ readonly TRANSITION_SCHEMA_FILTER='
     );
   . as $root
   | (.schema_version == 3 and .registry == "luna-local-review-loop")
+  and (.repository_root | nonempty)
+  and (.repository_identity | nonempty)
+  and (.repository_checkout_identity | type == "string" and test("^gitdir:[0-9]+:[0-9]+:seal:[0-9a-f]{64}:seal-file:[0-9]+:[0-9]+$"))
   and (.identity_ledger | type == "array")
   and (.workers | type == "array")
   and all($root.identity_ledger[];

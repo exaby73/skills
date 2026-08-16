@@ -26,6 +26,10 @@ LOCK_DIR=''
 GIT_DIR_REAL=''
 GIT_COMMON_DIR_REAL=''
 REPO_IDENTITY=''
+REPO_CHECKOUT_PHYSICAL_ID=''
+REPO_CHECKOUT_SEAL_PATH=''
+REPO_CHECKOUT_SEAL=''
+REPO_CHECKOUT_SEAL_PHYSICAL_ID=''
 REPO_CHECKOUT_IDENTITY=''
 PRINT_PATH=0
 EXISTING_ONLY=0
@@ -64,7 +68,7 @@ readonly SCHEMA_FILTER='
       and (.registry == "luna-local-review-loop")
       and (.repository_root | nonempty_string)
       and (.repository_identity | nonempty_string)
-      and (.repository_checkout_identity | nonempty_string)
+      and (.repository_checkout_identity | type == "string" and test("^gitdir:[0-9]+:[0-9]+(:seal:[0-9a-f]{64}(:seal-file:[0-9]+:[0-9]+)?)?$"))
       and (.created_at | nonempty_string)
       and (.updated_at | nonempty_string)
       and (.identity_ledger | type == "array")
@@ -157,6 +161,7 @@ Usage:
 Initialize or validate project-local Luna registry.
 --existing-path prints an existing registry without launch-only prerequisites.
 Init may add exactly one .agents/agent-registry/ line to root .gitignore.
+The registry-local .gitignore is private and ends with '*'.
 EOF
   exit "$exit_code"
 }
@@ -212,7 +217,7 @@ require_private_file() {
 
 require_commands() {
   local missing='' command_name
-  local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed)
+  local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed wc)
   if [[ "$EXISTING_ONLY" -eq 0 ]]; then required_commands+=(od tr sort head mkfifo); fi
   for command_name in "${required_commands[@]}"; do
     command -v "$command_name" >/dev/null 2>&1 || missing="${missing}${missing:+, }${command_name}"
@@ -251,6 +256,8 @@ resolve_git_identity() {
   case "$common_dir" in /*) ;; *) common_dir="$REPO_ROOT/$common_dir" ;; esac
   GIT_COMMON_DIR_REAL="$(cd -P "$common_dir" 2>/dev/null && pwd -P)" || die "$EXIT_REPOSITORY" "cannot resolve Git common directory: $common_dir."
   [[ -d "$GIT_COMMON_DIR_REAL" && ! -L "$GIT_COMMON_DIR_REAL" ]] || die "$EXIT_REPOSITORY" "Git common directory must be real: $GIT_COMMON_DIR_REAL."
+  require_owned_directory "$GIT_DIR_REAL" 'Git administration directory'
+  require_owned_directory "$GIT_COMMON_DIR_REAL" 'Git common directory'
   if [[ -f "$REPO_ROOT/.git" ]]; then
     [[ ! -L "$REPO_ROOT/.git" ]] || die "$EXIT_REPOSITORY" "linked-worktree .git file must not be a symlink: $REPO_ROOT/.git."
     [[ "$(regular_file_link_count "$REPO_ROOT/.git")" == 1 ]] || die "$EXIT_REPOSITORY" "linked-worktree .git file must have exactly one hard link: $REPO_ROOT/.git."
@@ -282,8 +289,73 @@ resolve_git_identity() {
   elif common_identity="$(stat -f '%d:%i' "$GIT_COMMON_DIR_REAL" 2>/dev/null)"; then :
   else die "$EXIT_REPOSITORY" "cannot derive Git common-directory identity: $GIT_COMMON_DIR_REAL."; fi
   [[ "$common_identity" =~ ^[0-9]+:[0-9]+$ ]] || die "$EXIT_REPOSITORY" "Git common-directory identity is invalid: $common_identity."
-  REPO_CHECKOUT_IDENTITY="gitdir:$checkout_identity"
+  REPO_CHECKOUT_PHYSICAL_ID="gitdir:$checkout_identity"
   REPO_IDENTITY="git-common:$common_identity"
+  REPO_CHECKOUT_SEAL_PATH="$GIT_DIR_REAL/.luna-checkout-identity"
+}
+
+physical_file_identity() {
+  local path="$1"
+  local identity=''
+  if identity="$(stat -c '%d:%i' "$path" 2>/dev/null)"; then :
+  elif identity="$(stat -f '%d:%i' "$path" 2>/dev/null)"; then :
+  else return 1; fi
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s\n' "$identity"
+}
+
+validate_checkout_seal_file() {
+  local seal=''
+  local extra=''
+  local first_status=0
+  local seal_identity=''
+  [[ -e "$REPO_CHECKOUT_SEAL_PATH" || -L "$REPO_CHECKOUT_SEAL_PATH" ]] || return 1
+  require_private_file "$REPO_CHECKOUT_SEAL_PATH" 'Git checkout identity seal'
+  exec 9<"$REPO_CHECKOUT_SEAL_PATH" || die "$EXIT_FILESYSTEM" "cannot open Git checkout identity seal: $REPO_CHECKOUT_SEAL_PATH."
+  IFS= read -r seal <&9 || first_status=$?
+  if [[ "$first_status" -ne 0 && -z "$seal" ]]; then
+    exec 9<&-
+    die "$EXIT_FILESYSTEM" "Git checkout identity seal is empty: $REPO_CHECKOUT_SEAL_PATH."
+  fi
+  if IFS= read -r extra <&9; then
+    exec 9<&-
+    die "$EXIT_FILESYSTEM" "Git checkout identity seal must contain one lowercase-hex line: $REPO_CHECKOUT_SEAL_PATH."
+  fi
+  exec 9<&-
+  [[ "$seal" =~ ^[0-9a-f]{64}$ ]] || die "$EXIT_FILESYSTEM" "Git checkout identity seal must be exactly 256-bit lowercase hex: $REPO_CHECKOUT_SEAL_PATH."
+  seal_identity="$(physical_file_identity "$REPO_CHECKOUT_SEAL_PATH")" || die "$EXIT_FILESYSTEM" "cannot derive Git checkout identity seal device/inode: $REPO_CHECKOUT_SEAL_PATH."
+  REPO_CHECKOUT_SEAL="$(shasum -a 256 "$REPO_CHECKOUT_SEAL_PATH" | awk '{print $1}')" || die "$EXIT_FILESYSTEM" "cannot digest Git checkout identity seal: $REPO_CHECKOUT_SEAL_PATH."
+  [[ "$REPO_CHECKOUT_SEAL" =~ ^[0-9a-f]{64}$ ]] || die "$EXIT_FILESYSTEM" "Git checkout identity seal digest is invalid: $REPO_CHECKOUT_SEAL_PATH."
+  REPO_CHECKOUT_SEAL_PHYSICAL_ID="seal-file:$seal_identity"
+  REPO_CHECKOUT_IDENTITY="$REPO_CHECKOUT_PHYSICAL_ID:seal:$REPO_CHECKOUT_SEAL:$REPO_CHECKOUT_SEAL_PHYSICAL_ID"
+}
+
+create_checkout_seal() {
+  local temp_path=''
+  local random_seal=''
+  [[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_FILESYSTEM" "Git checkout identity seal is missing: $REPO_CHECKOUT_SEAL_PATH. Existing-path recovery is validation-only; recover with the previous skill version or run normal init after proving the checkout."
+  [[ ! -e "$REPO_CHECKOUT_SEAL_PATH" && ! -L "$REPO_CHECKOUT_SEAL_PATH" ]] || { validate_checkout_seal_file; return 0; }
+  temp_path="$(mktemp "$GIT_DIR_REAL/.luna-checkout-identity.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create Git checkout identity seal temporary file: $GIT_DIR_REAL."
+  chmod 0600 "$temp_path" || { rm -f "$temp_path"; die "$EXIT_FILESYSTEM" "cannot restrict Git checkout identity seal temporary file: $temp_path."; }
+  random_seal="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')" || { rm -f "$temp_path"; die "$EXIT_FILESYSTEM" 'cannot generate Git checkout identity seal entropy.'; }
+  [[ "$random_seal" =~ ^[0-9a-f]{64}$ ]] || { rm -f "$temp_path"; die "$EXIT_FILESYSTEM" 'generated Git checkout identity seal is not 256-bit lowercase hex.'; }
+  printf '%s\n' "$random_seal" >"$temp_path" || { rm -f "$temp_path"; die "$EXIT_FILESYSTEM" "cannot write Git checkout identity seal temporary file: $temp_path."; }
+  if ! ln -n "$temp_path" "$REPO_CHECKOUT_SEAL_PATH" 2>/dev/null; then
+    rm -f "$temp_path"
+    [[ -e "$REPO_CHECKOUT_SEAL_PATH" || -L "$REPO_CHECKOUT_SEAL_PATH" ]] || die "$EXIT_FILESYSTEM" "Git checkout identity seal appeared or could not be created: $REPO_CHECKOUT_SEAL_PATH."
+    validate_checkout_seal_file
+    return 0
+  fi
+  rm "$temp_path" || die "$EXIT_FILESYSTEM" "cannot release Git checkout identity seal temporary link: $temp_path."
+  validate_checkout_seal_file
+}
+
+ensure_checkout_seal() {
+  if [[ -e "$REPO_CHECKOUT_SEAL_PATH" || -L "$REPO_CHECKOUT_SEAL_PATH" ]]; then
+    validate_checkout_seal_file
+  else
+    create_checkout_seal
+  fi
 }
 
 ensure_boundary() {
@@ -338,6 +410,80 @@ ensure_gitignore() {
   mv "$temp_path" "$ignore_path" || die "$EXIT_FILESYSTEM" "cannot publish repository root .gitignore: $ignore_path."
 }
 
+private_gitignore_has_final_star() {
+  local ignore_path="$1"
+  awk 'NF { last = $0 } END { exit(last == "*" ? 0 : 1) }' "$ignore_path" >/dev/null 2>&1
+}
+
+validate_private_gitignore_target() {
+  local ignore_path="$REGISTRY_DIR/.gitignore"
+  [[ -e "$ignore_path" || -L "$ignore_path" ]] || return 1
+  require_private_file "$ignore_path" 'registry-local .gitignore'
+  private_gitignore_has_final_star "$ignore_path" || die "$EXIT_FILESYSTEM" "registry-local .gitignore must end with a '*' rule: $ignore_path."
+}
+
+ensure_private_gitignore() {
+  local ignore_path="$REGISTRY_DIR/.gitignore"
+  local temp_path=''
+  if [[ -e "$ignore_path" || -L "$ignore_path" ]]; then
+    require_private_file "$ignore_path" 'registry-local .gitignore'
+    if private_gitignore_has_final_star "$ignore_path"; then
+      return 0
+    fi
+    temp_path="$(mktemp "$REGISTRY_DIR/.gitignore.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create registry-local .gitignore temporary file: $REGISTRY_DIR."
+    if ! cat "$ignore_path" >"$temp_path" || ! printf '%s\n' '*' >>"$temp_path"; then
+      rm -f "$temp_path"
+      die "$EXIT_FILESYSTEM" "cannot update registry-local .gitignore: $ignore_path."
+    fi
+    chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry-local .gitignore temporary file: $temp_path."
+    mv "$temp_path" "$ignore_path" || die "$EXIT_FILESYSTEM" "cannot publish registry-local .gitignore: $ignore_path."
+    return 0
+  fi
+  (set -o noclobber; : >"$ignore_path") 2>/dev/null || die "$EXIT_FILESYSTEM" "cannot create registry-local .gitignore: $ignore_path."
+  chmod 0600 "$ignore_path" || die "$EXIT_FILESYSTEM" "cannot restrict registry-local .gitignore: $ignore_path."
+  printf '%s\n' '*' >"$ignore_path" || die "$EXIT_FILESYSTEM" "cannot write registry-local .gitignore: $ignore_path."
+  require_private_file "$ignore_path" 'registry-local .gitignore'
+}
+
+validate_registry_ignore_rules() {
+  local ignore_path="$REPO_ROOT/.gitignore"
+  local target='.agents/agent-registry/'
+  local target_count=''
+  local representative=''
+  [[ -f "$ignore_path" && ! -L "$ignore_path" ]] || die "$EXIT_FILESYSTEM" "repository root .gitignore is required for registry recovery: $ignore_path."
+  target_count="$(awk -v target="$target" '$0 == target { count++ } END { print count + 0 }' "$ignore_path")" || die "$EXIT_FILESYSTEM" "cannot inspect repository root .gitignore: $ignore_path."
+  [[ "$target_count" == 1 ]] || die "$EXIT_FILESYSTEM" "repository root .gitignore must contain exactly one $target rule: $ignore_path."
+  for representative in \
+    '.agents/agent-registry/.gitignore' \
+    '.agents/agent-registry/registry.json' \
+    '.agents/agent-registry/.lock' \
+    '.agents/agent-registry/.lock-owner.candidate' \
+    '.agents/agent-registry/artifacts/example/nested/result.json'; do
+    git -C "$REPO_ROOT" check-ignore --no-index -q -- "$representative" || die "$EXIT_FILESYSTEM" "registry path is not ignored by the project root .gitignore: $representative."
+  done
+}
+
+validate_present_registry_ignore_negations() {
+  local ignore_path="$REPO_ROOT/.gitignore"
+  local target='.agents/agent-registry/'
+  local target_count=''
+  local representative=''
+  [[ -f "$ignore_path" && ! -L "$ignore_path" ]] || return 0
+  target_count="$(awk -v target="$target" '$0 == target { count++ } END { print count + 0 }' "$ignore_path")" || die "$EXIT_FILESYSTEM" "cannot inspect repository root .gitignore: $ignore_path."
+  [[ "$target_count" == 1 ]] || return 0
+  if awk '$0 ~ /^!\.agents\/agent-registry(\/|$)/ { found = 1 } END { exit(found ? 0 : 1) }' "$ignore_path"; then
+    die "$EXIT_FILESYSTEM" "repository root .gitignore contains an unsafe registry negation: $ignore_path."
+  fi
+  for representative in \
+    '.agents/agent-registry/.gitignore' \
+    '.agents/agent-registry/registry.json' \
+    '.agents/agent-registry/.lock' \
+    '.agents/agent-registry/.lock-owner.candidate' \
+    '.agents/agent-registry/artifacts/example/nested/result.json'; do
+    git -C "$REPO_ROOT" check-ignore --no-index -q -- "$representative" || die "$EXIT_FILESYSTEM" "repository root .gitignore contains an unsafe negation for registry path: $representative."
+  done
+}
+
 require_project_skills() {
   local code_reviewer="$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md" caveman="$REPO_ROOT/.agents/skills/caveman/SKILL.md" missing='' path
   for path in "$REPO_ROOT/.agents" "$REPO_ROOT/.agents/skills" "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman"; do
@@ -362,6 +508,8 @@ source "$SCRIPT_DIR/registry-lock.sh"
 
 write_new_registry() {
   local timestamp temp_path
+  ensure_checkout_seal
+  [[ -n "$REPO_CHECKOUT_IDENTITY" ]] || die "$EXIT_SCHEMA" 'new registry has no durable checkout identity.'
   timestamp="$(now_utc)"
   temp_path="$(mktemp "$REGISTRY_DIR/.registry.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create registry temporary file in $REGISTRY_DIR."
   jq -n --arg root "$REPO_ROOT" --arg identity "$REPO_IDENTITY" --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg timestamp "$timestamp" \
@@ -384,6 +532,8 @@ migrate_v1_if_safe() {
   [[ "$worker_count" -eq 0 ]] || die "$EXIT_SCHEMA" "project-local schema-v1 registry is not empty: $REGISTRY_PATH. Automatic migration requires proven ownership and zero historical worker rows; recover it with the previous skill version. Registry unchanged."
   recorded_root="$(jq -r '.repository_root // empty' "$REGISTRY_PATH")"
   [[ "$recorded_root" == "$REPO_ROOT" ]] || die "$EXIT_REPOSITORY" "project-local schema-v1 registry ownership is not proven: $REGISTRY_PATH. Recover it with the previous skill version before replacing it."
+  [[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_SCHEMA" "schema-v1 migration is disabled for --existing-path recovery: $REGISTRY_PATH. Registry unchanged; run normal init only after recovery with the previous skill version."
+  ensure_checkout_seal
   timestamp="$(now_utc)"; temp_path="$(mktemp "$REGISTRY_DIR/.registry-migration.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create schema migration temporary file in $REGISTRY_DIR."
   jq -n --arg root "$REPO_ROOT" --arg identity "$REPO_IDENTITY" --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg timestamp "$timestamp" '{schema_version:3,registry:"luna-local-review-loop",repository_root:$root,repository_identity:$identity,repository_checkout_identity:$checkout_identity,created_at:$timestamp,updated_at:$timestamp,identity_ledger:[],workers:[]}' >"$temp_path" || die "$EXIT_SCHEMA" "cannot prepare schema-v1 migration: $REGISTRY_PATH."
   chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict schema migration file: $temp_path."
@@ -391,32 +541,87 @@ migrate_v1_if_safe() {
 }
 
 migrate_v2_if_safe() {
-  local worker_count ledger_count recorded_root temp_path timestamp
-  jq -e '(.schema_version == 2) and (.registry == "luna-local-review-loop") and (.repository_root | type == "string" and length > 0) and (.repository_identity | type == "string" and length > 0) and (.identity_ledger | type == "array") and (.workers | type == "array")' "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "schema version 2 registry cannot be validated safely: $REGISTRY_PATH. Preserve it and recover with the previous skill version."
+	local worker_count ledger_count recorded_root temp_path timestamp
+	jq -e '(.schema_version == 2) and (.registry == "luna-local-review-loop") and (.repository_root | type == "string" and length > 0) and (.repository_identity | type == "string" and length > 0) and (.identity_ledger | type == "array") and (.workers | type == "array")' "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "schema version 2 registry cannot be validated safely: $REGISTRY_PATH. Preserve it and recover with the previous skill version."
   recorded_root="$(jq -r '.repository_root' "$REGISTRY_PATH")"
   [[ "$recorded_root" == "$REPO_ROOT" ]] || die "$EXIT_REPOSITORY" "schema version 2 registry belongs to another repository root: $REGISTRY_PATH. Registry unchanged."
   worker_count="$(jq '.workers | length' "$REGISTRY_PATH")"
   [[ "$worker_count" -eq 0 ]] || die "$EXIT_SCHEMA" "schema version 2 registry contains $worker_count live worker(s): $REGISTRY_PATH. Retire them with the previous skill version before migration. Registry unchanged."
-  ledger_count="$(jq '.identity_ledger | length' "$REGISTRY_PATH")"
-  [[ "$ledger_count" -eq 0 ]] || die "$EXIT_SCHEMA" "schema version 2 registry contains $ledger_count historical worker row(s): $REGISTRY_PATH. Automatic migration requires proven emptiness; recover it with the previous skill version. Registry unchanged."
-  timestamp="$(now_utc)"; temp_path="$(mktemp "$REGISTRY_DIR/.registry-migration.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create schema migration temporary file in $REGISTRY_DIR."
-  if ! jq --arg identity "$REPO_IDENTITY" --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg timestamp "$timestamp" '.schema_version = 3 | .repository_identity = $identity | .repository_checkout_identity = $checkout_identity | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
-    rm -f "$temp_path"; die "$EXIT_SCHEMA" "cannot prepare schema version 3 migration: $REGISTRY_PATH."
+	ledger_count="$(jq '.identity_ledger | length' "$REGISTRY_PATH")"
+	[[ "$ledger_count" -eq 0 ]] || die "$EXIT_SCHEMA" "schema version 2 registry contains $ledger_count historical worker row(s): $REGISTRY_PATH. Automatic migration requires proven emptiness; recover it with the previous skill version. Registry unchanged."
+	[[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_SCHEMA" "schema-v2 migration is disabled for --existing-path recovery: $REGISTRY_PATH. Registry unchanged; run normal init only after recovery with the previous skill version."
+	timestamp="$(now_utc)"
+	if ! jq --arg identity "$REPO_IDENTITY" --arg checkout_identity "$REPO_CHECKOUT_PHYSICAL_ID" --arg timestamp "$timestamp" '.schema_version = 3 | .repository_identity = $identity | .repository_checkout_identity = $checkout_identity | .updated_at = $timestamp' "$REGISTRY_PATH" \
+		| jq -e "$SCHEMA_FILTER" >/dev/null 2>&1; then
+		die "$EXIT_SCHEMA" "schema version 2 registry cannot be safely migrated: $REGISTRY_PATH. Registry unchanged and checkout seal was not created."
+	fi
+	ensure_checkout_seal
+	temp_path="$(mktemp "$REGISTRY_DIR/.registry-migration.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create schema migration file in $REGISTRY_DIR."
+	if ! jq --arg identity "$REPO_IDENTITY" --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg timestamp "$timestamp" '.schema_version = 3 | .repository_identity = $identity | .repository_checkout_identity = $checkout_identity | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
+		rm -f "$temp_path"; die "$EXIT_SCHEMA" "cannot prepare schema version 3 migration: $REGISTRY_PATH."
+	fi
+	jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || { rm -f "$temp_path"; die "$EXIT_SCHEMA" "schema version 2 registry cannot be safely migrated after checkout seal creation: $REGISTRY_PATH. Registry unchanged."; }
+	chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict schema migration file: $temp_path."
+	mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish schema version 3 migration: $REGISTRY_PATH."
+}
+
+add_checkout_seal_to_registry() {
+	local temp_path=''
+	local timestamp=''
+	[[ -n "$REPO_CHECKOUT_IDENTITY" ]] || die "$EXIT_SCHEMA" 'cannot record an empty checkout identity seal.'
+	timestamp="$(now_utc)"
+	temp_path="$(mktemp "$REGISTRY_DIR/.registry-seal.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create checkout seal migration temporary file: $REGISTRY_DIR."
+	if ! jq --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg timestamp "$timestamp" '.repository_checkout_identity = $checkout_identity | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
+    rm -f "$temp_path"
+    die "$EXIT_SCHEMA" "cannot prepare checkout seal migration: $REGISTRY_PATH."
   fi
-  jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || { rm -f "$temp_path"; die "$EXIT_SCHEMA" "schema version 2 registry cannot be safely migrated: $REGISTRY_PATH. Registry unchanged."; }
-  chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict schema migration file: $temp_path."
-  mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish schema version 3 migration: $REGISTRY_PATH."
+  jq -e "$SCHEMA_FILTER" "$temp_path" >/dev/null 2>&1 || { rm -f "$temp_path"; die "$EXIT_SCHEMA" "checkout seal migration failed schema validation: $REGISTRY_PATH. Registry unchanged."; }
+  chmod 0600 "$temp_path" || die "$EXIT_FILESYSTEM" "cannot restrict checkout seal migration file: $temp_path."
+  mv "$temp_path" "$REGISTRY_PATH" || die "$EXIT_FILESYSTEM" "cannot publish checkout seal migration: $REGISTRY_PATH."
+}
+
+validate_drained_preseal_registry() {
+  local recorded_root=''
+  local recorded_identity=''
+  local worker_count=''
+  recorded_root="$(jq -r '.repository_root // empty' "$REGISTRY_PATH")"
+  [[ "$recorded_root" == "$REPO_ROOT" ]] || die "$EXIT_REPOSITORY" "pre-seal schema-v3 registry has a different recorded repository root: $REGISTRY_PATH. Registry unchanged; recover with the previous skill version."
+  [[ "$(jq -r '.repository_identity // empty' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_REPOSITORY" "pre-seal schema-v3 registry has a different repository identity: $REGISTRY_PATH. Registry unchanged; recover with the previous skill version."
+  recorded_identity="$(jq -r '.repository_checkout_identity // empty' "$REGISTRY_PATH")"
+  [[ "$recorded_identity" == "$REPO_CHECKOUT_PHYSICAL_ID" ]] || die "$EXIT_REPOSITORY" "pre-seal schema-v3 registry has a different physical checkout identity: $REGISTRY_PATH. Registry unchanged; recover with the previous skill version."
+  worker_count="$(jq '.workers | length' "$REGISTRY_PATH")"
+  [[ "$worker_count" == 0 ]] || die "$EXIT_SCHEMA" "pre-seal schema-v3 registry contains $worker_count live worker(s): $REGISTRY_PATH. Retire or recover every worker with the previous skill version, then rerun normal init. Registry unchanged."
+  [[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_SCHEMA" "pre-seal schema-v3 migration is disabled for --existing-path recovery: $REGISTRY_PATH. Registry unchanged; run normal init only after recovery with the previous skill version."
 }
 
 validate_existing_registry() {
-  local version temp_path
+  local version temp_path recorded_identity=''
   [[ -e "$REGISTRY_PATH" || -L "$REGISTRY_PATH" ]] || return 1
   require_private_file "$REGISTRY_PATH" 'registry'
   version="$(jq -r '.schema_version // empty' "$REGISTRY_PATH" 2>/dev/null)" || die "$EXIT_SCHEMA" "registry is not valid JSON: $REGISTRY_PATH."
   case "$version" in
   1) migrate_v1_if_safe ;;
   2) migrate_v2_if_safe ;;
-  3) ;;
+  3)
+    jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails pre-seal schema version 3 validation: $REGISTRY_PATH. Preserve it for recovery."
+    [[ "$(jq -r '.repository_identity' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_REPOSITORY" "registry belongs to a different repository identity at $REPO_ROOT: $REGISTRY_PATH. Preserve copied or replacement state; do not attach it."
+    recorded_identity="$(jq -r '.repository_checkout_identity' "$REGISTRY_PATH")"
+    case "$recorded_identity" in
+    "$REPO_CHECKOUT_PHYSICAL_ID")
+      validate_drained_preseal_registry
+      ensure_checkout_seal
+      add_checkout_seal_to_registry
+      ;;
+    "$REPO_CHECKOUT_PHYSICAL_ID:seal:"*)
+      ensure_checkout_seal
+      [[ "$recorded_identity" == "$REPO_CHECKOUT_IDENTITY" || "$recorded_identity" == "$REPO_CHECKOUT_PHYSICAL_ID:seal:$REPO_CHECKOUT_SEAL" ]] || die "$EXIT_REPOSITORY" "registry checkout seal does not match this physical Git administration directory: $REGISTRY_PATH. Preserve state and recover it only with its original checkout."
+      if [[ "$EXISTING_ONLY" -eq 0 && "$recorded_identity" != "$REPO_CHECKOUT_IDENTITY" ]]; then
+        add_checkout_seal_to_registry
+      fi
+      ;;
+    *) die "$EXIT_REPOSITORY" "registry belongs to a different physical Git checkout at $REPO_ROOT: $REGISTRY_PATH. Preserve state and recover it only with its original checkout." ;;
+    esac
+    ;;
   '') die "$EXIT_SCHEMA" "registry has no schema version: $REGISTRY_PATH. Preserve it for recovery." ;;
   *) die "$EXIT_SCHEMA" "unsupported registry schema version $version: $REGISTRY_PATH. Preserve it for recovery." ;;
   esac
@@ -424,6 +629,7 @@ validate_existing_registry() {
   [[ "$(jq -r '.repository_identity' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_REPOSITORY" "registry belongs to a different repository identity at $REPO_ROOT: $REGISTRY_PATH. Preserve copied or replacement state; do not attach it."
   [[ "$(jq -r '.repository_checkout_identity' "$REGISTRY_PATH")" == "$REPO_CHECKOUT_IDENTITY" ]] || die "$EXIT_REPOSITORY" "registry belongs to a different physical Git checkout at $REPO_ROOT: $REGISTRY_PATH. Preserve state and recover it only with its original checkout."
   if [[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" != "$REPO_ROOT" ]]; then
+    [[ "$EXISTING_ONLY" -eq 0 ]] || return 0
     temp_path="$(mktemp "$REGISTRY_DIR/.registry-move.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create moved-root registry temporary file: $REGISTRY_DIR."
     if ! jq --arg root "$REPO_ROOT" --arg timestamp "$(now_utc)" '.repository_root = $root | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
       rm -f "$temp_path"; die "$EXIT_FILESYSTEM" "cannot update moved repository root: $REGISTRY_PATH."
@@ -449,9 +655,18 @@ resolve_paths
 require_owned_directory "$REPO_ROOT" 'repository root'
 resolve_git_identity
 [[ "$EXISTING_ONLY" -eq 1 ]] || require_project_skills
-[[ "$EXISTING_ONLY" -eq 1 ]] || validate_gitignore_target
+validate_gitignore_target
+validate_present_registry_ignore_negations
 ensure_boundary
-[[ "$EXISTING_ONLY" -eq 1 ]] || ensure_gitignore
+if [[ "$EXISTING_ONLY" -eq 1 ]]; then
+  [[ -e "$REGISTRY_DIR/.gitignore" || -L "$REGISTRY_DIR/.gitignore" ]] || die "$EXIT_FILESYSTEM" "registry-local .gitignore is missing: $REGISTRY_DIR/.gitignore. Existing-path recovery is validation-only."
+  validate_private_gitignore_target
+  validate_registry_ignore_rules
+else
+  ensure_gitignore
+  ensure_private_gitignore
+  validate_registry_ignore_rules
+fi
 acquire_lock
 if ! validate_existing_registry; then
   [[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_FILESYSTEM" "registry does not exist: $REGISTRY_PATH. Run init before recovery lookup."

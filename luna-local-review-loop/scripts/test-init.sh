@@ -112,6 +112,10 @@ git -C "$REPO_ROOT" commit -qm init
 cat >"$BIN_DIR/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "$#" -eq 1 && "$1" == '--version' ]]; then
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.147.0}"
+  exit 0
+fi
 printf 'cwd=%s codex_home=%s args=%s\n' "$PWD" "$CODEX_HOME" "$*" >> "$CODEX_CALLS"
 if [[ " $* " == *' exec resume '* ]]; then
   if [[ "${FAKE_REQUIRE_WORKSPACE_WRITE_RESUME:-0}" == '1' && " $* " != *'sandbox_mode="workspace-write"'* ]]; then exit 92; fi
@@ -307,6 +311,14 @@ expect_init_failure() {
 	fi
 }
 
+expect_normal_init_failure() {
+	local repo="$1"
+	local output="$2"
+	if "$INIT_SCRIPT" --repo "$repo" >"$output" 2>&1; then
+		fail "normal init unexpectedly accepted $repo"
+	fi
+}
+
 repo_real="$(cd -P "$REPO_ROOT" && pwd -P)"
 registry_path="$repo_real/.agents/agent-registry/registry.json"
 registry_dir="$repo_real/.agents/agent-registry"
@@ -320,6 +332,23 @@ registry_output="$("$INIT_SCRIPT" --repo "$REPO_ROOT" --print-path)"
 [[ "$(file_mode "$REPO_ROOT/.gitignore")" == 640 ]] || fail '.gitignore mode changed'
 [[ "$(rg -c '^\.agents/agent-registry/$' "$REPO_ROOT/.gitignore")" == 1 ]] || fail '.gitignore does not contain exactly one registry line'
 [[ "$(sed -n '1,3p' "$REPO_ROOT/.gitignore")" == $'keep-one\nkeep-two\n.agents/agent-registry/' ]] || fail '.gitignore changed unrelated lines'
+private_ignore="$registry_dir/.gitignore"
+[[ "$(file_mode "$private_ignore")" == 600 ]] || fail 'registry-local .gitignore is not private'
+[[ "$(sed -n '$p' "$private_ignore")" == '*' ]] || fail 'registry-local .gitignore does not end with *'
+for ignored_path in \
+  '.agents/agent-registry/registry.json' \
+  '.agents/agent-registry/.lock' \
+  '.agents/agent-registry/.lock-owner.candidate' \
+  '.agents/agent-registry/artifacts/example/nested/result.json'; do
+  git -C "$REPO_ROOT" check-ignore --no-index -q -- "$ignored_path" || fail "registry representative is not ignored: $ignored_path"
+done
+git_admin_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)"
+seal_path="$git_admin_dir/.luna-checkout-identity"
+[[ -f "$seal_path" && ! -L "$seal_path" ]] || fail 'checkout identity seal is missing'
+[[ "$(file_mode "$seal_path")" == 600 ]] || fail 'checkout identity seal is not private'
+[[ "$(stat -c '%h' "$seal_path" 2>/dev/null || stat -f '%l' "$seal_path")" == 1 ]] || fail 'checkout identity seal is multiply linked'
+[[ "$(cat "$seal_path")" =~ ^[0-9a-f]{64}$ ]] || fail 'checkout identity seal is not 256-bit lowercase hex'
+[[ "$(jq -r '.repository_checkout_identity' "$registry_path")" =~ ^gitdir:[0-9]+:[0-9]+:seal:[0-9a-f]{64}:seal-file:[0-9]+:[0-9]+$ ]] || fail 'registry did not combine physical and seal identity evidence'
 second_registry="$("$INIT_SCRIPT" --repo "$REPO_ROOT" --print-path)"
 [[ "$second_registry" == "$registry_path" ]] || fail 'init was not idempotent'
 [[ "$(rg -c '^\.agents/agent-registry/$' "$REPO_ROOT/.gitignore")" == 1 ]] || fail 'idempotent init duplicated .gitignore line'
@@ -359,8 +388,31 @@ make_test_repo "$v2_repo"
 v2_path="$("$INIT_SCRIPT" --repo "$v2_repo" --print-path)"
 jq '.schema_version = 2 | del(.repository_checkout_identity)' "$v2_path" >"$v2_path.tmp"
 mv "$v2_path.tmp" "$v2_path"
-"$INIT_SCRIPT" --existing-path --repo "$v2_repo" >/dev/null
+"$INIT_SCRIPT" --repo "$v2_repo" >/dev/null
 jq -e '.schema_version == 3 and .workers == []' "$v2_path" >/dev/null || fail 'empty project-local schema-v2 state did not migrate'
+
+for v2_invalid_case in malformed unsafe; do
+	v2_invalid_repo="$TEST_ROOT/v2-$v2_invalid_case-repo"
+	make_test_repo "$v2_invalid_repo"
+	v2_invalid_path="$("$INIT_SCRIPT" --repo "$v2_invalid_repo" --print-path)"
+	v2_invalid_git_dir="$(git -C "$v2_invalid_repo" rev-parse --absolute-git-dir)"
+	v2_invalid_seal="$v2_invalid_git_dir/.luna-checkout-identity"
+	case "$v2_invalid_case" in
+	malformed)
+		jq '.schema_version = 2 | del(.repository_checkout_identity) | .identity_ledger = [] | .created_at = {}' "$v2_invalid_path" >"$v2_invalid_path.tmp"
+		;;
+	unsafe)
+		jq '.schema_version = 2 | del(.repository_checkout_identity) | .identity_ledger = [] | .created_at = ["unsafe-v2"]' "$v2_invalid_path" >"$v2_invalid_path.tmp"
+		;;
+	esac
+	mv "$v2_invalid_path.tmp" "$v2_invalid_path"
+	chmod 0600 "$v2_invalid_path"
+	rm "$v2_invalid_seal"
+	v2_invalid_before="$(cat "$v2_invalid_path")"
+	expect_normal_init_failure "$v2_invalid_repo" "$TEST_ROOT/v2-$v2_invalid_case.out"
+	[[ "$(cat "$v2_invalid_path")" == "$v2_invalid_before" ]] || fail "$v2_invalid_case schema-v2 state changed before safe migration rejection"
+	[[ ! -e "$v2_invalid_seal" && ! -L "$v2_invalid_seal" ]] || fail "$v2_invalid_case schema-v2 rejection created checkout seal"
+done
 
 v2_history_repo="$TEST_ROOT/v2-history-repo"
 make_test_repo "$v2_history_repo"
@@ -372,6 +424,24 @@ if "$INIT_SCRIPT" --existing-path --repo "$v2_history_repo" >"$TEST_ROOT/v2-hist
 	fail 'non-empty project-local schema-v2 state migrated automatically'
 fi
 [[ "$(cat "$v2_history_path")" == "$v2_history_before" ]] || fail 'non-empty schema-v2 state changed during refused migration'
+
+private_ignore_repair_repo="$TEST_ROOT/private-ignore-repair-repo"
+make_test_repo "$private_ignore_repair_repo"
+private_ignore_repair_path="$("$INIT_SCRIPT" --repo "$private_ignore_repair_repo" --print-path)"
+private_ignore_repair_file="$(dirname "$private_ignore_repair_path")/.gitignore"
+printf '%s\n' 'legacy-private-rule' >"$private_ignore_repair_file"
+chmod 0600 "$private_ignore_repair_file"
+"$INIT_SCRIPT" --repo "$private_ignore_repair_repo" >/dev/null || fail 'normal init did not repair registry-local .gitignore'
+[[ "$(cat "$private_ignore_repair_file")" == $'legacy-private-rule\n*' ]] || fail 'normal init did not append final * registry-local ignore rule'
+[[ "$(file_mode "$private_ignore_repair_file")" == 600 ]] || fail 'normal registry-local .gitignore repair changed private mode'
+printf '%s\n' 'invalid-private-rule' >"$private_ignore_repair_file"
+private_ignore_recovery_registry_before="$(cat "$private_ignore_repair_path")"
+private_ignore_recovery_file_before="$(cat "$private_ignore_repair_file")"
+private_ignore_recovery_root_before="$(cat "$private_ignore_repair_repo/.gitignore")"
+expect_init_failure "$private_ignore_repair_repo" "$TEST_ROOT/private-ignore-recovery.out"
+[[ "$(cat "$private_ignore_repair_file")" == "$private_ignore_recovery_file_before" ]] || fail 'existing-path recovery repaired invalid registry-local .gitignore'
+[[ "$(cat "$private_ignore_repair_path")" == "$private_ignore_recovery_registry_before" ]] || fail 'existing-path recovery changed registry while rejecting invalid registry-local .gitignore'
+[[ "$(cat "$private_ignore_repair_repo/.gitignore")" == "$private_ignore_recovery_root_before" ]] || fail 'existing-path recovery changed root .gitignore while rejecting invalid registry-local .gitignore'
 
 unsafe_agents_repo="$TEST_ROOT/unsafe-agents-repo"
 make_test_repo "$unsafe_agents_repo"
@@ -415,12 +485,68 @@ ln "$TEST_ROOT/hardlink-ignore-target" "$hardlink_ignore_repo/.gitignore"
 expect_init_failure "$hardlink_ignore_repo" "$TEST_ROOT/hardlink-ignore.out"
 [[ "$(cat "$TEST_ROOT/hardlink-ignore-target")" == preserve ]] || fail 'hard-linked .gitignore target changed'
 
+for nested_ignore_case in \
+  '.agents/agent-registry/registry.json' \
+  '.agents/agent-registry/.lock' \
+  '.agents/agent-registry/.lock-owner.candidate' \
+  '.agents/agent-registry/artifacts/example/nested/result.json'; do
+  nested_ignore_name="$(printf '%s' "$nested_ignore_case" | tr '/' '-')"
+  nested_ignore_repo="$TEST_ROOT/nested-ignore-$nested_ignore_name"
+  make_test_repo "$nested_ignore_repo"
+  printf '%s\n' '.agents/agent-registry/' "!$nested_ignore_case" >"$nested_ignore_repo/.gitignore"
+  nested_ignore_before="$(cat "$nested_ignore_repo/.gitignore")"
+  if "$INIT_SCRIPT" --repo "$nested_ignore_repo" >"$TEST_ROOT/nested-ignore-$nested_ignore_name.out" 2>&1; then
+    fail "unsafe nested ignore negation was accepted: $nested_ignore_case"
+  fi
+  [[ "$(cat "$nested_ignore_repo/.gitignore")" == "$nested_ignore_before" ]] || fail "nested ignore rejection rewrote root .gitignore: $nested_ignore_case"
+  [[ ! -e "$nested_ignore_repo/.agents/agent-registry" ]] || fail "nested ignore rejection created registry state: $nested_ignore_case"
+done
+
 insecure_registry_repo="$TEST_ROOT/insecure-registry-repo"
 make_test_repo "$insecure_registry_repo"
 insecure_registry_path="$("$INIT_SCRIPT" --repo "$insecure_registry_repo" --print-path)"
 chmod 0644 "$insecure_registry_path"
 expect_init_failure "$insecure_registry_repo" "$TEST_ROOT/insecure-registry.out"
 chmod 0600 "$insecure_registry_path"
+
+private_ignore_insecure_repo="$TEST_ROOT/private-ignore-insecure-repo"
+make_test_repo "$private_ignore_insecure_repo"
+private_ignore_insecure_path="$("$INIT_SCRIPT" --repo "$private_ignore_insecure_repo" --print-path)"
+private_ignore_insecure_file="$(dirname "$private_ignore_insecure_path")/.gitignore"
+chmod 0644 "$private_ignore_insecure_file"
+private_ignore_insecure_before="$(cat "$private_ignore_insecure_file")"
+expect_init_failure "$private_ignore_insecure_repo" "$TEST_ROOT/private-ignore-insecure.out"
+[[ "$(cat "$private_ignore_insecure_file")" == "$private_ignore_insecure_before" ]] || fail 'unsafe registry-local .gitignore changed'
+chmod 0600 "$private_ignore_insecure_file"
+
+private_ignore_symlink_repo="$TEST_ROOT/private-ignore-symlink-repo"
+make_test_repo "$private_ignore_symlink_repo"
+private_ignore_symlink_path="$("$INIT_SCRIPT" --repo "$private_ignore_symlink_repo" --print-path)"
+private_ignore_symlink_file="$(dirname "$private_ignore_symlink_path")/.gitignore"
+private_ignore_symlink_target="$TEST_ROOT/private-ignore-symlink-target"
+printf '%s\n' preserve >"$private_ignore_symlink_target"
+rm "$private_ignore_symlink_file"
+ln -s "$private_ignore_symlink_target" "$private_ignore_symlink_file"
+expect_init_failure "$private_ignore_symlink_repo" "$TEST_ROOT/private-ignore-symlink.out"
+[[ "$(cat "$private_ignore_symlink_target")" == preserve ]] || fail 'symlinked registry-local .gitignore target changed'
+rm "$private_ignore_symlink_file"
+printf '%s\n' '*' >"$private_ignore_symlink_file"
+chmod 0600 "$private_ignore_symlink_file"
+
+private_ignore_hardlink_repo="$TEST_ROOT/private-ignore-hardlink-repo"
+make_test_repo "$private_ignore_hardlink_repo"
+private_ignore_hardlink_path="$("$INIT_SCRIPT" --repo "$private_ignore_hardlink_repo" --print-path)"
+private_ignore_hardlink_file="$(dirname "$private_ignore_hardlink_path")/.gitignore"
+private_ignore_hardlink_target="$TEST_ROOT/private-ignore-hardlink-target"
+printf '%s\n' '*' >"$private_ignore_hardlink_target"
+chmod 0600 "$private_ignore_hardlink_target"
+rm "$private_ignore_hardlink_file"
+ln "$private_ignore_hardlink_target" "$private_ignore_hardlink_file"
+expect_init_failure "$private_ignore_hardlink_repo" "$TEST_ROOT/private-ignore-hardlink.out"
+[[ "$(cat "$private_ignore_hardlink_target")" == '*' ]] || fail 'hard-linked registry-local .gitignore target changed'
+rm "$private_ignore_hardlink_file"
+printf '%s\n' '*' >"$private_ignore_hardlink_file"
+chmod 0600 "$private_ignore_hardlink_file"
 
 hardlink_registry_repo="$TEST_ROOT/hardlink-registry-repo"
 make_test_repo "$hardlink_registry_repo"
@@ -431,13 +557,152 @@ ln "$hardlink_registry_path" "$TEST_ROOT/hardlink-registry-target-link"
 if "$INIT_SCRIPT" --existing-path --repo "$hardlink_registry_repo" >"$TEST_ROOT/hardlink-registry.out" 2>&1; then fail 'hard-linked registry file was accepted'; fi
 [[ "$(cat "$TEST_ROOT/hardlink-registry-target")" == preserve ]] || fail 'hard-linked registry inspection changed target'
 
+seal_security_repo="$TEST_ROOT/seal-security-repo"
+make_test_repo "$seal_security_repo"
+seal_security_path="$("$INIT_SCRIPT" --repo "$seal_security_repo" --print-path)"
+seal_security_git_dir="$(git -C "$seal_security_repo" rev-parse --absolute-git-dir)"
+seal_security_file="$seal_security_git_dir/.luna-checkout-identity"
+seal_security_saved="$seal_security_git_dir/.luna-checkout-identity.saved"
+seal_security_target="$TEST_ROOT/seal-security-target"
+seal_security_registry_before="$(cat "$seal_security_path")"
+seal_security_ignore_before="$(cat "$seal_security_repo/.gitignore")"
+mv "$seal_security_file" "$seal_security_saved"
+expect_init_failure "$seal_security_repo" "$TEST_ROOT/seal-missing.out"
+[[ "$(cat "$seal_security_path")" == "$seal_security_registry_before" ]] || fail 'missing seal changed registry during existing-path recovery'
+[[ "$(cat "$seal_security_repo/.gitignore")" == "$seal_security_ignore_before" ]] || fail 'missing seal changed root metadata during existing-path recovery'
+mv "$seal_security_saved" "$seal_security_file"
+
+mv "$seal_security_file" "$seal_security_saved"
+printf '%s\n' invalid-seal >"$seal_security_file"
+chmod 0600 "$seal_security_file"
+expect_init_failure "$seal_security_repo" "$TEST_ROOT/seal-malformed.out"
+[[ "$(cat "$seal_security_path")" == "$seal_security_registry_before" ]] || fail 'malformed seal changed registry'
+rm "$seal_security_file"
+mv "$seal_security_saved" "$seal_security_file"
+
+chmod 0644 "$seal_security_file"
+expect_init_failure "$seal_security_repo" "$TEST_ROOT/seal-mode.out"
+chmod 0600 "$seal_security_file"
+
+cp "$seal_security_file" "$seal_security_target"
+chmod 0600 "$seal_security_target"
+mv "$seal_security_file" "$seal_security_saved"
+ln "$seal_security_target" "$seal_security_file"
+expect_init_failure "$seal_security_repo" "$TEST_ROOT/seal-hardlink.out"
+rm "$seal_security_file"
+mv "$seal_security_saved" "$seal_security_file"
+
+mv "$seal_security_file" "$seal_security_saved"
+ln -s "$seal_security_target" "$seal_security_file"
+expect_init_failure "$seal_security_repo" "$TEST_ROOT/seal-symlink.out"
+rm "$seal_security_file"
+mv "$seal_security_saved" "$seal_security_file"
+
+mv "$seal_security_file" "$seal_security_saved"
+printf '%064d\n' 0 >"$seal_security_file"
+chmod 0600 "$seal_security_file"
+expect_init_failure "$seal_security_repo" "$TEST_ROOT/seal-replacement.out"
+rm "$seal_security_file"
+mv "$seal_security_saved" "$seal_security_file"
+
+preseal_repo="$TEST_ROOT/preseal-migration-repo"
+make_test_repo "$preseal_repo"
+preseal_path="$("$INIT_SCRIPT" --repo "$preseal_repo" --print-path)"
+preseal_git_dir="$(git -C "$preseal_repo" rev-parse --absolute-git-dir)"
+preseal_seal="$preseal_git_dir/.luna-checkout-identity"
+preseal_git_identity="$(stat -c '%d:%i' "$preseal_git_dir" 2>/dev/null || stat -f '%d:%i' "$preseal_git_dir")"
+jq --arg checkout "gitdir:$preseal_git_identity" '
+  .repository_checkout_identity = $checkout
+  | .updated_at = "2020-01-01T00:00:00Z"
+  | .preserved_state = {ledger:"keep",number:7}
+  | .identity_ledger = [{
+      task_id:"retired-history",
+      scope:"pre-seal historical task",
+      sandbox:"read-only",
+      retry_of:null,
+      session_id:"01preseal-history",
+      status:"retired",
+      reserved_at:"2026-01-01T00:00:00Z",
+      bound_at:"2026-01-01T00:01:00Z",
+      activated_at:"2026-01-01T00:02:00Z",
+      terminal_at:"2026-01-01T00:03:00Z",
+      retired_at:"2026-01-01T00:03:00Z",
+      terminal_status:"completed",
+      terminal_evidence:"historical completion"
+    }]
+  | .workers = []
+' "$preseal_path" >"$preseal_path.tmp"
+mv "$preseal_path.tmp" "$preseal_path"
+rm "$preseal_seal"
+"$INIT_SCRIPT" --repo "$preseal_repo" >/dev/null
+jq -e '.repository_checkout_identity | test("^gitdir:[0-9]+:[0-9]+:seal:[0-9a-f]{64}:seal-file:[0-9]+:[0-9]+$")' "$preseal_path" >/dev/null || fail 'drained pre-seal registry did not receive seal identity'
+jq -e 'any(.identity_ledger[]; .task_id == "retired-history" and .terminal_evidence == "historical completion")' "$preseal_path" >/dev/null || fail 'pre-seal migration discarded retired identity history'
+jq -e '.updated_at != "2020-01-01T00:00:00Z" and .preserved_state == {ledger:"keep",number:7}' "$preseal_path" >/dev/null || fail 'checkout seal migration did not atomically update timestamp while preserving registry state'
+
+preseal_live_repo="$TEST_ROOT/preseal-live-repo"
+make_test_repo "$preseal_live_repo"
+preseal_live_path="$("$INIT_SCRIPT" --repo "$preseal_live_repo" --print-path)"
+preseal_live_git_dir="$(git -C "$preseal_live_repo" rev-parse --absolute-git-dir)"
+preseal_live_identity="$(stat -c '%d:%i' "$preseal_live_git_dir" 2>/dev/null || stat -f '%d:%i' "$preseal_live_git_dir")"
+jq --arg checkout "gitdir:$preseal_live_identity" '
+  .repository_checkout_identity = $checkout
+  | .identity_ledger = [{
+      task_id:"live-pre-seal",
+      scope:"live pre-seal task",
+      sandbox:"read-only",
+      retry_of:null,
+      session_id:"01preseal-live",
+      status:"active",
+      reserved_at:"2026-01-01T00:00:00Z",
+      bound_at:"2026-01-01T00:01:00Z",
+      activated_at:"2026-01-02T00:02:00Z",
+      terminal_at:null,
+      retired_at:null,
+      terminal_status:null,
+      terminal_evidence:""
+    }]
+  | .workers = [{
+      task_id:"live-pre-seal",
+      scope:"live pre-seal task",
+      sandbox:"read-only",
+      retry_of:null,
+      session_id:"01preseal-live",
+      status:"active",
+      created_at:"2026-01-01T00:00:00Z",
+      updated_at:"2026-01-02T00:02:00Z",
+      bound_at:"2026-01-01T00:01:00Z",
+      activated_at:"2026-01-02T00:02:00Z",
+      checkpoint_evidence:"",
+      invocation_pid:null,
+      invocation_token:null,
+      invocation_instance:null,
+      active_child_pgid:null,
+      active_child_instance:null
+    }]
+' "$preseal_live_path" >"$preseal_live_path.tmp"
+mv "$preseal_live_path.tmp" "$preseal_live_path"
+preseal_live_before="$(cat "$preseal_live_path")"
+expect_init_failure "$preseal_live_repo" "$TEST_ROOT/preseal-live.out"
+[[ "$(cat "$preseal_live_path")" == "$preseal_live_before" ]] || fail 'live pre-seal registry changed during refused migration'
+
+preseal_unproven_repo="$TEST_ROOT/preseal-unproven-repo"
+make_test_repo "$preseal_unproven_repo"
+preseal_unproven_path="$("$INIT_SCRIPT" --repo "$preseal_unproven_repo" --print-path)"
+preseal_unproven_git_dir="$(git -C "$preseal_unproven_repo" rev-parse --absolute-git-dir)"
+preseal_unproven_identity="$(stat -c '%d:%i' "$preseal_unproven_git_dir" 2>/dev/null || stat -f '%d:%i' "$preseal_unproven_git_dir")"
+jq --arg checkout "gitdir:$preseal_unproven_identity" '.repository_root = "/unproven/repository/root" | .repository_checkout_identity = $checkout | .workers = [] | .identity_ledger = []' "$preseal_unproven_path" >"$preseal_unproven_path.tmp"
+mv "$preseal_unproven_path.tmp" "$preseal_unproven_path"
+preseal_unproven_before="$(cat "$preseal_unproven_path")"
+expect_init_failure "$preseal_unproven_repo" "$TEST_ROOT/preseal-unproven.out"
+[[ "$(cat "$preseal_unproven_path")" == "$preseal_unproven_before" ]] || fail 'unproven pre-seal registry changed during refused migration'
+
 move_repo="$TEST_ROOT/move-repo"
 make_test_repo "$move_repo"
 move_path_before="$($INIT_SCRIPT --repo "$move_repo" --print-path)"
 move_identity_before="$(jq -r '.repository_identity' "$move_path_before")"
 mv "$move_repo" "$TEST_ROOT/move-repo-renamed"
 move_repo_new="$TEST_ROOT/move-repo-renamed"
-move_path_after="$("$INIT_SCRIPT" --existing-path --repo "$move_repo_new")"
+move_path_after="$("$INIT_SCRIPT" --repo "$move_repo_new" --print-path)"
 move_repo_new_real="$(cd -P "$move_repo_new" && pwd -P)"
 [[ "$move_path_after" == "$move_repo_new_real/.agents/agent-registry/registry.json" ]] || fail 'moved checkout path was not deterministic'
 jq -e --arg root "$move_repo_new_real" '.repository_root == $root' "$move_path_after" >/dev/null || fail 'moved checkout root was not updated'
@@ -520,8 +785,66 @@ fi
 rm -f "$hardlink_artifact_dir/.task-prompt"
 rmdir "$hardlink_artifact_dir"
 
+gate_registry_before="$(cat "$registry_path")"
+if FAKE_CODEX_VERSION='codex-cli 0.146.9' CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id old-codex-workspace-write --scope 'reject workspace-write before reservation on old Codex' --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/old-codex-workspace-write.out" 2>&1; then
+  fail 'Codex 0.146.9 was accepted for workspace-write'
+fi
+[[ "$(cat "$registry_path")" == "$gate_registry_before" ]] || fail 'old Codex workspace-write gate mutated registry before reservation'
+if FAKE_CODEX_VERSION='codex-cli not-a-version' CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id malformed-codex-workspace-write --scope 'reject malformed Codex version before reservation' --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/malformed-codex-workspace-write.out" 2>&1; then
+  fail 'malformed Codex version was accepted for workspace-write'
+fi
+[[ "$(cat "$registry_path")" == "$gate_registry_before" ]] || fail 'malformed Codex workspace-write gate mutated registry'
+old_read_only_output="$(FAKE_CODEX_VERSION='codex-cli 0.146.9' CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id old-codex-read-only --scope 'retain read-only support on old Codex' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/old-codex-read-only.err")"
+jq -e '.outcome == "completed"' <<<"$old_read_only_output" >/dev/null || fail 'read-only task was blocked by workspace-write version gate'
+
+lock_fail_bin="$TEST_ROOT/lock-fail-bin"
+mkdir "$lock_fail_bin"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$lock_fail_bin/sed"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$lock_fail_bin/ps"
+chmod 0755 "$lock_fail_bin/sed" "$lock_fail_bin/ps"
+if PATH="$lock_fail_bin:$PATH" "$INIT_SCRIPT" --existing-path --repo "$REPO_ROOT" >"$TEST_ROOT/lock-candidate-failure.out" 2>&1; then
+  fail 'lock process identity failure unexpectedly succeeded'
+fi
+for lock_candidate in "$registry_dir"/.lock-owner.*; do
+	[[ ! -e "$lock_candidate" && ! -L "$lock_candidate" ]] || fail 'failed process identity left a lock-owner candidate'
+done
+
+lock_probe_bin="$TEST_ROOT/lock-probe-bin"
+lock_probe_count="$TEST_ROOT/lock-probe-count"
+mkdir "$lock_probe_bin"
+# shellcheck disable=SC2016 # The following single-quoted lines generate a separate probe script.
+printf '%s\n' \
+	'#!/usr/bin/env bash' \
+	'set -euo pipefail' \
+	'count=0' \
+	'if [[ -f "${LOCK_PROBE_COUNT_FILE:?}" ]]; then count="$(command -p cat "$LOCK_PROBE_COUNT_FILE")"; fi' \
+	'count=$((count + 1))' \
+	'printf "%s\n" "$count" >"$LOCK_PROBE_COUNT_FILE"' \
+	'if [[ "$count" == 1 ]]; then exec "${LOCK_PROBE_REAL_SED:?}" "$@"; fi' \
+	'exit 1' >"$lock_probe_bin/sed"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$lock_probe_bin/ps"
+chmod 0755 "$lock_probe_bin/sed" "$lock_probe_bin/ps"
+lock_probe_real_sed="$(command -p -v sed)"
+if PATH="$lock_probe_bin:$PATH" LOCK_PROBE_COUNT_FILE="$lock_probe_count" LOCK_PROBE_REAL_SED="$lock_probe_real_sed" "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id registry-lock-candidate-failure --scope 'shared registry caller lock candidate cleanup' >/dev/null 2>&1; then
+	fail 'registry caller lock process identity failure unexpectedly succeeded'
+fi
+for lock_candidate in "$registry_dir"/.lock-owner.*; do
+	[[ ! -e "$lock_candidate" && ! -L "$lock_candidate" ]] || fail 'registry caller left a lock-owner candidate after process identity failure'
+done
+jq -e 'all(.workers[]; .task_id != "registry-lock-candidate-failure")' "$registry_path" >/dev/null || fail 'registry caller lock failure mutated registry state'
+
+version_gate_continue_scope='reject workspace-write continuation before invocation claim'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id old-codex-continue --scope "$version_gate_continue_scope" --sandbox workspace-write >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id old-codex-continue --session-id 01old-codex-continue >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id old-codex-continue --session-id 01old-codex-continue >/dev/null
+if FAKE_CODEX_VERSION='codex-cli 0.146.9' CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --task-id old-codex-continue --prompt-file "$CONTINUE_FILE" >"$TEST_ROOT/old-codex-continue.out" 2>&1; then
+  fail 'old Codex workspace-write continuation was accepted'
+fi
+jq -e 'any(.workers[]; .task_id == "old-codex-continue" and .invocation_token == null)' "$registry_path" >/dev/null || fail 'old Codex continuation claimed invocation before version gate'
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id old-codex-continue --status interrupted --evidence 'version gate test complete' >/dev/null
+
 printf '%s\n' 'runner task' >"$PROMPT_FILE"
-runner_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id local-runner --scope 'local runner artifact and structured-result contract' --sandbox workspace-write --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/local-runner.err")"
+runner_output="$(FAKE_CODEX_VERSION='codex-cli 0.147.0' CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id local-runner --scope 'local runner artifact and structured-result contract' --sandbox workspace-write --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/local-runner.err")"
 jq -e '.outcome == "completed" and (.validators | length > 0)' <<<"$runner_output" >/dev/null || fail 'registered runner did not complete'
 jq -e 'any(.identity_ledger[]; .task_id == "local-runner" and .terminal_status == "completed") and .workers == []' "$registry_path" >/dev/null || fail 'runner did not retire completed task'
 runner_artifact_dir="$registry_dir/artifacts/local-runner"
@@ -542,6 +865,11 @@ printf '%s\n' 'continue and complete' >"$CONTINUE_FILE"
 continue_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --task-id continuation-runner --prompt-file "$CONTINUE_FILE" 2>"$TEST_ROOT/continuation-resume.err")"
 jq -e '.outcome == "completed"' <<<"$continue_output" >/dev/null || fail 'same-session continuation did not complete'
 jq -e 'any(.identity_ledger[]; .task_id == "continuation-runner" and .terminal_status == "completed") and .workers == []' "$registry_path" >/dev/null || fail 'continuation did not retire worker'
+continuation_artifact_dir="$registry_dir/artifacts/continuation-runner"
+continuation_trackers=("$continuation_artifact_dir/".descendants-*.json)
+[[ -f "$continuation_artifact_dir/.task-prompt" && -f "$continuation_artifact_dir/stream-2.jsonl" && -f "$continuation_artifact_dir/result-2.json" ]] || fail 'continue artifacts were not below exact project-local registry authority'
+[[ "${#continuation_trackers[@]}" -eq 2 ]] || fail 'launch and continue tracker artifacts were not retained below project-local registry authority'
+[[ ! -e "$REPO_ROOT/artifacts" && ! -L "$REPO_ROOT/artifacts" ]] || fail 'continue created repository-root artifacts'
 
 "$REGISTRY_SCRIPT" assert-no-active --repo "$REPO_ROOT" >/dev/null
 "$REGISTRY_SCRIPT" assert-empty --repo "$REPO_ROOT" >/dev/null
@@ -653,6 +981,9 @@ if FAKE_FAIL_HANDSHAKE=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --re
 	fail 'failed handshake unexpectedly succeeded'
 fi
 jq -e 'any(.identity_ledger[]; .task_id == "failed-runner" and .session_id == null and .status == "retired" and .terminal_status == "failed")' "$registry_path" >/dev/null || fail 'failed pre-bind launch was not atomically retired'
+failed_runner_artifact_dir="$registry_dir/artifacts/failed-runner"
+[[ -f "$failed_runner_artifact_dir/.task-prompt" && -f "$failed_runner_artifact_dir/launch.jsonl" && -f "$failed_runner_artifact_dir/launch.stderr.log" ]] || fail 'failed launch artifacts were not below exact project-local registry authority'
+[[ ! -e "$REPO_ROOT/artifacts" && ! -L "$REPO_ROOT/artifacts" ]] || fail 'failed launch created repository-root artifacts'
 retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id failed-runner-retry --scope 'runner retry scope' --retry-of failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/retry.err")"
 jq -e '.outcome == "completed"' <<<"$retry_output" >/dev/null || fail 'runner retry did not complete'
 
@@ -863,19 +1194,20 @@ if "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id missing --session-id no
 fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
-# The rewritten fixture adds local-runner (one resume) and the
-# continuation-runner launch/continue pair (two resumes), while removing the
-# old sparse-continuation resume: 20 - 1 + 1 + 2 = 22.
+# The rewritten fixture adds local-runner (one resume), the old-Codex
+# read-only task (one resume), and the continuation-runner launch/continue pair
+# (two resumes), while removing the old sparse-continuation resume: 20 - 1 + 1
+# + 1 + 2 = 23.
 resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 22 ]] || fail "expected twenty-two exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 23 ]] || fail "expected twenty-three exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 44 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 46 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
-[[ "$read_only_count" -eq 22 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
+[[ "$read_only_count" -eq 23 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 22 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 23 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
-[[ "$read_only_resume_count" -eq 5 ]] || fail "expected read-only sandbox on retry, blocked retry, and both continued-session resumes, got $read_only_resume_count"
+[[ "$read_only_resume_count" -eq 6 ]] || fail "expected read-only sandbox on retry, blocked retry, and both continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then
 	fail 'a resumed Codex session ran outside the canonical target repository'
 fi
