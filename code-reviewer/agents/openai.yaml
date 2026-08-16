@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pragmatic Code Reviewer"
+  short_description: "Evidence-based code review without preference churn"
+  default_prompt: "Use $code-reviewer to review these changes and return an evidence-based approval decision."

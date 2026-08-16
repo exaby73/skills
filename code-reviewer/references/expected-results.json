@@ -1,0 +1,48 @@
+{
+  "fixtures": [
+    {
+      "id": "material-defect",
+      "expectedDecision": "Request changes",
+      "blockingFindings": [
+        {
+          "scenario": "A caller supplies an account ID belonging to another tenant.",
+          "impact": "The caller can read and rename another tenant's account.",
+          "evidence": "Both lookup and update dropped the required tenant scope.",
+          "fixBoundary": "Restore tenant scoping on lookup and mutation."
+        },
+        {
+          "scenario": "Any valid account rename succeeds.",
+          "impact": "The operation destroys the stored balance.",
+          "evidence": "The update writes balance: 0 despite the rename-only contract.",
+          "fixBoundary": "Update only the name field."
+        }
+      ],
+      "nonBlockingSuggestions": []
+    },
+    {
+      "id": "preference-only",
+      "expectedDecision": "Approved",
+      "blockingFindings": [],
+      "nonBlockingSuggestions": []
+    },
+    {
+      "id": "mixed-guidance",
+      "expectedDecision": "Request changes",
+      "blockingFindings": [
+        {
+          "scenario": "An administrator successfully changes a member role.",
+          "impact": "The required access-change audit trail is absent.",
+          "evidence": "The linked policy requires an audit event in the transaction, but the diff only updates the member.",
+          "fixBoundary": "Append the required audit event inside the existing transaction."
+        }
+      ],
+      "nonBlockingSuggestions": []
+    },
+    {
+      "id": "clean-change",
+      "expectedDecision": "Approved",
+      "blockingFindings": [],
+      "nonBlockingSuggestions": []
+    }
+  ]
+}
