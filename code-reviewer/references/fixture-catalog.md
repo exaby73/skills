@@ -136,11 +136,14 @@ The worker must atomically claim a delivery key before sending, pass that key to
 +     await deliveries.recordSuccess(job.key);
 +     return { status: "delivered" };
 +   } catch (error) {
-+     await failures.record({ key: job.key, category: classify(error) });
-+     await deliveries.release(job.key);
++     try {
++       await failures.record({ key: job.key, category: classify(error) });
++     } finally {
++       await deliveries.release(job.key);
++     }
 +     throw error;
 +   }
 + }
 ```
 
-Relevant tests cover atomic claiming, first delivery, duplicate and in-flight delivery, provider failure categorization and claim release, provider idempotency when success recording fails, and success recording.
+Relevant tests cover atomic claiming, first delivery, duplicate and in-flight delivery, provider failure categorization, claim release when failure recording fails, provider idempotency when success recording fails, and success recording.

@@ -26,7 +26,9 @@ REQUIRED_SKILL_PHRASES = {
     "Suggestion (non-blocking)",
     "Conclusion: Approved",
     "Conclusion: Request changes",
+    "Conclusion: Evidence blocked",
     "context compact, resume, or handoff",
+    "filesystem root",
 }
 
 

@@ -13,10 +13,10 @@ Review for material engineering risk without turning alternative preferences int
    - If the request names a commit, tag, branch, or revision range, inspect that revision or range explicitly with the repository's VCS; do not substitute the current worktree state.
    - For a working-tree review, inspect staged and unstaged changes plus relevant untracked files.
    - For a remote pull request, inspect its title, body, issue links, comments, checks, changed files, and exact head. Avoid switching branches unless local inspection requires it and the user has authorized that mutation.
-2. Discover every applicable `AGENTS.md` from the repository root through each changed file's directory. Read all of them before evaluating the diff.
+2. Discover every applicable `AGENTS.md` for each changed file by walking from the filesystem root through that file's parent directories, including directories above the VCS repository root. Read discovered guidance once, from outermost ancestor to innermost directory, before evaluating the diff.
 3. Follow review policies, specifications, acceptance criteria, product or domain documents, and other sources named by applicable `AGENTS.md` files. Resolve relative links from the file that names them.
 4. Reconcile those sources with the issue or pull-request contract, current implementation, tests, migrations, configuration, and changed behavior. Do not review the diff in isolation.
-5. Record the target, exact revision when applicable, and sources used. If required evidence is unavailable, state the gap and do not invent a conclusion.
+5. Record the target, exact revision when applicable, and sources used. If required evidence is unavailable, return an evidence-blocked outcome that names the missing evidence and do not invent an approval or request-changes conclusion.
 
 Treat `AGENTS.md` as the repository extension point. Repository-specific policy belongs there or in documents it links; do not require a fork of this skill.
 
@@ -109,5 +109,6 @@ End with one independent decision:
 
 - `Conclusion: Approved` when no blocking finding remains.
 - `Conclusion: Request changes` when one or more blocking findings remain.
+- `Conclusion: Evidence blocked` when required review evidence is unavailable; list the missing evidence and the action needed before review can conclude.
 
 When approved with no findings, say `No blocking findings.` Do not manufacture feedback to make the review appear thorough.
