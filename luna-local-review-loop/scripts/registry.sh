@@ -18,7 +18,6 @@ readonly SCRIPT_DIR
 readonly INIT_SCRIPT="$SCRIPT_DIR/init.sh"
 
 REPO_INPUT='.'
-STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/luna-local-review-loop-${UID}}"
 REGISTRY_PATH=''
 REGISTRY_DIR=''
 LOCK_DIR=''
@@ -50,6 +49,9 @@ readonly TRANSITION_SCHEMA_FILTER='
     );
   . as $root
   | (.schema_version == 3 and .registry == "luna-local-review-loop")
+  and (.repository_root | nonempty)
+  and (.repository_identity | nonempty)
+  and (.repository_checkout_identity | type == "string" and test("^gitdir:[0-9]+:[0-9]+:seal:[0-9a-f]{64}:seal-file:[0-9]+:[0-9]+$"))
   and (.identity_ledger | type == "array")
   and (.workers | type == "array")
   and all($root.identity_ledger[];
@@ -106,24 +108,25 @@ usage() {
 	local exit_code="${1:-0}"
 	cat <<'EOF'
 Usage:
-  registry.sh init|path [--repo PATH] [--state-root PATH]
-  registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--sandbox read-only|workspace-write] [--pid PID --token TOKEN] [--repo PATH] [--state-root PATH]
-  registry.sh bind --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH] [--state-root PATH]
-  registry.sh activate --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH] [--state-root PATH]
-  registry.sh checkpoint --task-id ID --evidence TEXT [--repo PATH] [--state-root PATH]
-  registry.sh claim-invocation --task-id ID --pid PID --token TOKEN [--require-status active] [--repo PATH] [--state-root PATH]
-  registry.sh release-invocation --task-id ID --token TOKEN [--repo PATH] [--state-root PATH]
-  registry.sh record-child --task-id ID --pgid PGID --token TOKEN [--repo PATH] [--state-root PATH]
-  registry.sh clear-child --task-id ID --pgid PGID --token TOKEN [--repo PATH] [--state-root PATH]
-  registry.sh complete-and-retire --task-id ID --status completed|failed|blocked|interrupted --evidence TEXT [--invocation-token TOKEN] [--repo PATH] [--state-root PATH]
-  registry.sh query --task-id ID [--repo PATH] [--state-root PATH]
-  registry.sh active [--repo PATH] [--state-root PATH]
-  registry.sh assert-no-active|assert-empty [--repo PATH] [--state-root PATH]
+  registry.sh init|path [--repo PATH]
+  registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--sandbox read-only|workspace-write] [--pid PID --token TOKEN] [--repo PATH]
+  registry.sh bind --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH]
+  registry.sh activate --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH]
+  registry.sh checkpoint --task-id ID --evidence TEXT [--repo PATH]
+  registry.sh claim-invocation --task-id ID --pid PID --token TOKEN [--require-status active] [--repo PATH]
+  registry.sh release-invocation --task-id ID --token TOKEN [--repo PATH]
+  registry.sh record-child --task-id ID --pgid PGID --token TOKEN [--repo PATH]
+  registry.sh clear-child --task-id ID --pgid PGID --token TOKEN [--repo PATH]
+  registry.sh complete-and-retire --task-id ID --status completed|failed|blocked|interrupted --evidence TEXT [--invocation-token TOKEN] [--repo PATH]
+  registry.sh query --task-id ID [--repo PATH]
+  registry.sh active [--repo PATH]
+  registry.sh assert-no-active|assert-empty [--repo PATH]
 
 The durable identity is the Codex session ID. Process handles and outer tool-cell
 IDs are transient orchestration details and are never accepted by this registry.
 Exact-scope retries may name retired failed, blocked, or interrupted attempts;
-the retry inherits or matches the parent sandbox.
+the retry inherits or matches the parent sandbox. Registry state is always under
+the canonical repository's .agents/agent-registry boundary.
 EOF
 	exit "$exit_code"
 }
@@ -273,7 +276,7 @@ descendant_state_is_confirmed_clean() {
 source "$SCRIPT_DIR/registry-lock.sh"
 
 resolve_registry() {
-	REGISTRY_PATH="$($INIT_SCRIPT --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" --existing-path)" || exit $?
+	REGISTRY_PATH="$($INIT_SCRIPT --repo "$REPO_INPUT" --existing-path)" || exit $?
 	[[ -n "$REGISTRY_PATH" ]] || die "$EXIT_FILESYSTEM" 'init returned an empty registry path.'
 	REGISTRY_DIR="$(dirname "$REGISTRY_PATH")"
 	LOCK_DIR="$REGISTRY_DIR/.lock"
@@ -302,12 +305,6 @@ parse_common() {
 	--repo | -C)
 		[[ $# -ge 2 ]] || die "$EXIT_USAGE" "missing value for $1."
 		REPO_INPUT="$2"
-		PARSE_SHIFT=2
-		return 0
-		;;
-	--state-root)
-		[[ $# -ge 2 ]] || die "$EXIT_USAGE" 'missing value for --state-root.'
-		STATE_ROOT_INPUT="$2"
 		PARSE_SHIFT=2
 		return 0
 		;;

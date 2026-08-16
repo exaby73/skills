@@ -19,6 +19,23 @@ release_lock() {
 	fi
 }
 
+cleanup_unpublished_lock_candidate() {
+	if [[ -n "${LOCK_OWNER_FILE:-}" && -f "$LOCK_OWNER_FILE" && ! -L "$LOCK_OWNER_FILE" ]]; then
+		rm -f "$LOCK_OWNER_FILE" 2>/dev/null || true
+	fi
+}
+
+lock_exit_cleanup() {
+	# Release published lock first; candidate path may be the lock's only other
+	# hard link, so removing it before release would hide the owner identity.
+	release_lock
+	cleanup_unpublished_lock_candidate
+}
+
+# Shared callers inherit this trap before acquire_lock creates a candidate.
+# It remains installed through acquisition, so failures cannot clobber cleanup.
+trap lock_exit_cleanup EXIT
+
 remove_stale_lock_file() {
 	local attempt="$1"
 	local expected_record="$2"
@@ -88,15 +105,30 @@ lock_owner_is_confirmed_stale() {
 	pid_is_confirmed_nonexistent "$owner_pid"
 }
 
+lock_file_is_private() {
+	local path="$1"
+	local metadata=''
+	local owner=''
+	local mode=''
+	if metadata="$(stat -c '%u %a' "$path" 2>/dev/null)"; then
+		read -r owner mode <<<"$metadata"
+	elif metadata="$(stat -f '%u %Lp' "$path" 2>/dev/null)"; then
+		read -r owner mode <<<"$metadata"
+	else
+		return 1
+	fi
+	[[ "$owner" == "$UID" && "$mode" == 600 ]]
+}
+
 acquire_lock() {
 	local attempt=0
 	local owner_record=''
 	local owner_instance=''
 
 	LOCK_OWNER_FILE="$(mktemp "$REGISTRY_DIR/.lock-owner.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create registry-lock owner candidate in $REGISTRY_DIR."
+	chmod 0600 "$LOCK_OWNER_FILE" || die "$EXIT_FILESYSTEM" "cannot restrict registry-lock owner candidate: $LOCK_OWNER_FILE."
 	owner_instance="$(lock_process_instance_identity "$$")" || die "$EXIT_LOCK" "cannot identify registry-lock owner process instance for PID $$."
 	printf '%s|%s\n' "$$" "$owner_instance" >"$LOCK_OWNER_FILE" || die "$EXIT_FILESYSTEM" "cannot record registry-lock owner in $LOCK_OWNER_FILE."
-	trap release_lock EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	while true; do
@@ -106,6 +138,7 @@ acquire_lock() {
 		fi
 		[[ ! -L "$LOCK_DIR" ]] || die "$EXIT_FILESYSTEM" "registry lock must not be a symlink: $LOCK_DIR."
 		[[ -f "$LOCK_DIR" ]] || die "$EXIT_FILESYSTEM" "registry lock must be an atomic regular file: $LOCK_DIR. Preserve it for inspection before retrying."
+		lock_file_is_private "$LOCK_DIR" || die "$EXIT_FILESYSTEM" "registry lock must have mode 0600: $LOCK_DIR. Preserve it for inspection before retrying."
 		owner_record=''
 		IFS= read -r owner_record <"$LOCK_DIR" || owner_record=''
 		if lock_owner_is_confirmed_stale "$owner_record"; then

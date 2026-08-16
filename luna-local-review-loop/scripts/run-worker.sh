@@ -26,7 +26,6 @@ readonly RESULT_SCHEMA="$SCRIPT_DIR/../references/worker-result.schema.json"
 MODE='launch'
 REPO_INPUT='.'
 REPO_ROOT=''
-STATE_ROOT_INPUT="${LUNA_REGISTRY_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/luna-local-review-loop-${UID}}"
 TASK_ID=''
 SCOPE=''
 RETRY_OF=''
@@ -35,6 +34,7 @@ TASK_SANDBOX=''
 MODEL='gpt-5.6-luna'
 REASONING_EFFORT='max'
 CODEX_BIN="${CODEX_BIN:-codex}"
+CODEX_VERSION_VALIDATED=0
 FINISHED=0
 SESSION_ID=''
 INVOCATION_TOKEN=''
@@ -59,14 +59,14 @@ usage() {
 	local exit_code="${1:-0}"
 	cat <<'EOF'
 Usage:
-  run-worker.sh launch --task-id ID --scope TEXT --prompt-file FILE [--retry-of ID] [--sandbox read-only|workspace-write] [--repo PATH] [--state-root PATH]
-  run-worker.sh continue --task-id ID --prompt-file FILE [--repo PATH] [--state-root PATH]
-  run-worker.sh finish --task-id ID --status failed|blocked|interrupted --evidence TEXT [--repo PATH] [--state-root PATH]
+  run-worker.sh launch --task-id ID --scope TEXT --prompt-file FILE [--retry-of ID] [--sandbox read-only|workspace-write] [--repo PATH]
+  run-worker.sh continue --task-id ID --prompt-file FILE [--repo PATH]
+  run-worker.sh finish --task-id ID --status failed|blocked|interrupted --evidence TEXT [--repo PATH]
 
 Launch atomically reserves, creates and binds a resumable Codex session with a
 read-only handshake, activates it, and sends the task without a PTY or manual
 EOF. Continue resumes the exact registered session. Structured final output is
-printed to stdout; streaming logs stay in the external registry state directory.
+printed to stdout; streaming logs stay below the project-local registry directory.
 `--retry-of` resumes an exact scope from a retired failed, blocked, or
 interrupted attempt while preserving its sandbox.
 EOF
@@ -100,6 +100,45 @@ resolve_codex_home() {
 	export CODEX_HOME
 }
 
+require_workspace_write_boundary() {
+	local version_output=''
+	local version=''
+	local major=''
+	local minor=''
+	local patch=''
+	if [[ "$CODEX_VERSION_VALIDATED" -eq 1 ]]; then
+		return 0
+	fi
+	version_output="$( "$CODEX_BIN" --version 2>/dev/null )" || die "$EXIT_PREREQUISITE" "Codex CLI version probe failed; workspace-write reservation refused because the compiled recursive project .agents read-only metadata boundary cannot be proven."
+	[[ "$version_output" =~ ^codex-cli[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] || die "$EXIT_PREREQUISITE" "Codex CLI version is not fail-closed parseable as 'codex-cli X.Y.Z': ${version_output:-empty}. Workspace-write reservation refused."
+	version="${version_output#codex-cli }"
+	IFS='.' read -r major minor patch <<<"$version"
+	[[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || die "$EXIT_PREREQUISITE" "Codex CLI version is not fail-closed parseable as 'codex-cli X.Y.Z': $version_output. Workspace-write reservation refused."
+	if (( 10#$major < 0 || (10#$major == 0 && 10#$minor < 147) || (10#$major == 0 && 10#$minor == 147 && 10#$patch < 0) )); then
+		die "$EXIT_PREREQUISITE" "Codex CLI $version is too old for workspace-write registry protection; require >= 0.147.0 with the compiled recursive project .agents read-only metadata boundary. Read-only tasks remain supported."
+	fi
+	CODEX_VERSION_VALIDATED=1
+}
+
+preflight_workspace_write_launch() {
+	local effective_sandbox="$TASK_SANDBOX"
+	local retry_worker=''
+	if [[ -z "$effective_sandbox" ]]; then
+		if [[ -n "$RETRY_OF" ]]; then
+			retry_worker="$( "$REGISTRY_SCRIPT" query --task-id "$RETRY_OF" --repo "$REPO_INPUT" 2>/dev/null )" || die "$EXIT_RUNTIME_STATE" "cannot inspect retry sandbox before reservation: $RETRY_OF."
+			effective_sandbox="$(jq -r '.sandbox // empty' <<<"$retry_worker")"
+			case "$effective_sandbox" in
+			read-only | workspace-write) ;;
+			*) die "$EXIT_RUNTIME_STATE" "retry registry returned invalid sandbox before reservation: $RETRY_OF." ;;
+			esac
+		else
+			effective_sandbox='workspace-write'
+		fi
+	fi
+	[[ "$effective_sandbox" == workspace-write ]] || return 0
+	require_workspace_write_boundary
+}
+
 validate_common() {
 	local codex_discovered=''
 	local codex_parent=''
@@ -108,6 +147,7 @@ validate_common() {
 	local missing=''
 	local prompt_parent=''
 	local prompt_name=''
+	local repo_candidate=''
 	local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed od tr sort head mkfifo)
 	for command_name in "${required_commands[@]}"; do
 		if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -124,9 +164,17 @@ validate_common() {
 	[[ -f "$CODEX_BIN" && -x "$CODEX_BIN" ]] || die "$EXIT_PREREQUISITE" "Codex CLI is not an executable file: $CODEX_BIN."
 	[[ -f "$RESULT_SCHEMA" ]] || die "$EXIT_PREREQUISITE" "worker result schema not found: $RESULT_SCHEMA."
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_USAGE" "repository path does not exist or is not a directory: $REPO_INPUT."
-	REPO_ROOT="$(git -C "$REPO_INPUT" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_USAGE" "repository path is not inside a Git repository: $REPO_INPUT."
+	repo_candidate="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve repository path: $REPO_INPUT."
+	REPO_ROOT="$(git -C "$repo_candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_USAGE" "repository path is not inside a Git repository: $REPO_INPUT."
 	REPO_ROOT="$(cd -P "$REPO_ROOT" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve repository root: $REPO_INPUT."
+	case "$repo_candidate" in
+	"$REPO_ROOT" | "$REPO_ROOT"/*) ;;
+	*) die "$EXIT_USAGE" "Git recorded a different checkout root than the supplied path: $repo_candidate -> $REPO_ROOT." ;;
+	esac
 	[[ "$TASK_ID" =~ ^[A-Za-z0-9._-]+$ && "$TASK_ID" != . && "$TASK_ID" != .. ]] || die "$EXIT_USAGE" 'task-id must be an artifact-safe name containing only letters, numbers, dot, underscore, or hyphen, and must not be dot or dot-dot.'
+	if [[ -n "$RETRY_OF" ]]; then
+		[[ "$RETRY_OF" =~ ^[A-Za-z0-9._-]+$ && "$RETRY_OF" != . && "$RETRY_OF" != .. ]] || die "$EXIT_USAGE" 'retry-of must be an artifact-safe task ID.'
+	fi
 	[[ -f "$PROMPT_FILE" && ! -L "$PROMPT_FILE" ]] || die "$EXIT_USAGE" "prompt-file must be a regular non-symlink file: $PROMPT_FILE."
 	case "$PROMPT_FILE" in /*) ;; *) PROMPT_FILE="$PWD/$PROMPT_FILE" ;; esac
 	prompt_parent="${PROMPT_FILE%/*}"
@@ -143,7 +191,7 @@ finish_on_error() {
 	close_prompt_descriptor
 	cleanup_prompt_staging
 	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && -n "$TASK_ID" && -n "$INVOCATION_TOKEN" ]]; then
-		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status failed --evidence "worker launcher exited $exit_code before a structured terminal result" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" >/dev/null 2>&1 || true
+		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status failed --evidence "worker launcher exited $exit_code before a structured terminal result" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" >/dev/null 2>&1 || true
 	fi
 	INVOCATION_CLAIMED=0
 	exit "$exit_code"
@@ -155,7 +203,7 @@ prepare_invocation() {
 
 claim_invocation() {
 	prepare_invocation
-	local claim_args=(claim-invocation --task-id "$TASK_ID" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")
+	local claim_args=(claim-invocation --task-id "$TASK_ID" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT")
 	[[ "$MODE" != continue ]] || claim_args+=(--require-status active)
 	run_registry_quiet "${claim_args[@]}"
 	INVOCATION_CLAIMED=1
@@ -163,7 +211,7 @@ claim_invocation() {
 
 release_invocation() {
 	if [[ "$INVOCATION_CLAIMED" -eq 1 ]]; then
-		run_registry_quiet release-invocation --task-id "$TASK_ID" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+		run_registry_quiet release-invocation --task-id "$TASK_ID" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 		INVOCATION_CLAIMED=0
 	fi
 }
@@ -513,18 +561,34 @@ create_real_child_directory() {
 	local parent_real
 	local path
 	local resolved
+	local created=0
+	local owner=''
+	local mode=''
 	parent_real="$(cd -P "$parent" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label parent directory: $parent."
 	path="$parent/$name"
 	[[ ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must be a real directory, not a symlink: $path."
 	if [[ ! -e "$path" ]]; then
 		if ! mkdir "$path" 2>/dev/null; then
 			[[ -d "$path" && ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "cannot create $label: $path."
+		else
+			created=1
 		fi
 	fi
 	[[ -d "$path" && ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must be a real directory: $path."
 	resolved="$(cd -P "$path" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label: $path."
 	[[ "$resolved" == "$parent_real/$name" ]] || die "$EXIT_RUNTIME_STATE" "$label resolved outside its parent: $path -> $resolved."
-	chmod 0700 "$resolved" || die "$EXIT_RUNTIME_STATE" "cannot restrict $label permissions: $resolved."
+	if owner="$(stat -c '%u' "$resolved" 2>/dev/null)"; then :
+	elif owner="$(stat -f '%u' "$resolved" 2>/dev/null)"; then :
+	else die "$EXIT_RUNTIME_STATE" "cannot inspect $label ownership: $resolved."; fi
+	[[ "$owner" == "$UID" ]] || die "$EXIT_RUNTIME_STATE" "$label must be owned by UID $UID: $resolved is owned by UID $owner."
+	if [[ "$created" -eq 1 ]]; then
+		chmod 0700 "$resolved" || die "$EXIT_RUNTIME_STATE" "cannot restrict $label permissions: $resolved."
+	else
+		if mode="$(stat -c '%a' "$resolved" 2>/dev/null)"; then :
+		elif mode="$(stat -f '%Lp' "$resolved" 2>/dev/null)"; then :
+		else die "$EXIT_RUNTIME_STATE" "cannot inspect $label permissions: $resolved."; fi
+		[[ "$mode" == 700 ]] || die "$EXIT_RUNTIME_STATE" "$label must have mode 0700: $resolved has mode $mode."
+	fi
 	printf '%s\n' "$resolved"
 }
 
@@ -535,12 +599,32 @@ require_real_child_directory() {
 	local parent_real
 	local path
 	local resolved
+	local owner=''
 	parent_real="$(cd -P "$parent" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label parent directory: $parent."
 	path="$parent/$name"
 	[[ -d "$path" && ! -L "$path" ]] || die "$EXIT_WORKER" "$label is missing or symlinked: $path."
 	resolved="$(cd -P "$path" 2>/dev/null && pwd -P)" || die "$EXIT_RUNTIME_STATE" "cannot resolve $label: $path."
 	[[ "$resolved" == "$parent_real/$name" ]] || die "$EXIT_RUNTIME_STATE" "$label resolved outside its parent: $path -> $resolved."
+	if owner="$(stat -c '%u' "$resolved" 2>/dev/null)"; then :
+	elif owner="$(stat -f '%u' "$resolved" 2>/dev/null)"; then :
+	else die "$EXIT_RUNTIME_STATE" "cannot inspect $label ownership: $resolved."; fi
+	[[ "$owner" == "$UID" ]] || die "$EXIT_RUNTIME_STATE" "$label must be owned by UID $UID: $resolved is owned by UID $owner."
+	local mode=''
+	if mode="$(stat -c '%a' "$resolved" 2>/dev/null)"; then :
+	elif mode="$(stat -f '%Lp' "$resolved" 2>/dev/null)"; then :
+	else die "$EXIT_RUNTIME_STATE" "cannot inspect $label permissions: $resolved."; fi
+	[[ "$mode" == 700 ]] || die "$EXIT_RUNTIME_STATE" "$label must have mode 0700: $resolved has mode $mode."
 	printf '%s\n' "$resolved"
+}
+
+resolve_registry_directory() {
+	local registry_path="$1"
+	local expected_registry_path="$REPO_ROOT/.agents/agent-registry/registry.json"
+	local registry_dir=''
+	[[ "$registry_path" == "$expected_registry_path" ]] || die "$EXIT_RUNTIME_STATE" "registry path is not the exact project-local authority: $registry_path."
+	registry_dir="$(dirname "$registry_path")" || die "$EXIT_RUNTIME_STATE" "cannot derive registry directory from authoritative registry path: $registry_path."
+	[[ "$registry_dir" == "$REPO_ROOT/.agents/agent-registry" ]] || die "$EXIT_RUNTIME_STATE" "registry directory is not the exact project-local authority directory: $registry_dir."
+	printf '%s\n' "$registry_dir"
 }
 
 artifact_link_count() {
@@ -561,9 +645,19 @@ require_owned_artifact_file() {
 	local path="$1"
 	local label="$2"
 	local link_count=''
+	local owner=''
+	local mode=''
 	[[ -f "$path" && ! -L "$path" ]] || die "$EXIT_RUNTIME_STATE" "$label must be a real regular file: $path."
 	link_count="$(artifact_link_count "$path")" || die "$EXIT_RUNTIME_STATE" "cannot inspect $label link count: $path."
 	[[ "$link_count" -eq 1 ]] || die "$EXIT_RUNTIME_STATE" "$label must have exactly one hard link: $path."
+	if owner="$(stat -c '%u' "$path" 2>/dev/null)"; then :
+	elif owner="$(stat -f '%u' "$path" 2>/dev/null)"; then :
+	else die "$EXIT_RUNTIME_STATE" "cannot inspect $label ownership: $path."; fi
+	[[ "$owner" == "$UID" ]] || die "$EXIT_RUNTIME_STATE" "$label must be owned by UID $UID: $path is owned by UID $owner."
+	if mode="$(stat -c '%a' "$path" 2>/dev/null)"; then :
+	elif mode="$(stat -f '%Lp' "$path" 2>/dev/null)"; then :
+	else die "$EXIT_RUNTIME_STATE" "cannot inspect $label permissions: $path."; fi
+	[[ "$mode" == 600 ]] || die "$EXIT_RUNTIME_STATE" "$label must have mode 0600: $path has mode $mode."
 }
 
 artifact_identity() {
@@ -666,21 +760,36 @@ run_gated_codex() {
 	fi
 	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
 	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
-	rm -f "$gate_path" "$lease_path" "$lease_ready_path"
-	mkfifo "$lease_path" || return 1
+	[[ ! -e "$gate_path" && ! -L "$gate_path" ]] || die "$EXIT_RUNTIME_STATE" "Codex start gate already exists; refusing to overwrite it: $gate_path."
+	[[ ! -e "$lease_path" && ! -L "$lease_path" ]] || die "$EXIT_RUNTIME_STATE" "Codex lease already exists; refusing to overwrite it: $lease_path."
+	[[ ! -e "$lease_ready_path" && ! -L "$lease_ready_path" ]] || die "$EXIT_RUNTIME_STATE" "Codex lease-ready marker already exists; refusing to overwrite it: $lease_ready_path."
+	create_owned_artifact_file "$lease_ready_path" 'Codex lease-ready marker'
+	if ! mkfifo "$lease_path"; then
+		rm -f "$lease_ready_path"
+		return 1
+	fi
+	if ! chmod 0600 "$lease_path"; then
+		rm -f "$lease_path" "$lease_ready_path"
+		return 1
+	fi
+	if ! exec 7>>"$lease_ready_path"; then
+		rm -f "$lease_path" "$lease_ready_path"
+		return 1
+	fi
 	cat "$lease_path" >/dev/null &
 	ACTIVE_LEASE_PID=$!
 	ACTIVE_LEASE_INSTANCE="$(process_instance_identity "$ACTIVE_LEASE_PID")" || {
 		kill -TERM "$ACTIVE_LEASE_PID" 2>/dev/null || true
 		wait "$ACTIVE_LEASE_PID" 2>/dev/null || true
 		ACTIVE_LEASE_PID=''
+		exec 7>&-
 		rm -f "$lease_path"
 		return 1
 	}
 	set -m
 	(
 		exec 9>"$lease_path"
-		: >"$lease_ready_path"
+		printf '%s\n' ready >&7
 		export LUNA_WORKER_PROCESS_TOKEN="$INVOCATION_TOKEN"
 		cd "$codex_cwd" || exit 126
 		while [[ ! -f "$gate_path" ]]; do
@@ -688,24 +797,27 @@ run_gated_codex() {
 			sleep 0.05
 		done
 		if [[ "$stdin_source" == "$PROMPT_DESCRIPTOR_SOURCE" ]]; then
+			exec 7>&-
 			exec "$@" <&8
 		elif [[ -n "$stdin_source" ]]; then
 			exec 8<&-
+			exec 7>&-
 			exec "$@" <"$stdin_source"
 		else
 			exec 8<&-
+			exec 7>&-
 			exec "$@" </dev/null
 		fi
 		) >>"$stream_log" 2>>"$stream_stderr" &
 	set +m
 	ACTIVE_CODEX_PID=$!
 	child_pid="$ACTIVE_CODEX_PID"
-	while [[ ! -f "$lease_ready_path" ]]; do
+	while [[ ! -s "$lease_ready_path" ]]; do
 		kill -0 "$child_pid" 2>/dev/null || break
 		process_instance_matches "$ACTIVE_LEASE_PID" "$ACTIVE_LEASE_INSTANCE" || break
 		sleep 0.01
 	done
-	if [[ ! -f "$lease_ready_path" ]]; then
+	if [[ ! -s "$lease_ready_path" ]]; then
 		kill -TERM "$child_pid" 2>/dev/null || true
 		wait "$child_pid" 2>/dev/null || true
 		kill -TERM "$ACTIVE_LEASE_PID" 2>/dev/null || true
@@ -713,9 +825,11 @@ run_gated_codex() {
 		ACTIVE_CODEX_PID=''
 		ACTIVE_LEASE_PID=''
 		ACTIVE_LEASE_INSTANCE=''
+		exec 7>&-
 		rm -f "$lease_path" "$lease_ready_path"
 		return 1
 	fi
+	exec 7>&-
 	rm -f "$lease_path" "$lease_ready_path"
 	ACTIVE_CODEX_INSTANCE="$(process_instance_identity "$child_pid")" || {
 		kill -TERM "$child_pid" 2>/dev/null || true
@@ -737,9 +851,11 @@ run_gated_codex() {
 		return 1
 	fi
 	ACTIVE_TRACKER_STATE="$artifact_dir/.descendants-$INVOCATION_TOKEN.json"
-	[[ ! -L "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must not be a symlink: $ACTIVE_TRACKER_STATE."
-	[[ ! -e "$ACTIVE_TRACKER_STATE" || -f "$ACTIVE_TRACKER_STATE" ]] || die "$EXIT_RUNTIME_STATE" "descendant tracker state must be a regular file target: $ACTIVE_TRACKER_STATE."
-	rm -f "$ACTIVE_TRACKER_STATE"
+	if [[ -e "$ACTIVE_TRACKER_STATE" || -L "$ACTIVE_TRACKER_STATE" ]]; then
+		require_owned_artifact_file "$ACTIVE_TRACKER_STATE" 'previous descendant tracker state'
+		jq -e '.status == "clean" and (.root_pid | type == "number" and . > 0 and floor == .) and .processes == []' "$ACTIVE_TRACKER_STATE" >/dev/null 2>&1 || die "$EXIT_RUNTIME_STATE" "previous descendant tracker has not proved a clean process tree: $ACTIVE_TRACKER_STATE."
+		rm "$ACTIVE_TRACKER_STATE" || die "$EXIT_RUNTIME_STATE" "cannot replace validated clean descendant tracker state: $ACTIVE_TRACKER_STATE."
+	fi
 	monitor_descendant_tree "$child_pid" "$ACTIVE_TRACKER_STATE" "$ACTIVE_LEASE_PID" "$ACTIVE_LEASE_INSTANCE" >/dev/null 2>&1 &
 	ACTIVE_TRACKER_PID=$!
 	while [[ ! -s "$ACTIVE_TRACKER_STATE" ]]; do
@@ -752,13 +868,13 @@ run_gated_codex() {
 		stop_active_lease
 		return 1
 	}
-	if ! run_registry_quiet record-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
+	if ! run_registry_quiet record-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"; then
 		stop_codex_process_group TERM || true
 		stop_tracked_worker_processes TERM || true
 		stop_active_lease
 		return 1
 	fi
-	if ! : >"$gate_path"; then
+	if ! create_owned_artifact_file "$gate_path" 'Codex start gate'; then
 		stop_codex_process_group TERM || true
 		stop_tracked_worker_processes TERM || true
 		stop_active_lease
@@ -772,7 +888,7 @@ run_gated_codex() {
 	stop_tracked_worker_processes TERM || return 1
 	require_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
 	require_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
-	if ! run_registry_quiet clear-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"; then
+	if ! run_registry_quiet clear-child --task-id "$TASK_ID" --pgid "$child_pgid" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"; then
 		ACTIVE_CODEX_PGID=''
 		return 1
 	fi
@@ -834,6 +950,7 @@ resume_task() {
 	local codex_status=0
 	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$resume_prompt_source" "$REPO_ROOT" "$CODEX_BIN" exec resume \
 		--ignore-user-config \
+		--strict-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		-c "sandbox_mode=\"$TASK_SANDBOX\"" \
@@ -856,17 +973,17 @@ resume_task() {
 	evidence="$(jq -r '.summary' "$result_path")"
 	case "$outcome" in
 	completed)
-		run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status completed --evidence "$evidence" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+		run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status completed --evidence "$evidence" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 		FINISHED=1
 		INVOCATION_CLAIMED=0
 		;;
 	blocked)
-		run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status blocked --evidence "$evidence" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+		run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status blocked --evidence "$evidence" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 		FINISHED=1
 		INVOCATION_CLAIMED=0
 		;;
 	needs_parent_action)
-		run_registry_quiet checkpoint --task-id "$TASK_ID" --evidence "$evidence" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+		run_registry_quiet checkpoint --task-id "$TASK_ID" --evidence "$evidence" --repo "$REPO_INPUT"
 		release_invocation
 		FINISHED=1
 		;;
@@ -879,6 +996,7 @@ launch_worker() {
 	trap finish_on_error EXIT
 	[[ -n "$SCOPE" ]] || die "$EXIT_USAGE" 'launch requires non-empty --scope.'
 	validate_common
+	preflight_workspace_write_launch
 	local registry_path
 	local registry_dir
 	local artifact_root
@@ -886,18 +1004,18 @@ launch_worker() {
 	local prompt_staging
 	local prompt_snapshot
 	prepare_invocation
-	registry_path="$($REGISTRY_SCRIPT init --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" --print-path)"
-	registry_dir="$(dirname "$registry_path")"
+	registry_path="$($REGISTRY_SCRIPT init --repo "$REPO_INPUT" --print-path)"
+	registry_dir="$(resolve_registry_directory "$registry_path")"
 	artifact_root="$(create_real_child_directory "$registry_dir" artifacts 'artifact root')"
 	prompt_staging="$artifact_root/.prompt-$INVOCATION_TOKEN"
 	PROMPT_STAGING_PATH="$prompt_staging"
 	snapshot_prompt_file "$PROMPT_FILE" "$prompt_staging"
-	local reserve_args=(reserve --task-id "$TASK_ID" --scope "$SCOPE" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")
+	local reserve_args=(reserve --task-id "$TASK_ID" --scope "$SCOPE" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT")
 	[[ -z "$RETRY_OF" ]] || reserve_args+=(--retry-of "$RETRY_OF")
 	[[ -z "$TASK_SANDBOX" ]] || reserve_args+=(--sandbox "$TASK_SANDBOX")
 	run_registry_quiet "${reserve_args[@]}"
 	INVOCATION_CLAIMED=1
-	TASK_SANDBOX="$("$REGISTRY_SCRIPT" query --task-id "$TASK_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT" | jq -r '.sandbox')"
+	TASK_SANDBOX="$("$REGISTRY_SCRIPT" query --task-id "$TASK_ID" --repo "$REPO_INPUT" | jq -r '.sandbox')"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
 
 	artifact_dir="$(create_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
@@ -918,6 +1036,7 @@ launch_worker() {
 	local codex_status=0
 	run_gated_codex "$artifact_dir" "$launch_log" "$launch_stderr" '' "$REPO_ROOT" "$CODEX_BIN" exec \
 		--ignore-user-config \
+		--strict-config \
 		-m "$MODEL" \
 		-c "model_reasoning_effort=$REASONING_EFFORT" \
 		-s read-only \
@@ -926,13 +1045,13 @@ launch_worker() {
 		'Handshake only. Do not inspect or modify the repository. Reply exactly READY_TO_BIND.' || codex_status=$?
 	if [[ "$codex_status" -ne 0 ]]; then
 		SESSION_ID="$(extract_session_id "$launch_log")"
-		[[ -z "$SESSION_ID" ]] || run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+		[[ -z "$SESSION_ID" ]] || run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 		die "$EXIT_WORKER" "Codex handshake failed for task $TASK_ID. Logs: $launch_log and $launch_stderr"
 	fi
 	SESSION_ID="$(extract_session_id "$launch_log")"
 	[[ -n "$SESSION_ID" ]] || die "$EXIT_WORKER" "Codex handshake emitted no thread.started session ID. Log: $launch_log"
-	run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
-	run_registry_quiet activate --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+	run_registry_quiet bind --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
+	run_registry_quiet activate --task-id "$TASK_ID" --session-id "$SESSION_ID" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 	resume_task "$artifact_dir" "$PROMPT_DESCRIPTOR_SOURCE"
 }
 
@@ -943,16 +1062,17 @@ continue_worker() {
 	local artifact_root
 	local artifact_dir
 	local worker
-	registry_path="$($REGISTRY_SCRIPT path --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")"
-	registry_dir="$(dirname "$registry_path")"
+	registry_path="$($REGISTRY_SCRIPT path --repo "$REPO_INPUT")"
+	registry_dir="$(resolve_registry_directory "$registry_path")"
 	artifact_root="$(require_real_child_directory "$registry_dir" artifacts 'artifact root')"
 	artifact_dir="$(require_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
 	trap finish_on_error EXIT
-	claim_invocation
-	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT")"
+	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT")"
 	SESSION_ID="$(jq -r '.session_id' <<<"$worker")"
 	TASK_SANDBOX="$(jq -r '.sandbox' <<<"$worker")"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
+	[[ "$TASK_SANDBOX" == read-only ]] || require_workspace_write_boundary
+	claim_invocation
 	resume_task "$artifact_dir" "$PROMPT_FILE"
 }
 
@@ -961,7 +1081,7 @@ finish_worker() {
 	case "$FINISH_STATUS" in failed | blocked | interrupted) ;; *) die "$EXIT_USAGE" 'finish status must be failed, blocked, or interrupted.' ;; esac
 	trap finish_on_error EXIT
 	claim_invocation
-	run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status "$FINISH_STATUS" --evidence "$FINISH_EVIDENCE" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" --state-root "$STATE_ROOT_INPUT"
+	run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status "$FINISH_STATUS" --evidence "$FINISH_EVIDENCE" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 	FINISHED=1
 	INVOCATION_CLAIMED=0
 }
@@ -998,10 +1118,6 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--repo | -C)
 		REPO_INPUT="${2:-}"
-		shift 2
-		;;
-	--state-root)
-		STATE_ROOT_INPUT="${2:-}"
 		shift 2
 		;;
 	--status)
