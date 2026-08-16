@@ -1,123 +1,122 @@
 ---
 name: luna-local-review-loop
-description: Route local repository implementation, documentation, testing, validation, and review fixes between a parent and fresh GPT-5.6 Luna Max workers. Use for non-trivial local work requiring one-task worker isolation, resumable registered sessions, least-privilege permission brokerage, structured results, mandatory cleanup, and parent-owned code review and delivery.
+description: Route non-trivial local repository implementation, documentation, testing, validation, and review-fix work through one fresh resumable worker at a time. Use when work needs immutable scope ownership, least-privilege permission brokerage, structured results, durable retry state, process-safe cleanup, and parent-owned review and delivery.
 ---
 
 # Luna Local Review Loop
 
-Route local work to fresh Luna Max workers, then have the parent validate and review the combined result. Read [README.md](README.md) before first use. Treat the bundled scripts as the worker-registry source of truth.
+Use bundled scripts as registry source of truth. Read README.md before first use.
 
-## Identify the role
+## Roles
 
-- The parent owns decomposition, launch, permissions, durable goals/plans, validation judgment, review, commits, delivery, CI, and GitHub state.
-- A worker owns exactly one immutable task. It never delegates, stages, commits, pushes, reviews the combined change, or manages GitHub/CI state.
-- Both roles read the target repository's `AGENTS.md` hierarchy and project-local `.agents/skills/caveman/SKILL.md` before work. Both use Caveman for user-facing output. Never substitute a global Caveman copy.
-- The parent alone invokes the project-local `code-reviewer` skill. Never delegate parent review to Luna. Obey any project rule that fixes the parent reviewer model/reasoning configuration.
+Parent owns decomposition, permissions, durable goals/plans, validation judgment, review, commits, delivery, CI, and GitHub state. Worker owns exactly one immutable task. Worker never delegates, stages, commits, pushes, reviews combined changes, manages GitHub/CI, daemonizes, double-forks, or starts persistent background services.
 
-## Initialize without tracked-project mutation
+Both roles read target repository AGENTS.md hierarchy and project-local .agents/skills/caveman/SKILL.md. Use project-local Caveman for user-facing output. Parent alone invokes project-local code-reviewer.
 
-Run once per repository or after runtime cleanup:
+## Initialize
 
-```sh
+Run from any path inside target Git checkout:
+
+~~~sh
 skill_root='/absolute/path/to/luna-local-review-loop'
 repo_root='/absolute/path/to/repository'
 "$skill_root/scripts/init.sh" --repo "$repo_root"
-```
+~~~
 
-Init validates `codex`, `jq`, Git, every runner utility, project-local Caveman, and project-local code-reviewer. It stores the registry below `${LUNA_REGISTRY_ROOT:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/luna-local-review-loop-${UID}}` using a deterministic creation key. The selected state root must be owned by the current UID and grant no group or other permissions. First initialization creates one random, untracked `luna-local-review-loop.instance` marker inside the physical Git directory and atomically records the authoritative external registry path in `luna-local-review-loop.registry` beside it. That locator is `pending` only during first creation and becomes `ready` after the registry exists; a missing ready target is recovery damage and is never recreated. If interruption leaves only the real instance marker, normal init may resume only when checkout-authority inspection finds no durable authority record, conflicting external state, or live legacy state; `--existing-path` remains recovery-only and refuses without inventing a locator, marker, or registry. Later operations follow the locator even when `--state-root`, `LUNA_REGISTRY_ROOT`, `XDG_RUNTIME_DIR`, or `TMPDIR` changes, so one checkout cannot silently create parallel registries. A separate private authority record under `${LUNA_AUTHORITY_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/luna-local-review-loop}` survives replacement Git metadata and changes to the selectable state root. It blocks new initialization when both Git authority files disappear while the recorded registry retains live workers, and it never replaces a missing authoritative target with empty state. The instance marker combines with the Git directory's device/inode identity, and the registry retains that path-independent physical-checkout discriminator, so a moved checkout with a missing marker cannot silently create new state while workers remain live. Moving the same checkout otherwise preserves live workers and updates the stored canonical repository root, while a copied checkout replaces its copied locator and receives isolated state; a replacement repository cannot inherit old state. A linked worktree must also have a Git-admin backlink to its supplied checkout; copied linked-worktree aliases are rejected before registry selection. A live project-local schema-v1 registry blocks only first-time external-state creation; once valid external state exists, recovery access remains available even if legacy state reappears. Init never edits `.gitignore`, `skills-lock.json`, `.agents/skills`, or tracked project files, and never installs from the network. If a skill is missing, init prints explicit universal-target install commands; the parent decides whether to run them and reviews the resulting project changes.
+Authoritative registry path is always:
 
-When an old-path authority target is a valid version-3 registry for another physical checkout with no live workers, normal initialization retires only that stale authority and allocates isolated identity-keyed state; live-worker, checkout-identity, symlink, hard-link, and replacement-repository protections remain fail-closed.
+~~~text
+<repository-root>/.agents/agent-registry/registry.json
+~~~
+
+Every registry lock, prompt snapshot, JSONL stream, stderr log, structured result, descendant tracker, lease, and other skill-owned durable artifact stays below <repository-root>/.agents/agent-registry/. Never derive or read registry state from environment variables, temporary directories, home directories, runtime-state directories, Codex state directories, Git administration directories, or caller-provided paths.
+
+Init is idempotent. It may create .agents/agent-registry/ with mode 0700, state files with mode 0600, and exactly one .agents/agent-registry/ line in a regular root .gitignore. Existing .gitignore mode stays unchanged when it is owned by the caller and not group- or world-writable; new .gitignore mode is 0644; all other lines stay unchanged. Init rejects symlinked or non-directory boundary ancestors, path escape, unsafe ownership or permissions, symlinked/non-regular or multiply-linked state files, and unsafe .gitignore.
+
+registry.sh path --repo "$repo_root" deterministically resolves the same project-local path. No caller-selected alternate state path or second index is supported.
+
+## Identity and migration
+
+Derive repository identity from canonical Git evidence: physical Git administration device/inode identity, Git common-directory identity, ordinary-checkout .git ownership, or linked-worktree .git and Git-admin backlinks. Do not use random markers or repository path hashes. A moved physical checkout keeps identity and updates stored repository_root; copied or replacement Git metadata has different identity and cannot attach to live or copied state. Copied linked-worktree aliases and ordinary .git aliases fail closed.
+
+Schema-v3 identity_ledger is append-only lifetime history. workers contains only reserved, bound, or active rows. Empty project-local schema-v1 state may migrate only when repository ownership is proven and every worker row is absent. Live, malformed, foreign, or non-empty legacy state remains unchanged and returns recovery instructions. Empty project-local schema-v2 state may migrate after root ownership is proven. This version never discovers or copies state from older installations stored outside the project; retire live workers with the previous version before installing this one.
 
 ## Route work
 
-- Parent-direct only when clearly trivial: normally at most two minutes, one file, no meaningful external side effect, and cheaper than worker coordination.
-- Use Luna Max for everything else. Luna is mandatory when work may touch three or more files or exceed five minutes. Bias toward Luna in the grey zone.
-- Decompose independent tasks into non-overlapping owned paths, one expected result, one validator, one sandbox, and explicit exclusions. Each worker receives one task only and is retired at terminal state. Never reuse a worker for another task.
-- Apply repository command gates before launch. Commands reserved for the parent, including elevated tests, stay parent-owned even if the worker sandbox could run them.
+Use parent-direct handling only for clearly trivial work. For non-trivial work, parent creates one task with immutable scope, expected result, sandbox, validator, exclusions, Caveman requirement, no-stage/no-commit rule, and explicit lifecycle-escape prohibition. One session serves one task. Parent performs validation and review; worker reports evidence.
 
-## Launch an atomic registered worker
+## Launch
 
-Write the full task to a temporary prompt file outside the repository diff. Include task ID, immutable scope, owned paths, validator, repository rules, Caveman requirement, no-stage/no-commit rule, structured evidence expectations, and an explicit ban on daemonization, persistent background services, double-forking, or other deliberate lifecycle escape.
-
-Task IDs must be artifact-safe path components: letters, numbers, dot, underscore, or hyphen only, excluding `.` and `..`.
-
-```sh
-task_id='issue-123-validator'
-task_scope='owned paths: src/a.ts; task: implement validator; validator: pnpm check; sandbox: workspace-write; no staging or commits'
-
+~~~sh
 "$skill_root/scripts/run-worker.sh" launch \
   --repo "$repo_root" \
-  --task-id "$task_id" \
-  --scope "$task_scope" \
+  --task-id issue-123-worker-1 \
+  --scope 'owned paths: src/a.ts; task: implement validator; validator: project check; no commits' \
   --sandbox workspace-write \
-  --prompt-file '/absolute/path/to/task-prompt.txt'
-```
+  --prompt-file /absolute/path/to/task-prompt.txt
+~~~
 
-The launcher snapshots the validated launch prompt into private staging before reservation, atomically reserves the task together with its initial invocation claim, then publishes its real single-link `.task-prompt` file before handshake. It validates and opens that snapshot once before handshake; the read-only handshake closes the descriptor before exec, while the first task resume inherits it and never reopens the task-artifact pathname. Replacing the caller prompt or `.task-prompt` during handshake therefore cannot change the first task resume, and the handshake cannot inspect or consume its input. Continuations read their newly supplied prompt normally. Launch EXIT cleanup removes staging only when its current path is still the exact real single-link file created by that invocation; symlinked, hard-linked, unrelated, or ambiguous paths are left untouched. The launcher starts a non-ephemeral read-only handshake, captures the Codex session ID from JSONL even when the command exits immediately, binds and activates that session with the same invocation token, resumes it from the canonical target repository with the registered sandbox reapplied, and writes streaming logs outside the project. The requested `read-only` or `workspace-write` sandbox applies only to the immutable task resume, never to handshake. Before any launch child changes directory, a relative `CODEX_HOME` is resolved and exported as an absolute physical path, so permission probes, handshake, and resume use the same runtime directory. It returns only the final structured result on stdout. A live invocation owner exclusively controls binding, activation, and retirement through its exact token; tokenless recovery is allowed only after that owner is confirmed exited.
+Task IDs contain only letters, numbers, dot, underscore, and hyphen; . and .. are forbidden. Launch snapshots the prompt below the project-local registry, atomically reserves the task and invocation token, performs a read-only handshake, binds the durable Codex session ID, activates it, then resumes the exact session from canonical repository root with the registered sandbox. It prints only structured final JSON on stdout; streaming artifacts and stderr remain below the task artifact directory.
 
-Never add `--ephemeral` to a resumable worker. The durable identity is the Codex session ID (`01...`). A live `exec_command.session_id` integer is only a transient inner process-control handle. A `functions.exec` cell ID and a shell PID are neither worker identities nor accepted registry handles. The registry intentionally stores none of those process handles.
+Handshake always uses read-only mode and cannot consume the task prompt. First resume inherits the descriptor opened for the immutable .task-prompt; it does not reopen that pathname. Continuations read their supplied prompt normally. Never use --ephemeral, PTY, manual EOF, --last, replacement sessions, or process handles as worker identity.
 
-The launcher uses `--ignore-user-config` so unrelated MCP servers/connectors do not start. Add task-relevant context to the prompt or target repository configuration; do not re-enable the full user connector set merely for convenience.
+The launcher uses --ignore-user-config to avoid unrelated connector startup. Codex runtime state is separate product-owned state; this skill does not relocate or manage it. If runtime permission fails, return needs_parent_action with exact permission request.
 
-The registry atomically claims each live invocation and pins its PID to a validated process-start identity, so PID reuse is treated as a stale claim. A stale claim may be replaced only while holding the registry mutation lock and only after the previous invocation's recorded descendant tracker exists, is clean, and retains no process identities whenever a child was recorded. Missing tracker evidence blocks reclaim and retirement. The lock owner and each Codex process-group leader are also pinned to process-start identities. Lock release/recovery compare the retained inode, so a contender cannot delete a newer owner; group recovery ignores a reused PGID unless its leader instance matches, while the descendant tracker remains the independent cleanup proof. Symlinked or non-regular locks are rejected. The runner resolves the validated Codex executable to an absolute path before changing directories and revalidates every launch utility before both launch and continuation claims. Every Codex launch runs in its own process group and waits behind a start gate until the ancestry tracker publishes readiness, then persists the PGID and leader identity before releasing the gate. A separate ancestry tracker records observed descendants, pins each PID to its process-start identity, and verifies each known parent instance before adopting its current children. The tracker publishes its first full process snapshot immediately, polls at 50 ms after a change, backs off to 100 ms after one stable observation, and caps stable polling at 250 ms; it republishes validated state at that cadence so external tampering is overwritten. Every worker and descendant also inherits a private FIFO lease, so a fast-reparented background process keeps cleanup active even when its intermediate parent disappeared between snapshots. Before publishing clean state, the tracker independently enumerates visible invocation-token processes. If the lease proves something remains live but the host cannot identify it safely, the runner refuses retirement and preserves recoverable active state. This blocks clearing or retirement while a recorded or lease-proven process instance remains live without allowing a reused parent PID to capture an unrelated process tree. This is cooperative local lifecycle safety, not an OS containment boundary: every worker prompt must forbid daemonization, persistent background services, double-forking, closing the lifecycle lease, and deliberate lifecycle escape. Put persistent services under parent-owned orchestration or an explicit container/cgroup boundary. Zombie members count as exited. Ambiguous access is handled conservatively as still live, requiring manual inspection instead of unsafe retirement. If the runner receives `INT`, `TERM`, or `HUP` (`SIGHUP`) and descendant cleanup is unproven, it preserves the lease evidence, skips EXIT retirement, and leaves registry state active until explicit recovery proves cleanup; otherwise it signals and drains the Codex group plus tracked descendants before token-checked registry retirement. Artifact directories and files, including `.task-prompt`, must remain real, non-symlinked, single-link files below the external registry path; artifact attempts advance from the greatest existing numeric suffix, and stale symlink or hard-link targets are never overwritten. Never bypass these controls by deleting registry state manually.
+## Ownership and process safety
 
-Use `read-only` for investigation/review and `workspace-write` for implementation. The parent shell must separately allow the owning Codex runtime-state directory (normally `$CODEX_HOME` or `~/.codex`) to be written. This runtime permission is distinct from the worker repository sandbox. If the launcher reports exit 11, stop and obtain that narrow outer permission; never broaden the repository sandbox as a workaround.
+Registry transitions use an atomic lock whose owner PID and process-start identity are pinned. A stale claim can be reclaimed only after the previous invocation is confirmed exited and any recorded child has clean, empty descendant evidence. PID reuse, PGID reuse, ambiguous process access, missing tracker evidence, missing lease proof, symlinked locks, and non-regular locks fail closed.
 
-## Continue the exact task after parent action
+Every Codex child runs in its own process group behind a start gate. The descendant tracker records every observed PID with process-start identity, verifies parent identity before expansion, inherits a private FIFO lease, independently enumerates token-bearing processes, and publishes clean only after process and lease evidence is empty. Cleanup signals only verified process instances. Zombies count as exited; unverifiable processes remain live for recovery. INT, TERM, and HUP preserve active registry state when cleanup cannot be proven.
 
-If the structured result is `needs_parent_action`, the registry keeps that task active. The parent reviews and, if safe and authorized, performs only the exact requested action. Put the command, exit status, and captured output in a new temporary prompt file, then resume the exact registered session:
+Artifacts are created exclusively as single-link regular files with mode 0600; task and artifact directories are real directories with mode 0700. Existing symlinked, hard-linked, non-regular, or unsafe artifacts are never overwritten. Sparse attempt numbering advances from greatest existing numeric suffix.
 
-```sh
+## Continue, retry, and finish
+
+needs_parent_action keeps task active. Parent performs only exact approved action, records command/status/output in a new prompt file, then continues same task/session:
+
+~~~sh
 "$skill_root/scripts/run-worker.sh" continue \
   --repo "$repo_root" \
-  --task-id "$task_id" \
-  --prompt-file '/absolute/path/to/parent-result.txt'
-```
+  --task-id issue-123-worker-1 \
+  --prompt-file /absolute/path/to/parent-result.txt
+~~~
 
-No PTY, manual EOF, `--last`, replacement session, or process handle is used. Continue may only resume an active registered task. Repeat only for the same immutable scope.
+Failed, blocked, or interrupted attempts can be retried with a fresh task ID and exact --retry-of. Retry inherits stored sandbox; explicit mismatch is rejected. Each attempt has at most one retry child, and retry chain remains linear.
 
-If a launch failed, was blocked, or was interrupted, retire it with evidence, then retry the exact scope using a fresh task ID linked to that attempt:
-
-```sh
-"$skill_root/scripts/run-worker.sh" launch \
-  --repo "$repo_root" \
-  --task-id 'issue-123-validator-retry-1' \
-  --scope "$task_scope" \
-  --retry-of "$task_id" \
-  --prompt-file '/absolute/path/to/task-prompt.txt'
-```
-
-Only retired `failed`, `blocked`, or `interrupted` attempts permit exact-scope retry. The retry inherits its parent's stored sandbox when `--sandbox` is omitted; an explicit sandbox must match, so retry cannot escalate permissions. A failed, blocked, or interrupted attempt may have only one retry child, and no retry is permitted while another live worker owns that scope. If the child also fails, becomes blocked, or is interrupted, link the next retry to that child. The ledger keeps the complete linear retry chain.
-
-## Judge evidence and review
-
-Each structured worker result contains outcome, concise summary, changed files, validator commands/status/evidence, unresolved items, and any required parent action. Every listed validator must have non-empty command/evidence strings. `needs_parent_action` requires a non-empty parent action and may use an empty validator list; terminal outcomes require `null`. `completed` additionally requires at least one validator, every validator to be `passed`, and an empty unresolved list; failed/not-run validation or remaining work must not retire the task as completed. Streaming JSONL and repeated diffs stay in the external artifact directory shown on stderr, with process warnings in separate stderr logs.
-
-1. Collect all worker results and inspect the actual repository diff.
-2. Run every parent-owned or still-required validator under repository rules. A missing or failed validator remains unresolved.
-3. Invoke the parent `code-reviewer` skill over the complete change and applicable `AGENTS.md` guidance.
-4. Route each real finding as a fresh one-task worker unless it independently qualifies as trivial parent-direct work.
-5. Validate fixes and repeat parent review until explicitly approved.
-6. The parent alone stages, commits, pushes, manages CI/PRs, replies to reviews, and resolves threads.
-
-## Close every lifecycle
-
-The runner atomically records and retires `completed` and `blocked` outcomes. `needs_parent_action` remains active until continued or explicitly finished. Explicit `finish` accepts only `failed`, `blocked`, or `interrupted`; `completed` requires both a validated structured result and the token-owning active runner. For a task with no recorded child, finish remains usable when worker artifacts are absent or removed. If a child was recorded, preserved descendant tracker and lease evidence remain required for safe finish and recovery; missing evidence blocks retirement. Tokenless low-level retirement is rejected while the recorded invocation owner is live; only that owner may retire with its exact token. Dead-process probes run in the C locale, count zombies as exited, and block on ambiguous access. For a crash, cancellation, abandoned task, or goal shutdown, finish it explicitly:
-
-```sh
+~~~sh
 "$skill_root/scripts/run-worker.sh" finish \
   --repo "$repo_root" \
-  --task-id "$task_id" \
+  --task-id issue-123-worker-1 \
   --status interrupted \
-  --evidence 'parent stopped the task after process failure'
-```
+  --evidence 'parent stopped task after process failure'
+~~~
 
-Before completing or blocking any parent goal, terminate any real live invocation through supported orchestration, retire every reserved/bound/active registry entry with evidence, then run both checks:
+Explicit finish accepts failed, blocked, or interrupted. completed requires token-owning active runner plus validated structured result. Tokenless recovery is allowed only after owner exit is proven. A task with no recorded child can be finished without artifacts; recorded-child cleanup requires preserved clean tracker and lease evidence.
 
-```sh
+Before parent goal completion:
+
+~~~sh
 "$skill_root/scripts/registry.sh" assert-no-active --repo "$repo_root"
 "$skill_root/scripts/registry.sh" assert-empty --repo "$repo_root"
-```
+~~~
 
-If cleanup cannot be proven, the parent goal is not safely terminal. Preserve the external registry/artifacts and report the blocker. The registry never kills arbitrary processes and never deletes Codex history.
-Recovery and cleanup commands validate an existing external registry without requiring Codex or project skills, so launch-prerequisite damage cannot prevent retirement and assertions.
+Never delete registry state or Codex history manually.
+
+## Structured result
+
+Result must match references/worker-result.schema.json. completed requires at least one validator, all validators passed, non-empty evidence, and no unresolved work. blocked and needs_parent_action carry concise evidence; needs_parent_action requires non-empty parentAction. Terminal outcomes use parentAction: null.
+
+## Validation
+
+Run:
+
+~~~sh
+./luna-local-review-loop/scripts/test-init.sh
+bash -n luna-local-review-loop/scripts/*.sh
+shellcheck --version
+shellcheck luna-local-review-loop/scripts/*.sh
+python3 /path/to/skill-creator/scripts/quick_validate.py luna-local-review-loop
+git diff --check
+~~~
+
+Review targeted searches for obsolete alternate-state names and paths. Run one real forward test only when it does not launch another worker. Parent owns final real forward test, code review, staging, commit, push, PR, and delivery.
