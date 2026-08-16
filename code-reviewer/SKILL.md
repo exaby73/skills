@@ -10,7 +10,8 @@ Review for material engineering risk without turning alternative preferences int
 ## Establish the review contract
 
 1. Resolve the repository root and review target.
-   - For local work, inspect staged and unstaged changes plus relevant untracked files.
+   - If the request names a commit, tag, branch, or revision range, inspect that revision or range explicitly with the repository's VCS; do not substitute the current worktree state.
+   - For a working-tree review, inspect staged and unstaged changes plus relevant untracked files.
    - For a remote pull request, inspect its title, body, issue links, comments, checks, changed files, and exact head. Avoid switching branches unless local inspection requires it and the user has authorized that mutation.
 2. Discover every applicable `AGENTS.md` from the repository root through each changed file's directory. Read all of them before evaluating the diff.
 3. Follow review policies, specifications, acceptance criteria, product or domain documents, and other sources named by applicable `AGENTS.md` files. Resolve relative links from the file that names them.

@@ -23,9 +23,7 @@
       "id": "preference-only",
       "expectedDecision": "Approved",
       "blockingFindings": [],
-      "nonBlockingSuggestions": [
-        "An array pipeline is optional and must not block the clear tested loop."
-      ]
+      "nonBlockingSuggestions": []
     },
     {
       "id": "mixed-guidance",
@@ -38,9 +36,7 @@
           "fixBoundary": "Append the required audit event inside the existing transaction."
         }
       ],
-      "nonBlockingSuggestions": [
-        "The function name is team discretion and must not block."
-      ]
+      "nonBlockingSuggestions": []
     },
     {
       "id": "clean-change",

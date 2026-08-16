@@ -71,8 +71,6 @@ Return enabled channel names in their existing order.
 + });
 ```
 
-An array pipeline could express the same behavior, but the submitted loop is safe, clear, tested, and contract-compliant.
-
 ## Fixture: mixed-guidance
 
 ### Repository `AGENTS.md`
@@ -108,8 +106,6 @@ Administrators may change a member's role. Successful changes must remain audita
 + }
 ```
 
-The short function name is a preference-level concern. The missing required audit event is not.
-
 ## Fixture: clean-change
 
 ### Repository `AGENTS.md`
@@ -125,23 +121,26 @@ Read `docs/job-contract.md`. Review retries for idempotency and observable failu
 ```md
 # Job contract
 
-The worker must ignore an already-processed delivery key and record failures with the delivery key and error category.
+The worker must atomically claim a delivery key before sending, pass that key to an idempotent provider, ignore processed or in-flight keys, and record failures with the delivery key and error category. Releasing a failed claim is safe because the provider deduplicates retries by that key.
 ```
 
 ### Diff
 
 ```diff
 + export async function deliver(job: DeliveryJob) {
-+   if (await deliveries.exists(job.key)) return { status: "already-processed" };
++   const claim = await deliveries.claim(job.key);
++   if (claim === "processed") return { status: "already-processed" };
++   if (claim === "in-flight") return { status: "pending" };
 +   try {
-+     await provider.send(job.payload);
++     await provider.send(job.payload, { idempotencyKey: job.key });
 +     await deliveries.recordSuccess(job.key);
 +     return { status: "delivered" };
 +   } catch (error) {
 +     await failures.record({ key: job.key, category: classify(error) });
++     await deliveries.release(job.key);
 +     throw error;
 +   }
 + }
 ```
 
-Relevant tests cover first delivery, duplicate delivery, provider failure categorization, and success recording.
+Relevant tests cover atomic claiming, first delivery, duplicate and in-flight delivery, provider failure categorization and claim release, provider idempotency when success recording fails, and success recording.
