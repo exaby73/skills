@@ -1,0 +1,68 @@
+{
+  "fixtures": [
+    {
+      "id": "material-ui-defects",
+      "expectedDecision": "Request changes",
+      "blockingFindings": [
+        {
+          "severity": "Major",
+          "scenario": "An operator needs to finalize a ready work item from the normal route entry point.",
+          "impact": "The primary task is hard to discover because the named action is hidden behind a generic overflow menu.",
+          "evidence": "At /work-items/42 in the ready state at 390x844, routes/work-items/42.html renders only the icon button [aria-label=\"More actions\"]; .menu is hidden and the Finalize control is absent until the menu is expanded.",
+          "governingCriterion": "The linked interface contract requires a named primary action to be visible in main content without a generic overflow menu.",
+          "fixBoundary": "Expose the named Finalize action in the main content or an explicitly labeled primary-action region while preserving the existing finalization behavior."
+        },
+        {
+          "severity": "Major",
+          "scenario": "A keyboard user opens the action menu and tries to read and operate the finalization control.",
+          "impact": "Low-vision users cannot reliably read the control, and keyboard users cannot see which control has focus.",
+          "evidence": "At /work-items/42, 390x844, menu-open ready state, .finish renders 16px normal-weight #888 text on #fff at computed contrast 3.54:1, below the contract's 4.5:1 normal-text threshold, and button:focus removes the visible focus indicator while tabbing.",
+          "governingCriterion": "The linked interface contract requires normal text to meet a minimum contrast ratio of 4.5:1 against its background and requires a visible focus indicator for every keyboard-focusable control.",
+          "fixBoundary": "Apply the repository's contrast-compliant control styling and restore a visible focus indicator for the affected controls."
+        },
+        {
+          "severity": "Major",
+          "scenario": "An operator scans the work-item summary and heading to understand the page hierarchy.",
+          "impact": "Related content uses different alignment edges, weakening the established hierarchy and making the route harder to scan.",
+          "evidence": "At /work-items/42, 1440x900, the .content and heading begin at 32px from the panel edge; the .summary box begins at 56px after its 24px margin-left and its text begins at 68px after its 12px padding, so related content does not share the 32px edge.",
+          "governingCriterion": "The linked interface contract requires main-panel content to align to the shared content edge and use the spacing scale.",
+          "fixBoundary": "Align the summary to the shared content edge and replace the one-off spacing with the applicable spacing token."
+        },
+        {
+          "severity": "Major",
+          "scenario": "An operator reaches the primary finalization control and attempts to activate it across input methods.",
+          "impact": "The changed control violates the explicit component and token contract, reducing target reachability and causing visual-system drift.",
+          "evidence": "At /work-items/42, 1440x900, .finish renders at 32px high with a hard-coded #fff background instead of the required action-primary component, color-action-primary token, and 44px minimum target height.",
+          "governingCriterion": "The linked interface contract requires primary controls to use action-primary, color-action-primary, and a minimum target height of 44px.",
+          "fixBoundary": "Use the required primary control component and token at the affected finalization boundary, including its 44px minimum target height."
+        }
+      ],
+      "nonBlockingSuggestions": []
+    },
+    {
+      "id": "preference-only-ui",
+      "expectedDecision": "Approved",
+      "blockingFindings": [],
+      "nonBlockingSuggestions": []
+    },
+    {
+      "id": "clean-ui",
+      "expectedDecision": "Approved",
+      "blockingFindings": [],
+      "nonBlockingSuggestions": []
+    },
+    {
+      "id": "evidence-blocked-ui",
+      "expectedDecision": "Evidence blocked",
+      "blockingFindings": [],
+      "nonBlockingSuggestions": [],
+      "missingEvidence": [
+        "The route-specific acceptance notes referenced by Repository AGENTS.md",
+        "A runnable rendered /profile route at the exact review revision",
+        "Rendered DOM or accessibility-tree evidence and an interaction trace for save, pending, success, and error states",
+        "Representative mobile, tablet, and desktop observations"
+      ],
+      "requiredAction": "Provide the route-specific acceptance notes and a runnable rendered /profile preview at the exact review revision with the save journey and representative viewports, then repeat the review against the exact revision."
+    }
+  ]
+}
