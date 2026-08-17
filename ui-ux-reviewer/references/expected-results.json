@@ -32,7 +32,7 @@
           "severity": "Major",
           "scenario": "An operator reaches the primary finalization control and attempts to activate it across input methods.",
           "impact": "The changed control violates the explicit component and token contract, reducing target reachability and causing visual-system drift.",
-          "evidence": "At /work-items/42, 1440x900, .finish renders at 32px high with a hard-coded #888 background instead of the required action-primary component, color-action-primary token, and 44px minimum target height.",
+          "evidence": "At /work-items/42, 1440x900, .finish renders at 32px high with a hard-coded #fff background instead of the required action-primary component, color-action-primary token, and 44px minimum target height.",
           "governingCriterion": "The linked interface contract requires primary controls to use action-primary, color-action-primary, and a minimum target height of 44px.",
           "fixBoundary": "Use the required primary control component and token at the affected finalization boundary, including its 44px minimum target height."
         }

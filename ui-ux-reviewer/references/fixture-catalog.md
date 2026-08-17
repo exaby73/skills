@@ -115,7 +115,7 @@ Source and rendered artifact
 <header class="topbar">
   <button class="nav-toggle" aria-expanded="false" aria-controls="collection-nav">Collections</button>
   <h1>Collections</h1>
-  <button class="action-primary" type="button"><span aria-hidden="true">+</span> Add collection</button>
+  <a class="action-primary" href="/collections/new"><span aria-hidden="true">+</span> Add collection</a>
 </header>
 <nav id="collection-nav" aria-label="Collection sections" hidden>
   <a href="/collections">Overview</a>
@@ -129,7 +129,7 @@ Source and rendered artifact
 
 Rendered observations
 
-- At viewport `390x844`, the title and labeled `Add collection` action are visible in the first viewport. The navigation disclosure is labeled, has an `aria-expanded` state, and opens without horizontal overflow. Cards form one column with 16px gaps.
+- At viewport `390x844`, the title and labeled `Add collection` action are visible in the first viewport. The navigation disclosure starts with `aria-expanded="false"`; activating `Collections` changes it to `aria-expanded="true"`, removes `hidden` from `#collection-nav`, and reveals the semantic links without horizontal overflow. Activating `Add collection` follows `/collections/new` and opens the Create collection route. Cards form one column with 16px gaps.
 - At viewport `834x1112`, cards form two columns and the action remains reachable without overlap. At `1440x900`, the same top navigation remains clear and the card grid uses the shared 24px outer spacing.
 - The plus icon is paired with text, the action uses the shared primary control, and keyboard focus is visible on the toggle, action, and semantic Overview and Archived links.
 - The compact top navigation is an allowed alternative to side navigation. Text, hierarchy, spacing scale, and responsive behavior remain consistent with the linked guidance.
