@@ -1,14 +1,26 @@
 # Luna Local Review Loop
 
-Reusable protocol for bounded local repository work with one fresh resumable worker per task. Parent owns permissions, validation judgment, review, cleanup judgment, and delivery. Worker owns one immutable scope and returns structured evidence.
+Reusable protocol for bounded local repository work with one fresh worker per task. Native host collaboration is the default when its complete lifecycle capability set is available; the hardened CLI/registry flow is the deterministic fallback. The parent/controller remains model-agnostic, owns permissions and delivery, and evaluates review evidence. Implementation and validation use fresh Luna Max workers; every code-review pass uses a fresh read-only Sol-High reviewer.
 
-## Initialize
+## Path selection
+
+The parent selects the path from an explicit host capability result. The native gate requires unique task identity, spawn, message/follow-up, wait, interruption/close, and list/read/collect. Shell or environment guesses are not capability detection.
+
+Native implementation and validation workers use model gpt-5.6-luna with reasoning max and the smallest useful context. Native work uses no project-local registry, codex exec, or alternate process/index. If native startup begins and fails, preserve the failure and stop; never switch to fallback after partial startup.
+
+Every code-reviewer pass and re-review uses a fresh read-only Sol-High agent with model gpt-5.6-sol and reasoning high. Provide the full contract, applicable guidance, target revisions, current diff, and validation evidence. The reviewer cannot edit, stage, commit, push, change GitHub state, launch workers, or decide delivery. If Sol-High is unavailable or unverifiable, report Evidence blocked and do not substitute Luna, the parent, or another model.
+
+The parent model and reasoning remain task-selected and are not specified by this skill. See the path-selection and review-routing contract fixtures for executable checks.
+
+## CLI fallback: initialize
+
+Run this section only after the native capability gate reports that native startup is unavailable.
 
 ~~~sh
 ./luna-local-review-loop/scripts/init.sh --repo /absolute/path/to/repository
 ~~~
 
-Authoritative path is deterministic:
+Fallback registry path is deterministic:
 
 ~~~text
 <repository-root>/.agents/agent-registry/registry.json
@@ -31,7 +43,7 @@ Project-local schema-v3 registry contains:
 
 Empty schema-v1 state migrates only with proven current-root ownership and zero worker rows. Live, malformed, foreign, or non-empty v1 state remains unchanged and prints previous-version recovery instructions. Empty local v2 state migrates after root ownership is proven: its prospective schema-v3 transformation is fully validated before any checkout seal is created, then only the validated sealed transformation is published. Malformed or unsafe v2 state leaves registry bytes and seal absence unchanged. A pre-seal schema-v3 registry migrates only in normal init after exact root, repository identity, physical checkout identity, and zero active workers are proven; retired `identity_ledger` history is preserved. Existing-path recovery never performs that migration and a missing seal fails unchanged. Older installations may have state outside project; retire live workers with previous version before installing this skill. This version never finds, reads, copies, or repairs that state automatically.
 
-## Launch and continue
+## CLI fallback: launch and continue
 
 ~~~sh
 ./luna-local-review-loop/scripts/run-worker.sh launch \
@@ -83,10 +95,12 @@ See references/worker-result.schema.json. completed needs one or more passed val
 
 ~~~sh
 ./luna-local-review-loop/scripts/test-init.sh
+bash luna-local-review-loop/scripts/test-path-selection.sh
+bash luna-local-review-loop/scripts/test-review-routing.sh
 bash -n luna-local-review-loop/scripts/*.sh
 shellcheck luna-local-review-loop/scripts/*.sh
 python3 /path/to/skill-creator/scripts/quick_validate.py luna-local-review-loop
 git diff --check
 ~~~
 
-Parent performs final real forward test and code review. Do not launch subworkers during this skill update.
+Parent performs the final real forward test and evaluates each fresh Sol-High review. Do not launch subworkers during this skill update. The native/fallback contract is documented at the top of this README.

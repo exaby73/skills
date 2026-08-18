@@ -1,0 +1,46 @@
+{
+  "fixture": "review-routing-contract-v1",
+  "parent": {
+    "modelRequirement": null,
+    "reasoningRequirement": null,
+    "finalDecisionOwner": "parent-controller",
+    "acceptedSelections": [
+      "task-selection-a",
+      "task-selection-b"
+    ]
+  },
+  "reviewer": {
+    "pass": {
+      "fresh": true,
+      "model": "gpt-5.6-sol",
+      "reasoning": "high",
+      "mode": "read-only",
+      "requiredContext": [
+        "ticket-or-pull-request-contract",
+        "applicable-guidance",
+        "target-revisions",
+        "full-current-diff",
+        "validation-evidence"
+      ],
+      "finalDecisionOwner": "parent-controller"
+    },
+    "rerun": {
+      "fresh": true,
+      "differentIdentity": true,
+      "model": "gpt-5.6-sol",
+      "reasoning": "high",
+      "mode": "read-only"
+    },
+    "unavailable": {
+      "solAvailable": false,
+      "expectedOutcome": "Evidence blocked",
+      "fallbackReviewer": null
+    }
+  },
+  "prohibitedSubstitutions": [
+    "luna-as-reviewer",
+    "parent-as-reviewer",
+    "other-model-reviewer",
+    "reviewer-write-or-delivery"
+  ]
+}

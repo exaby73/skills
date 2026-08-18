@@ -5,13 +5,37 @@ description: Route non-trivial local repository implementation, documentation, t
 
 # Luna Local Review Loop
 
-Use bundled scripts as registry source of truth. Read README.md before first use.
+Use native host collaboration when its complete lifecycle capability set is available. Use bundled scripts as the deterministic `codex exec` fallback only. Read README.md before first use.
 
 ## Roles
 
 Parent owns decomposition, permissions, durable goals/plans, validation judgment, review, commits, delivery, CI, and GitHub state. Worker owns exactly one immutable task. Worker never delegates, stages, commits, pushes, reviews combined changes, manages GitHub/CI, daemonizes, double-forks, or starts persistent background services.
 
-Both roles read target repository AGENTS.md hierarchy and project-local .agents/skills/caveman/SKILL.md. Use project-local Caveman for user-facing output. Parent alone invokes project-local code-reviewer.
+Both roles read target repository AGENTS.md hierarchy and project-local .agents/skills/caveman/SKILL.md. Use project-local Caveman for user-facing output. The parent orchestrates each code-reviewer pass through a fresh Sol-High reviewer and retains the final review decision.
+
+## Select execution path
+
+The parent/controller is model-agnostic. This skill never names, pins, or implies a concrete parent model or reasoning setting.
+
+Use native host collaboration only when the host exposes the complete lifecycle contract: spawn, unique task identity, message/follow-up, wait, interruption/close, and list/read/collect. Select this from the host capability result, never from shell or environment guesses.
+
+Implementation and validation workers always use a fresh Luna Max worker: model `gpt-5.6-luna`, reasoning `max`, and the smallest useful context. Every code-review pass and re-review always uses a fresh, read-only Sol-High reviewer: model `gpt-5.6-sol`, reasoning `high`. The parent evaluates the review and owns the final decision; the parent model is not a substitute reviewer.
+
+Record the selected path and the exact worker/reviewer configuration in the parent-owned evidence. Native execution must prove the host lifecycle and must not create or read the fallback registry. If native startup has begun and then fails, stop with an explicit failure; do not silently switch paths. Use the CLI fallback only when the complete native capability set was unavailable before startup.
+
+## Native implementation and validation path
+
+When the complete native capability set is available, the parent launches one fresh Luna Max worker for each immutable implementation or validation task. Give every task a unique host identity and a self-contained prompt containing the owned scope, target revisions, governing guidance, validator, exclusions, no-stage/no-commit rule, and interruption boundary.
+
+The native worker configuration is always model `gpt-5.6-luna` with reasoning `max`. The parent uses the native lifecycle directly: spawn, send a follow-up when needed, wait, inspect/list the task, interrupt or close when required, and collect the final structured result. Do not initialize the fallback registry, invoke `codex exec`, or use a second process/index for native work.
+
+A native lifecycle failure after spawn is a failed native run, not a reason to switch paths. Preserve the failure evidence and stop for parent action. The CLI fallback is eligible only when the complete native capability set was unavailable before any native worker started.
+
+## Fresh code-review path
+
+Every `code-reviewer` pass and re-review uses a fresh read-only Sol-High agent: model `gpt-5.6-sol`, reasoning `high`. The reviewer receives the complete current ticket or pull-request contract, applicable AGENTS.md and reviewer guidance, target revisions, full current diff, and the required validation evidence. It returns an independent conclusion for the parent to evaluate.
+
+A code-review agent never edits files, stages, commits, pushes, changes GitHub state, launches workers, or makes the final delivery decision. Do not substitute a Luna worker, the parent/controller, or another model. If Sol-High is unavailable or its identity/configuration cannot be verified, report `Evidence blocked` and do not claim review approval.
 
 ## Keep orchestration off the critical path
 
@@ -19,7 +43,9 @@ Both roles read target repository AGENTS.md hierarchy and project-local .agents/
 - Never make Luna maintenance a prerequisite for an unrelated delivery goal unless that maintenance is an explicit acceptance criterion or a proven safety requirement for the requested work.
 - Stop a worker when it repeats the same environment or tooling failure, or when continued execution produces no useful task progress. Do not retry the same unchanged blocker; the parent performs the remaining work directly or reports the blocker.
 
-## Initialize
+## CLI fallback: initialize
+
+Run this section only after the host capability gate proves native collaboration is unavailable before startup. Native work never initializes or uses this registry.
 
 Run from any path inside target Git checkout:
 
@@ -29,7 +55,7 @@ repo_root='/absolute/path/to/repository'
 "$skill_root/scripts/init.sh" --repo "$repo_root"
 ~~~
 
-Authoritative registry path is always:
+Fallback registry path is always:
 
 ~~~text
 <repository-root>/.agents/agent-registry/registry.json
@@ -49,9 +75,9 @@ Schema-v3 identity_ledger is append-only lifetime history. workers contains only
 
 ## Route work
 
-Use parent-direct handling only for clearly trivial work. For non-trivial work, parent creates one task with immutable scope, expected result, sandbox, validator, exclusions, Caveman requirement, no-stage/no-commit rule, and explicit lifecycle-escape prohibition. One session serves one task. Parent performs validation and review; worker reports evidence.
+Use parent-direct handling only for clearly trivial work. For non-trivial work, parent creates one task with immutable scope, expected result, sandbox, validator, exclusions, Caveman requirement, no-stage/no-commit rule, and explicit lifecycle-escape prohibition. One session serves one task. Parent performs validation and evaluates the fresh Sol-High review result; worker reports evidence.
 
-## Launch
+## CLI fallback: launch
 
 ~~~sh
 "$skill_root/scripts/run-worker.sh" launch \
@@ -76,7 +102,7 @@ Every Codex child runs in its own process group behind a start gate. The descend
 
 Artifacts are created exclusively as single-link regular files with mode 0600; task and artifact directories are real directories with mode 0700. Existing symlinked, hard-linked, non-regular, or unsafe artifacts are never overwritten. Sparse attempt numbering advances from greatest existing numeric suffix.
 
-## Continue, retry, and finish
+## CLI fallback: continue, retry, and finish
 
 needs_parent_action keeps task active. Parent performs only exact approved action, records command/status/output in a new prompt file, then continues same task/session:
 
@@ -99,7 +125,7 @@ Failed, blocked, or interrupted attempts can be retried with a fresh task ID and
 
 Explicit finish accepts failed, blocked, or interrupted. completed requires token-owning active runner plus validated structured result. Tokenless recovery is allowed only after owner exit is proven. A task with no recorded child can be finished without artifacts; recorded-child cleanup requires preserved clean tracker and lease evidence.
 
-Before parent goal completion:
+Before parent goal completion, when the CLI fallback was selected:
 
 ~~~sh
 "$skill_root/scripts/registry.sh" assert-no-active --repo "$repo_root"
@@ -110,7 +136,7 @@ Never delete registry state or Codex history manually.
 
 ## Structured result
 
-Result must match references/worker-result.schema.json. completed requires at least one validator, all validators passed, non-empty evidence, and no unresolved work. blocked and needs_parent_action carry concise evidence; needs_parent_action requires non-empty parentAction. Terminal outcomes use parentAction: null.
+Worker results from either path must match references/worker-result.schema.json. completed requires at least one validator, all validators passed, non-empty evidence, and no unresolved work. blocked and needs_parent_action carry concise evidence; needs_parent_action requires non-empty parentAction. Terminal outcomes use parentAction: null. A Sol-High reviewer returns a separate read-only review conclusion; it never masquerades as a worker result.
 
 ## Validation
 
@@ -118,6 +144,8 @@ Run:
 
 ~~~sh
 ./luna-local-review-loop/scripts/test-init.sh
+bash luna-local-review-loop/scripts/test-path-selection.sh
+bash luna-local-review-loop/scripts/test-review-routing.sh
 bash -n luna-local-review-loop/scripts/*.sh
 shellcheck --version
 shellcheck luna-local-review-loop/scripts/*.sh
@@ -125,4 +153,4 @@ python3 /path/to/skill-creator/scripts/quick_validate.py luna-local-review-loop
 git diff --check
 ~~~
 
-Review targeted searches for obsolete alternate-state names and paths. Run one real forward test only when it does not launch another worker. Parent owns final real forward test, code review, staging, commit, push, PR, and delivery.
+Review targeted searches for obsolete alternate-state names and paths. Run native lifecycle probes for implementation/validation and fresh Sol-High read-only review fixtures when the host supports them. Run one real forward test only when it does not launch another worker. The parent owns final real forward-test judgment, review evaluation, staging, commit, push, PR, and delivery.

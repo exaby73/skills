@@ -1,0 +1,70 @@
+{
+  "fixture": "path-selection-contract-v1",
+  "parent": {
+    "modelRequirement": null,
+    "reasoningRequirement": null,
+    "selections": [
+      {
+        "id": "task-selection-a",
+        "model": "task-selected-model-a",
+        "reasoning": "task-selected-reasoning-a"
+      },
+      {
+        "id": "task-selection-b",
+        "model": "task-selected-model-b",
+        "reasoning": "task-selected-reasoning-b"
+      }
+    ]
+  },
+  "native": {
+    "requiredCapabilities": [
+      "spawn",
+      "unique-task-identity",
+      "follow-up",
+      "wait",
+      "interrupt-or-close",
+      "list-read-collect"
+    ],
+    "implementationWorker": {
+      "model": "gpt-5.6-luna",
+      "reasoning": "max",
+      "fresh": true,
+      "readOnlyReview": false
+    },
+    "cases": [
+      {
+        "id": "native-complete",
+        "capabilityResult": "complete",
+        "startup": "not-started",
+        "expectedPath": "native",
+        "expectedOutcome": "completed"
+      },
+      {
+        "id": "native-interrupted",
+        "capabilityResult": "complete",
+        "startup": "started",
+        "expectedPath": "native",
+        "expectedOutcome": "interrupted"
+      },
+      {
+        "id": "native-post-start-failure",
+        "capabilityResult": "complete",
+        "startup": "started",
+        "expectedPath": "native",
+        "expectedOutcome": "failed-no-fallback"
+      },
+      {
+        "id": "capability-incomplete",
+        "capabilityResult": "incomplete",
+        "startup": "not-started",
+        "expectedPath": "cli-fallback",
+        "expectedOutcome": "fallback"
+      }
+    ]
+  },
+  "fallback": {
+    "registryAuthority": "<repository-root>/.agents/agent-registry/registry.json",
+    "allowedOnlyBeforeNativeStartup": true,
+    "nativeMustNotReadOrWriteRegistry": true
+  }
+}
