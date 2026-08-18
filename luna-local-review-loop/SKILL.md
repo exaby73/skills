@@ -17,25 +17,37 @@ Both roles read target repository AGENTS.md hierarchy and project-local .agents/
 
 The parent/controller is model-agnostic. This skill never names, pins, or implies a concrete parent model or reasoning setting.
 
-Use native host collaboration only when the host exposes the complete lifecycle contract: spawn, unique task identity, message/follow-up, wait, interruption/close, and list/read/collect. Select this from the host capability result, never from shell or environment guesses.
+Use native host collaboration only when the host exposes the complete lifecycle contract: spawn, unique task identity, message/follow-up, wait, interruption/close, and list/read/collect. The pre-start capability result must also prove exact model selection, exact reasoning selection, and an enforceable read-only or sandbox control for both implementation and review roles. Select this from the host capability result, never from shell or environment guesses.
 
 Implementation and validation workers always use a fresh Luna Max worker: model `gpt-5.6-luna`, reasoning `max`, and the smallest useful context. Every code-review pass and re-review always uses a fresh, read-only Sol-High reviewer: model `gpt-5.6-sol`, reasoning `high`. The parent evaluates the review and owns the final decision; the parent model is not a substitute reviewer.
 
-Record the selected path and the exact worker/reviewer configuration in the parent-owned evidence. Native execution must prove the host lifecycle and must not create or read the fallback registry. If native startup has begun and then fails, stop with an explicit failure; do not silently switch paths. Use the CLI fallback only when the complete native capability set was unavailable before startup.
+Record the selected path and the exact worker/reviewer configuration in the parent-owned evidence. Before selecting native, the parent performs a read-only fallback-ownership preflight: after validating the canonical repository and registry authority, a missing project-local fallback registry is recorded as `not-initialized` (a clear ownership state); when it exists, inspect its active workers for the repository and immutable scope. An active or awaiting-continue fallback task pins that scope to its existing CLI task until it is retired. A malformed, unreadable, ambiguous, or conflicting fallback state is a parent-action stop. This preflight is the only registry inspection permitted before native startup; native execution itself must never create or read the fallback registry. If native startup has begun and then fails, stop with an explicit failure; do not silently switch paths. Use the CLI fallback only when the complete native capability set was unavailable before startup and the fallback review gate is recorded.
 
 ## Native implementation and validation path
 
-When the complete native capability set is available, the parent launches one fresh Luna Max worker for each immutable implementation or validation task. Give every task a unique host identity and a self-contained prompt containing the owned scope, target revisions, governing guidance, validator, exclusions, no-stage/no-commit rule, and interruption boundary.
+When the complete native capability set is available, the parent launches one fresh Luna Max worker for each immutable implementation or validation task. Give every task a unique host identity and a self-contained prompt containing the owned scope, target revisions, governing guidance, validator, exclusions, no-stage/no-commit rule, interruption boundary, and the exact structured-result contract at `references/worker-result.schema.json`.
 
-The native worker configuration is always model `gpt-5.6-luna` with reasoning `max`. The parent uses the native lifecycle directly: spawn, send a follow-up when needed, wait, inspect/list the task, interrupt or close when required, and collect the final structured result. Do not initialize the fallback registry, invoke `codex exec`, or use a second process/index for native work.
+The native worker configuration is always model `gpt-5.6-luna` with reasoning `max`; the host must return evidence that those settings were selected and verified, not merely that arbitrary configuration is supported. The parent uses the native lifecycle directly: spawn, send a follow-up when needed, wait, inspect/list the task, interrupt or close when required, and collect the final structured result. Do not initialize the fallback registry, invoke `codex exec`, or use a second process/index for native work.
 
 A native lifecycle failure after spawn is a failed native run, not a reason to switch paths. Preserve the failure evidence and stop for parent action. The CLI fallback is eligible only when the complete native capability set was unavailable before any native worker started.
+
+The parent validates every collected native result against `references/worker-result.schema.json` and the completion invariants before accepting it: `completed` needs non-empty evidence, at least one validator, every validator `passed`, `unresolved: []`, and `parentAction: null`; `blocked` and `needs_parent_action` retain their required evidence and terminal/non-terminal `parentAction` shape. A missing, malformed, incomplete, or contradictory native result is `Evidence blocked`/failed parent evidence. It never activates CLI fallback after native startup.
 
 ## Fresh code-review path
 
 Every `code-reviewer` pass and re-review uses a fresh read-only Sol-High agent: model `gpt-5.6-sol`, reasoning `high`. The reviewer receives the complete current ticket or pull-request contract, applicable AGENTS.md and reviewer guidance, target revisions, full current diff, and the required validation evidence. It returns an independent conclusion for the parent to evaluate.
 
 A code-review agent never edits files, stages, commits, pushes, changes GitHub state, launches workers, or makes the final delivery decision. Do not substitute a Luna worker, the parent/controller, or another model. If Sol-High is unavailable or its identity/configuration cannot be verified, report `Evidence blocked` and do not claim review approval.
+
+On a CLI-fallback host, run the bundled read-only Sol route after implementation/validation and for every re-review:
+
+~~~sh
+"$skill_root/scripts/run-review.sh" \
+  --repo "$repo_root" \
+  --prompt-file /absolute/path/to/full-review-prompt.txt
+~~~
+
+That route selects and verifies only `gpt-5.6-sol` with reasoning `high` under `read-only`; the prompt must carry the same complete contract, guidance, target revisions, full diff, and validation evidence on every fresh run. If the route or Sol-High configuration is unavailable, fallback implementation may be recorded as work in progress, but the delivery outcome remains `Evidence blocked` and the parent cannot approve it.
 
 ## Keep orchestration off the critical path
 
@@ -45,7 +57,7 @@ A code-review agent never edits files, stages, commits, pushes, changes GitHub s
 
 ## CLI fallback: initialize
 
-Run this section only after the host capability gate proves native collaboration is unavailable before startup. Native work never initializes or uses this registry.
+Run this section only after the host capability gate proves native collaboration is unavailable before startup, the fallback-ownership preflight has pinned or cleared any existing task, and the CLI Sol-High review route is available or has been explicitly recorded as `Evidence blocked`. Native work never initializes or uses this registry.
 
 Run from any path inside target Git checkout:
 
@@ -136,7 +148,7 @@ Never delete registry state or Codex history manually.
 
 ## Structured result
 
-Worker results from either path must match references/worker-result.schema.json. completed requires at least one validator, all validators passed, non-empty evidence, and no unresolved work. blocked and needs_parent_action carry concise evidence; needs_parent_action requires non-empty parentAction. Terminal outcomes use parentAction: null. A Sol-High reviewer returns a separate read-only review conclusion; it never masquerades as a worker result.
+Worker results from either path must match references/worker-result.schema.json. Native prompts must include that exact contract, and the parent must validate the collected native JSON and completion invariants before accepting it. completed requires at least one validator, all validators passed, non-empty evidence, and no unresolved work. blocked and needs_parent_action carry concise evidence; needs_parent_action requires non-empty parentAction. Terminal outcomes use parentAction: null. A Sol-High reviewer returns a separate read-only review conclusion; it never masquerades as a worker result.
 
 ## Validation
 

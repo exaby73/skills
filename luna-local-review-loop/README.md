@@ -6,15 +6,19 @@ Reusable protocol for bounded local repository work with one fresh worker per ta
 
 The parent selects the path from an explicit host capability result. The native gate requires unique task identity, spawn, message/follow-up, wait, interruption/close, and list/read/collect. Shell or environment guesses are not capability detection.
 
-Native implementation and validation workers use model gpt-5.6-luna with reasoning max and the smallest useful context. Native work uses no project-local registry, codex exec, or alternate process/index. If native startup begins and fails, preserve the failure and stop; never switch to fallback after partial startup.
+Native implementation and validation workers use model gpt-5.6-luna with reasoning max and the smallest useful context. The native pre-start capability result must also prove exact model/reasoning selection and enforceable read-only or sandbox controls for both worker and reviewer roles. Native work uses no project-local registry, codex exec, or alternate process/index. If native startup begins and fails, preserve the failure and stop; never switch to fallback after partial startup.
 
 Every code-reviewer pass and re-review uses a fresh read-only Sol-High agent with model gpt-5.6-sol and reasoning high. Provide the full contract, applicable guidance, target revisions, current diff, and validation evidence. The reviewer cannot edit, stage, commit, push, change GitHub state, launch workers, or decide delivery. If Sol-High is unavailable or unverifiable, report Evidence blocked and do not substitute Luna, the parent, or another model.
 
 The parent model and reasoning remain task-selected and are not specified by this skill. See the path-selection and review-routing contract fixtures for executable checks.
 
+Before native selection, the parent validates the canonical repository and registry authority, then checks the project-local fallback registry, when present, for an active or awaiting-continue task with the same immutable scope. A missing registry is the explicit `not-initialized` clear state; malformed, unreadable, or ambiguous fallback state fails closed. An active task remains the owner until retired; native cannot start over it. This parent preflight is the only registry read in the native path; native workers never touch fallback state.
+
+CLI fallback hosts use the same reviewer contract through `scripts/run-review.sh`, which invokes only gpt-5.6-sol/high with read-only sandboxing. If that route is unavailable, implementation may continue as fallback work but delivery remains Evidence blocked.
+
 ## CLI fallback: initialize
 
-Run this section only after the native capability gate reports that native startup is unavailable.
+Run this section only after the native capability gate reports that native startup is unavailable, fallback ownership has been pinned or proven clear, and the CLI Sol-High reviewer route is available or explicitly Evidence blocked.
 
 ~~~sh
 ./luna-local-review-loop/scripts/init.sh --repo /absolute/path/to/repository
@@ -67,6 +71,16 @@ Use continue only for same active task after parent action:
 
 Use finish for failed, blocked, or interrupted. completed requires validated structured result from token-owning runner. Retry exact scope with fresh task ID plus --retry-of; retry inherits sandbox and accepts one child per attempt.
 
+CLI-fallback review route:
+
+~~~sh
+./luna-local-review-loop/scripts/run-review.sh \
+  --repo /absolute/path/to/repository \
+  --prompt-file /absolute/path/to/full-review-prompt.txt
+~~~
+
+The prompt is read-only and must include the complete current contract, applicable guidance, target revisions, full diff, and validation evidence. A fresh invocation is required for every review and re-review; Sol-High identity and configuration must be verified from the result.
+
 ## Safety contract
 
 - Atomic registry lock stores owner PID and process-start identity.
@@ -89,7 +103,7 @@ If cleanup cannot be proven, preserve active state and report blocker. Do not de
 
 ## Structured result
 
-See references/worker-result.schema.json. completed needs one or more passed validators, non-empty evidence, and no unresolved work. needs_parent_action keeps task active and requires non-empty parentAction; terminal outcomes use null.
+See references/worker-result.schema.json. Every native prompt carries this contract, and the parent validates native results before acceptance. completed needs one or more passed validators, non-empty evidence, and no unresolved work. needs_parent_action keeps task active and requires non-empty parentAction; terminal outcomes use null.
 
 ## Validation
 

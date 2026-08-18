@@ -1,5 +1,5 @@
 {
-  "fixture": "path-selection-contract-v1",
+  "fixture": "path-selection-contract-v2",
   "parent": {
     "modelRequirement": null,
     "reasoningRequirement": null,
@@ -23,8 +23,23 @@
       "follow-up",
       "wait",
       "interrupt-or-close",
-      "list-read-collect"
+      "list-read-collect",
+      "model-selection",
+      "reasoning-selection",
+      "read-only-or-sandbox-control"
     ],
+    "configuration": {
+      "implementation": {
+        "model": "gpt-5.6-luna",
+        "reasoning": "max",
+        "sandbox": "task-selected-read-only-or-workspace-write"
+      },
+      "review": {
+        "model": "gpt-5.6-sol",
+        "reasoning": "high",
+        "mode": "read-only"
+      }
+    },
     "implementationWorker": {
       "model": "gpt-5.6-luna",
       "reasoning": "max",
@@ -35,36 +50,121 @@
       {
         "id": "native-complete",
         "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "not-initialized",
+        "reviewerAvailability": "native-sol-high",
         "startup": "not-started",
+        "nativeLifecycle": "completed",
         "expectedPath": "native",
         "expectedOutcome": "completed"
       },
       {
         "id": "native-interrupted",
         "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "native-sol-high",
         "startup": "started",
+        "nativeLifecycle": "interrupted",
         "expectedPath": "native",
         "expectedOutcome": "interrupted"
       },
       {
         "id": "native-post-start-failure",
         "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "native-sol-high",
         "startup": "started",
+        "nativeLifecycle": "failed",
         "expectedPath": "native",
         "expectedOutcome": "failed-no-fallback"
       },
       {
         "id": "capability-incomplete",
         "capabilityResult": "incomplete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "cli-sol-high",
         "startup": "not-started",
+        "nativeLifecycle": "not-started",
         "expectedPath": "cli-fallback",
         "expectedOutcome": "fallback"
+      },
+      {
+        "id": "configuration-incomplete",
+        "capabilityResult": "complete",
+        "configurationResult": "incomplete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "cli-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "expectedPath": "cli-fallback",
+        "expectedOutcome": "fallback"
+      },
+      {
+        "id": "native-reviewer-unavailable",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "unavailable",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "expectedPath": "cli-fallback",
+        "expectedOutcome": "Evidence blocked"
+      },
+      {
+        "id": "fallback-active",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "active",
+        "reviewerAvailability": "cli-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "expectedPath": "cli-fallback",
+        "expectedOutcome": "fallback-active-pinned"
+      },
+      {
+        "id": "fallback-reviewer-unavailable",
+        "capabilityResult": "incomplete",
+        "configurationResult": "incomplete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "unavailable",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "expectedPath": "cli-fallback",
+        "expectedOutcome": "Evidence blocked"
+      },
+      {
+        "id": "fallback-state-ambiguous",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "ambiguous",
+        "reviewerAvailability": "cli-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "expectedPath": "parent-action",
+        "expectedOutcome": "preflight-blocked"
       }
     ]
   },
   "fallback": {
     "registryAuthority": "<repository-root>/.agents/agent-registry/registry.json",
+    "ownershipPreflight": {
+      "readOnly": true,
+      "beforeNativeStartup": true,
+      "activeTaskPinsScope": true,
+      "ambiguousStateBlocksStartup": true,
+      "missingRegistryState": "not-initialized-clear"
+    },
     "allowedOnlyBeforeNativeStartup": true,
-    "nativeMustNotReadOrWriteRegistry": true
+    "nativeMustNotReadOrWriteRegistry": true,
+    "solReviewRoute": {
+      "script": "scripts/run-review.sh",
+      "model": "gpt-5.6-sol",
+      "reasoning": "high",
+      "mode": "read-only",
+      "unavailableOutcome": "Evidence blocked"
+    }
   }
 }

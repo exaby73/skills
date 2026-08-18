@@ -31,6 +31,8 @@ for pass_name in ("pass", "rerun"):
     assert current["model"] == "gpt-5.6-sol"
     assert current["reasoning"] == "high"
     assert current["mode"] == "read-only"
+    assert current["requiredContext"] == review["pass"]["requiredContext"]
+    assert current["finalDecisionOwner"] == review["pass"]["finalDecisionOwner"]
 assert review["rerun"]["differentIdentity"] is True
 assert review["unavailable"] == {
     "solAvailable": False,
@@ -55,6 +57,17 @@ rg -q 'Every .*code-reviewer.*pass and re-review uses a fresh read-only Sol-High
 rg -q 'model .*gpt-5\.6-sol.*reasoning .*high' "$SKILL_ROOT/SKILL.md"
 rg -q 'report .*Evidence blocked' "$SKILL_ROOT/SKILL.md"
 rg -q 'Do not substitute a Luna worker' "$SKILL_ROOT/SKILL.md"
+rg -q 'same complete contract, guidance, target revisions, full diff, and validation evidence' "$SKILL_ROOT/SKILL.md"
 rg -q 'fresh read-only Sol-High reviewer' "$SKILL_ROOT/README.md"
+rg -q 'run-review\.sh' "$SKILL_ROOT/README.md"
+
+review_script="$SKILL_ROOT/scripts/run-review.sh"
+rg -q 'gpt-5\.6-sol' "$review_script"
+rg -q 'model_reasoning_effort=high' "$review_script"
+rg -q -- '-s read-only' "$review_script"
+if rg -q 'gpt-5\.6-luna|workspace-write|registry\.sh|run-worker\.sh' "$review_script"; then
+    echo 'CLI review route is not Sol-only/read-only' >&2
+    exit 1
+fi
 
 printf 'PASS: Sol-High review-routing contract\n'

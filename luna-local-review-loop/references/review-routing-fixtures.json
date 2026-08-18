@@ -29,7 +29,15 @@
       "differentIdentity": true,
       "model": "gpt-5.6-sol",
       "reasoning": "high",
-      "mode": "read-only"
+      "mode": "read-only",
+      "requiredContext": [
+        "ticket-or-pull-request-contract",
+        "applicable-guidance",
+        "target-revisions",
+        "full-current-diff",
+        "validation-evidence"
+      ],
+      "finalDecisionOwner": "parent-controller"
     },
     "unavailable": {
       "solAvailable": false,
