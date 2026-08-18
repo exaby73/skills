@@ -34,6 +34,8 @@ REPO_CHECKOUT_IDENTITY=''
 SHA256_COMMAND=''
 PRINT_PATH=0
 EXISTING_ONLY=0
+PREFLIGHT_ONLY=0
+PREFLIGHT_LOCK_HELD=0
 LOCK_HELD=0
 
 readonly SCHEMA_FILTER='
@@ -158,9 +160,12 @@ usage() {
 Usage:
   init.sh [--repo PATH|-C PATH] [--print-path]
   init.sh --existing-path [--repo PATH|-C PATH]
+  init.sh --preflight [--repo PATH|-C PATH]
 
 Initialize or validate project-local Luna registry.
 --existing-path prints an existing registry without launch-only prerequisites.
+--preflight validates fallback registry setup and migration eligibility without
+creating project metadata, registry state, or a checkout identity seal.
 Init may add exactly one .agents/agent-registry/ line to root .gitignore.
 The registry-local .gitignore is private and ends with '*'.
 EOF
@@ -242,13 +247,13 @@ sha256_digest() {
 require_commands() {
   local missing='' command_name
   local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk stat cat mktemp date chmod sed wc)
-  if [[ "$EXISTING_ONLY" -eq 0 ]]; then required_commands+=(od tr sort head mkfifo); fi
+  if [[ "$EXISTING_ONLY" -eq 0 && "$PREFLIGHT_ONLY" -eq 0 ]]; then required_commands+=(od tr sort head mkfifo); fi
   for command_name in "${required_commands[@]}"; do
     command -v "$command_name" >/dev/null 2>&1 || missing="${missing}${missing:+, }${command_name}"
   done
   [[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing runtime prerequisite(s): $missing."
   select_sha256_command || die "$EXIT_PREREQUISITE" 'missing SHA-256 prerequisite: install shasum or sha256sum.'
-  if [[ "$EXISTING_ONLY" -eq 0 ]] && ! command -v "${CODEX_BIN:-codex}" >/dev/null 2>&1; then
+  if [[ "$EXISTING_ONLY" -eq 0 && "$PREFLIGHT_ONLY" -eq 0 ]] && ! command -v "${CODEX_BIN:-codex}" >/dev/null 2>&1; then
     die "$EXIT_PREREQUISITE" "Codex CLI not found: ${CODEX_BIN:-codex}. Use --existing-path only for registry recovery."
   fi
   [[ "${BASH_VERSINFO[0]}" -ge 3 ]] || die "$EXIT_PREREQUISITE" "Bash 3 or newer is required (detected ${BASH_VERSION})."
@@ -406,6 +411,27 @@ ensure_boundary() {
   [[ "$mode" == 700 ]] || die "$EXIT_FILESYSTEM" "project-local registry directory must have mode 0700: $REGISTRY_DIR has mode $mode."
 }
 
+validate_preflight_boundary() {
+  local canonical metadata mode
+  if [[ ! -e "$AGENTS_DIR" && ! -L "$AGENTS_DIR" ]]; then
+    return 0
+  fi
+  [[ -d "$AGENTS_DIR" && ! -L "$AGENTS_DIR" ]] || die "$EXIT_FILESYSTEM" "project agent directory must be a real directory: $AGENTS_DIR."
+  require_owned_directory "$AGENTS_DIR" 'project agent directory'
+  canonical="$(cd -P "$AGENTS_DIR" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot resolve project agent directory: $AGENTS_DIR."
+  [[ "$canonical" == "$AGENTS_DIR" ]] || die "$EXIT_FILESYSTEM" "project agent directory escapes repository root: $AGENTS_DIR."
+  if [[ ! -e "$REGISTRY_DIR" && ! -L "$REGISTRY_DIR" ]]; then
+    return 0
+  fi
+  [[ -d "$REGISTRY_DIR" && ! -L "$REGISTRY_DIR" ]] || die "$EXIT_FILESYSTEM" "project-local registry directory must be a real directory: $REGISTRY_DIR."
+  require_owned_directory "$REGISTRY_DIR" 'project-local registry directory'
+  canonical="$(cd -P "$REGISTRY_DIR" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" "cannot resolve project-local registry directory: $REGISTRY_DIR."
+  [[ "$canonical" == "$REGISTRY_DIR" ]] || die "$EXIT_FILESYSTEM" "project-local registry directory escapes repository root: $REGISTRY_DIR."
+  metadata="$(path_owner_mode "$REGISTRY_DIR")" || die "$EXIT_FILESYSTEM" "cannot inspect project-local registry directory: $REGISTRY_DIR."
+  read -r _ mode <<<"$metadata"
+  [[ "$mode" == 700 ]] || die "$EXIT_FILESYSTEM" "project-local registry directory must have mode 0700: $REGISTRY_DIR has mode $mode."
+}
+
 validate_gitignore_target() {
   local ignore_path="$REPO_ROOT/.gitignore" metadata='' owner='' mode=''
   [[ ! -L "$ignore_path" ]] || die "$EXIT_FILESYSTEM" "repository root .gitignore must not be a symlink: $ignore_path."
@@ -509,6 +535,18 @@ validate_present_registry_ignore_negations() {
   done
 }
 
+validate_preflight_ignore_state() {
+  local private_ignore="$REGISTRY_DIR/.gitignore"
+  if [[ -e "$REGISTRY_DIR" || -L "$REGISTRY_DIR" ]]; then
+    if [[ -e "$private_ignore" || -L "$private_ignore" ]]; then
+      validate_private_gitignore_target
+    fi
+  fi
+  if [[ -e "$REGISTRY_PATH" || -L "$REGISTRY_PATH" ]]; then
+    validate_registry_ignore_rules
+  fi
+}
+
 require_project_skills() {
   local code_reviewer="$REPO_ROOT/.agents/skills/code-reviewer/SKILL.md" caveman="$REPO_ROOT/.agents/skills/caveman/SKILL.md" missing='' path
   for path in "$REPO_ROOT/.agents" "$REPO_ROOT/.agents/skills" "$REPO_ROOT/.agents/skills/code-reviewer" "$REPO_ROOT/.agents/skills/caveman"; do
@@ -557,6 +595,7 @@ migrate_v1_if_safe() {
   [[ "$worker_count" -eq 0 ]] || die "$EXIT_SCHEMA" "project-local schema-v1 registry is not empty: $REGISTRY_PATH. Automatic migration requires proven ownership and zero historical worker rows; recover it with the previous skill version. Registry unchanged."
   recorded_root="$(jq -r '.repository_root // empty' "$REGISTRY_PATH")"
   [[ "$recorded_root" == "$REPO_ROOT" ]] || die "$EXIT_REPOSITORY" "project-local schema-v1 registry ownership is not proven: $REGISTRY_PATH. Recover it with the previous skill version before replacing it."
+  [[ "$PREFLIGHT_ONLY" -eq 0 ]] || return 0
   [[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_SCHEMA" "schema-v1 migration is disabled for --existing-path recovery: $REGISTRY_PATH. Registry unchanged; run normal init only after recovery with the previous skill version."
   ensure_checkout_seal
   timestamp="$(now_utc)"; temp_path="$(mktemp "$REGISTRY_DIR/.registry-migration.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create schema migration temporary file in $REGISTRY_DIR."
@@ -580,6 +619,7 @@ migrate_v2_if_safe() {
 		| jq -e "$SCHEMA_FILTER" >/dev/null 2>&1; then
 		die "$EXIT_SCHEMA" "schema version 2 registry cannot be safely migrated: $REGISTRY_PATH. Registry unchanged and checkout seal was not created."
 	fi
+	[[ "$PREFLIGHT_ONLY" -eq 0 ]] || return 0
 	ensure_checkout_seal
 	temp_path="$(mktemp "$REGISTRY_DIR/.registry-migration.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create schema migration file in $REGISTRY_DIR."
 	if ! jq --arg identity "$REPO_IDENTITY" --arg checkout_identity "$REPO_CHECKOUT_IDENTITY" --arg timestamp "$timestamp" '.schema_version = 3 | .repository_identity = $identity | .repository_checkout_identity = $checkout_identity | .updated_at = $timestamp' "$REGISTRY_PATH" >"$temp_path"; then
@@ -616,6 +656,7 @@ validate_drained_preseal_registry() {
   [[ "$recorded_identity" == "$REPO_CHECKOUT_PHYSICAL_ID" ]] || die "$EXIT_REPOSITORY" "pre-seal schema-v3 registry has a different physical checkout identity: $REGISTRY_PATH. Registry unchanged; recover with the previous skill version."
   worker_count="$(jq '.workers | length' "$REGISTRY_PATH")"
   [[ "$worker_count" == 0 ]] || die "$EXIT_SCHEMA" "pre-seal schema-v3 registry contains $worker_count live worker(s): $REGISTRY_PATH. Retire or recover every worker with the previous skill version, then rerun normal init. Registry unchanged."
+  [[ "$PREFLIGHT_ONLY" -eq 0 ]] || return 0
   [[ "$EXISTING_ONLY" -eq 0 ]] || die "$EXIT_SCHEMA" "pre-seal schema-v3 migration is disabled for --existing-path recovery: $REGISTRY_PATH. Registry unchanged; run normal init only after recovery with the previous skill version."
 }
 
@@ -634,25 +675,37 @@ validate_existing_registry() {
     case "$recorded_identity" in
     "$REPO_CHECKOUT_PHYSICAL_ID")
       validate_drained_preseal_registry
-      ensure_checkout_seal
-      add_checkout_seal_to_registry
-      ;;
-    "$REPO_CHECKOUT_PHYSICAL_ID:seal:"*)
-      ensure_checkout_seal
-      [[ "$recorded_identity" == "$REPO_CHECKOUT_IDENTITY" || "$recorded_identity" == "$REPO_CHECKOUT_PHYSICAL_ID:seal:$REPO_CHECKOUT_SEAL" ]] || die "$EXIT_REPOSITORY" "registry checkout seal does not match this physical Git administration directory: $REGISTRY_PATH. Preserve state and recover it only with its original checkout."
-      if [[ "$EXISTING_ONLY" -eq 0 && "$recorded_identity" != "$REPO_CHECKOUT_IDENTITY" ]]; then
+      if [[ "$PREFLIGHT_ONLY" -eq 0 ]]; then
+        ensure_checkout_seal
         add_checkout_seal_to_registry
       fi
       ;;
+    "$REPO_CHECKOUT_PHYSICAL_ID:seal:"*)
+      if [[ "$PREFLIGHT_ONLY" -eq 1 ]]; then
+        [[ -e "$REPO_CHECKOUT_SEAL_PATH" || -L "$REPO_CHECKOUT_SEAL_PATH" ]] || die "$EXIT_FILESYSTEM" "sealed registry requires an existing Git checkout identity seal during preflight: $REPO_CHECKOUT_SEAL_PATH."
+        validate_checkout_seal_file
+      else
+        ensure_checkout_seal
+      fi
+      [[ "$recorded_identity" == "$REPO_CHECKOUT_IDENTITY" || "$recorded_identity" == "$REPO_CHECKOUT_PHYSICAL_ID:seal:$REPO_CHECKOUT_SEAL" ]] || die "$EXIT_REPOSITORY" "registry checkout seal does not match this physical Git administration directory: $REGISTRY_PATH. Preserve state and recover it only with its original checkout."
+		if [[ "$PREFLIGHT_ONLY" -eq 0 && "$EXISTING_ONLY" -eq 0 && "$recorded_identity" != "$REPO_CHECKOUT_IDENTITY" ]]; then
+			add_checkout_seal_to_registry
+		fi
+		[[ "$PREFLIGHT_ONLY" -eq 0 ]] || return 0
+		;;
     *) die "$EXIT_REPOSITORY" "registry belongs to a different physical Git checkout at $REPO_ROOT: $REGISTRY_PATH. Preserve state and recover it only with its original checkout." ;;
     esac
     ;;
   '') die "$EXIT_SCHEMA" "registry has no schema version: $REGISTRY_PATH. Preserve it for recovery." ;;
   *) die "$EXIT_SCHEMA" "unsupported registry schema version $version: $REGISTRY_PATH. Preserve it for recovery." ;;
   esac
+  if [[ "$PREFLIGHT_ONLY" -eq 1 && ( "$version" == 1 || "$version" == 2 ) ]]; then
+    return 0
+  fi
   jq -e "$SCHEMA_FILTER" "$REGISTRY_PATH" >/dev/null 2>&1 || die "$EXIT_SCHEMA" "registry fails schema version 3 validation: $REGISTRY_PATH. Preserve it for recovery."
   [[ "$(jq -r '.repository_identity' "$REGISTRY_PATH")" == "$REPO_IDENTITY" ]] || die "$EXIT_REPOSITORY" "registry belongs to a different repository identity at $REPO_ROOT: $REGISTRY_PATH. Preserve copied or replacement state; do not attach it."
   [[ "$(jq -r '.repository_checkout_identity' "$REGISTRY_PATH")" == "$REPO_CHECKOUT_IDENTITY" ]] || die "$EXIT_REPOSITORY" "registry belongs to a different physical Git checkout at $REPO_ROOT: $REGISTRY_PATH. Preserve state and recover it only with its original checkout."
+  [[ "$PREFLIGHT_ONLY" -eq 0 ]] || return 0
   if [[ "$(jq -r '.repository_root' "$REGISTRY_PATH")" != "$REPO_ROOT" ]]; then
     [[ "$EXISTING_ONLY" -eq 0 ]] || return 0
     temp_path="$(mktemp "$REGISTRY_DIR/.registry-move.XXXXXX")" || die "$EXIT_FILESYSTEM" "cannot create moved-root registry temporary file: $REGISTRY_DIR."
@@ -670,10 +723,15 @@ while [[ $# -gt 0 ]]; do
   --repo | -C) [[ $# -ge 2 ]] || die "$EXIT_USAGE" "missing value for $1."; REPO_INPUT="$2"; shift 2 ;;
   --print-path) PRINT_PATH=1; shift ;;
   --existing-path) EXISTING_ONLY=1; PRINT_PATH=1; shift ;;
+  --preflight) PREFLIGHT_ONLY=1; PRINT_PATH=1; shift ;;
+  --registry-lock-held) PREFLIGHT_LOCK_HELD=1; shift ;;
   --help | -h) usage "$EXIT_OK" ;;
   *) die "$EXIT_USAGE" "unknown argument: $1. Use --help for usage." ;;
   esac
 done
+
+[[ "$EXISTING_ONLY" -eq 0 || "$PREFLIGHT_ONLY" -eq 0 ]] || die "$EXIT_USAGE" '--existing-path and --preflight cannot be combined.'
+[[ "$PREFLIGHT_LOCK_HELD" -eq 0 || "$PREFLIGHT_ONLY" -eq 1 ]] || die "$EXIT_USAGE" '--registry-lock-held is only valid with --preflight.'
 
 require_commands
 resolve_paths
@@ -682,6 +740,20 @@ resolve_git_identity
 [[ "$EXISTING_ONLY" -eq 1 ]] || require_project_skills
 validate_gitignore_target
 validate_present_registry_ignore_negations
+if [[ "$PREFLIGHT_ONLY" -eq 1 ]]; then
+  validate_preflight_boundary
+  validate_preflight_ignore_state
+  if [[ -e "$REGISTRY_PATH" || -L "$REGISTRY_PATH" ]]; then
+    if [[ "$PREFLIGHT_LOCK_HELD" -eq 0 ]]; then
+      acquire_lock
+    fi
+    validate_existing_registry || die "$EXIT_FILESYSTEM" "registry preflight could not validate existing state: $REGISTRY_PATH."
+  fi
+  if [[ "$PRINT_PATH" -eq 1 ]]; then
+    printf '%s\n' "$REGISTRY_PATH"
+  fi
+  exit "$EXIT_OK"
+fi
 ensure_boundary
 if [[ "$EXISTING_ONLY" -eq 1 ]]; then
   [[ -e "$REGISTRY_DIR/.gitignore" || -L "$REGISTRY_DIR/.gitignore" ]] || die "$EXIT_FILESYSTEM" "registry-local .gitignore is missing: $REGISTRY_DIR/.gitignore. Existing-path recovery is validation-only."

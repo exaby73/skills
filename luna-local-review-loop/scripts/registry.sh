@@ -23,6 +23,13 @@ REGISTRY_DIR=''
 LOCK_DIR=''
 LOCK_HELD=0
 PARSE_SHIFT=0
+PREFLIGHT_READY_FILE=''
+PREFLIGHT_RELEASE_FILE=''
+PREFLIGHT_ERROR_FILE=''
+PREFLIGHT_READY_TOKEN=''
+PREFLIGHT_RELEASE_TOKEN=''
+PREFLIGHT_PARENT_PID=''
+PREFLIGHT_PARENT_INSTANCE=''
 
 readonly TRANSITION_SCHEMA_FILTER='
   def nonempty: type == "string" and length > 0;
@@ -108,7 +115,8 @@ usage() {
 	local exit_code="${1:-0}"
 	cat <<'EOF'
 Usage:
-  registry.sh init|path [--repo PATH]
+  registry.sh init|path|preflight [--repo PATH]
+  registry.sh preflight-lock --repo PATH --ready-file PATH --release-file PATH --parent-pid PID --parent-instance INSTANCE
   registry.sh reserve --task-id ID --scope TEXT [--retry-of ID] [--sandbox read-only|workspace-write] [--pid PID --token TOKEN] [--repo PATH]
   registry.sh bind --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH]
   registry.sh activate --task-id ID --session-id ID [--invocation-token TOKEN] [--repo PATH]
@@ -280,6 +288,239 @@ resolve_registry() {
 	[[ -n "$REGISTRY_PATH" ]] || die "$EXIT_FILESYSTEM" 'init returned an empty registry path.'
 	REGISTRY_DIR="$(dirname "$REGISTRY_PATH")"
 	LOCK_DIR="$REGISTRY_DIR/.lock"
+}
+
+resolve_preflight_registry() {
+	local repo_candidate=''
+	local repo_root=''
+	[[ -d "$REPO_INPUT" ]] || die "$EXIT_USAGE" "repository path is not a directory: $REPO_INPUT."
+	repo_candidate="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve repository path: $REPO_INPUT."
+	repo_root="$(git -C "$repo_candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_USAGE" "repository path is not inside a Git repository: $REPO_INPUT."
+	repo_root="$(cd -P "$repo_root" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" 'cannot resolve Git checkout root.'
+	case "$repo_candidate" in
+	"$repo_root" | "$repo_root"/*) ;;
+	*) die "$EXIT_USAGE" "Git recorded a different checkout root than the supplied path: $repo_candidate -> $repo_root." ;;
+	esac
+	REGISTRY_DIR="$repo_root/.agents/agent-registry"
+	REGISTRY_PATH="$REGISTRY_DIR/registry.json"
+	LOCK_DIR="$REGISTRY_DIR/.lock"
+}
+
+preflight_control_file_is_private() {
+	local path="$1"
+	local owner=''
+	local mode=''
+	local links=''
+	if owner="$(stat -c '%u' "$path" 2>/dev/null)"; then :
+	elif owner="$(stat -f '%u' "$path" 2>/dev/null)"; then :
+	else return 1; fi
+	if mode="$(stat -c '%a' "$path" 2>/dev/null)"; then :
+	elif mode="$(stat -f '%Lp' "$path" 2>/dev/null)"; then :
+	else return 1; fi
+	if links="$(stat -c '%h' "$path" 2>/dev/null)"; then :
+	elif links="$(stat -f '%l' "$path" 2>/dev/null)"; then :
+	else return 1; fi
+	[[ "$owner" == "$UID" && "$mode" == 600 && "$links" == 1 ]]
+}
+
+preflight_control_state_read() {
+	local path="$1"
+	local state=''
+	preflight_control_file_is_private "$path" || return 1
+	exec 8<"$path" || return 1
+	if ! IFS= read -r state <&8; then
+		exec 8<&-
+		return 1
+	fi
+	if IFS= read -r <&8; then
+		exec 8<&-
+		return 1
+	fi
+	exec 8<&-
+	printf '%s\n' "$state"
+}
+
+preflight_control_state_is_valid() {
+	local path="$1"
+	local expected="$2"
+	local state=''
+	state="$(preflight_control_state_read "$path")" || return 1
+	[[ "$state" == "$expected" ]]
+}
+
+preflight_parent_is_live() {
+	local parent_pid="$1"
+	local parent_instance="$2"
+	local current_instance=''
+	local process_state=''
+	local process_owner=''
+	process_owner="$(ps -p "$parent_pid" -o uid= 2>/dev/null | awk 'NF {print $1; exit}')" || return 1
+	[[ "$process_owner" == "$UID" ]] || return 1
+	current_instance="$(process_instance_identity "$parent_pid" 2>/dev/null)" || return 1
+	[[ "$current_instance" == "$parent_instance" ]] || return 1
+	process_state="$(ps -p "$parent_pid" -o stat= 2>/dev/null | awk 'NF {print $1; exit}')"
+	case "$process_state" in '' | Z*) return 1 ;; esac
+}
+
+publish_preflight_ready() {
+	local ready_value="$1"
+	local ready_parent=''
+	local temp_path=''
+	ready_parent="${PREFLIGHT_READY_FILE%/*}"
+	temp_path="$(mktemp "$ready_parent/.registry-preflight-ready.XXXXXX")" || return 1
+	if ! printf '%s:%s\n' "$ready_value" "$PREFLIGHT_READY_TOKEN" >"$temp_path" || ! chmod 0600 "$temp_path" || ! preflight_control_file_is_private "$temp_path"; then
+		rm -f "$temp_path"
+		return 1
+	fi
+	if ! mv -f "$temp_path" "$PREFLIGHT_READY_FILE"; then
+		rm -f "$temp_path"
+		return 1
+	fi
+	preflight_control_state_is_valid "$PREFLIGHT_READY_FILE" "$ready_value:$PREFLIGHT_READY_TOKEN"
+}
+
+remove_preflight_control_file() {
+	local path="$1"
+	[[ -n "$path" ]] || return 0
+	if [[ ! -e "$path" && ! -L "$path" ]]; then
+		return 0
+	fi
+	preflight_control_file_is_private "$path" || return 1
+	rm "$path" || return 1
+	[[ ! -e "$path" && ! -L "$path" ]]
+}
+
+release_preflight_lock_checked() {
+	local lock_was_held="$LOCK_HELD"
+	release_lock
+	if [[ "$lock_was_held" -eq 1 && ( -e "$LOCK_DIR" || -L "$LOCK_DIR" ) ]]; then
+		return 1
+	fi
+	return 0
+}
+
+preflight_lock_cleanup() {
+	local exit_code=$?
+	local cleanup_status=0
+	local parent_live=0
+	trap - EXIT
+	if preflight_parent_is_live "$PREFLIGHT_PARENT_PID" "$PREFLIGHT_PARENT_INSTANCE"; then
+		parent_live=1
+	fi
+	release_preflight_lock_checked || cleanup_status=1
+	if [[ "$parent_live" -eq 0 ]]; then
+		remove_preflight_control_file "$PREFLIGHT_READY_FILE" || cleanup_status=1
+		remove_preflight_control_file "$PREFLIGHT_RELEASE_FILE" || cleanup_status=1
+		remove_preflight_control_file "$PREFLIGHT_ERROR_FILE" || cleanup_status=1
+	fi
+	if [[ -n "$PREFLIGHT_ERROR_FILE" && -f "$PREFLIGHT_ERROR_FILE" && ! -L "$PREFLIGHT_ERROR_FILE" ]] && preflight_control_file_is_private "$PREFLIGHT_ERROR_FILE"; then
+		printf 'preflight-lock exit=%s cleanup=%s parent-live=%s lock-held=%s\n' "$exit_code" "$cleanup_status" "$parent_live" "$LOCK_HELD" >>"$PREFLIGHT_ERROR_FILE" || true
+	fi
+	if [[ "$cleanup_status" -ne 0 ]]; then
+		exit_code="$EXIT_LOCK"
+	fi
+	exit "$exit_code"
+}
+
+command_preflight_lock() {
+	local ready_file=''
+	local release_file=''
+	local error_file=''
+	local ready_token=''
+	local release_token=''
+	local parent_pid=''
+	local parent_instance=''
+	local release_parent=''
+	local ready_value=''
+	local release_state=''
+	while [[ $# -gt 0 ]]; do
+		if parse_common "$@"; then
+			shift "$PARSE_SHIFT"
+			continue
+		fi
+		case "$1" in
+		--ready-file)
+			ready_file="${2:-}"
+			shift 2
+			;;
+		--release-file)
+			release_file="${2:-}"
+			shift 2
+			;;
+		--error-file)
+			error_file="${2:-}"
+			shift 2
+			;;
+		--ready-token)
+			ready_token="${2:-}"
+			shift 2
+			;;
+		--release-token)
+			release_token="${2:-}"
+			shift 2
+			;;
+		--parent-pid)
+			parent_pid="${2:-}"
+			shift 2
+			;;
+		--parent-instance)
+			parent_instance="${2:-}"
+			shift 2
+			;;
+		*) die "$EXIT_USAGE" "unknown preflight-lock argument: $1." ;;
+		esac
+	done
+	[[ -n "$ready_file" && -n "$release_file" && -n "$error_file" && -n "$ready_token" && -n "$release_token" && -n "$parent_pid" && -n "$parent_instance" ]] || die "$EXIT_USAGE" 'preflight-lock requires ready/release/error files, ready/release tokens, and parent PID/instance.'
+	case "$parent_pid" in '' | 0 | *[!0-9]*) die "$EXIT_USAGE" "preflight parent PID must be a positive integer: $parent_pid." ;; esac
+	[[ "$parent_instance" =~ ^(proc:[0-9]+|ps:[A-Z][a-z]{2}[[:space:]][A-Z][a-z]{2}[[:space:]][0-9]{1,2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]][0-9]{4})$ ]] || die "$EXIT_USAGE" "preflight parent process instance is invalid: $parent_instance."
+	[[ "$ready_token" =~ ^[0-9a-f]{64}$ && "$release_token" =~ ^[0-9a-f]{64}$ ]] || die "$EXIT_USAGE" 'preflight control tokens must be lowercase SHA-256 digests.'
+	case "$ready_file" in /*) ;; *) die "$EXIT_USAGE" "preflight ready file must be absolute: $ready_file." ;; esac
+	case "$release_file" in /*) ;; *) die "$EXIT_USAGE" "preflight release file must be absolute: $release_file." ;; esac
+	case "$error_file" in /*) ;; *) die "$EXIT_USAGE" "preflight error file must be absolute: $error_file." ;; esac
+	[[ -f "$ready_file" && ! -L "$ready_file" ]] || die "$EXIT_FILESYSTEM" "preflight ready file must be an existing regular file: $ready_file."
+	preflight_control_file_is_private "$ready_file" || die "$EXIT_FILESYSTEM" "preflight ready file must be a private single-link file: $ready_file."
+	[[ -f "$release_file" && ! -L "$release_file" ]] || die "$EXIT_FILESYSTEM" "preflight release file must be an existing regular file: $release_file."
+	preflight_control_file_is_private "$release_file" || die "$EXIT_FILESYSTEM" "preflight release file must be a private single-link file: $release_file."
+	[[ -f "$error_file" && ! -L "$error_file" ]] || die "$EXIT_FILESYSTEM" "preflight error file must be an existing regular file: $error_file."
+	preflight_control_file_is_private "$error_file" || die "$EXIT_FILESYSTEM" "preflight error file must be a private single-link file: $error_file."
+	preflight_control_state_is_valid "$ready_file" "pending:$ready_token" || die "$EXIT_FILESYSTEM" 'preflight ready file has an invalid initial state.'
+	preflight_control_state_is_valid "$release_file" "hold:$release_token" || die "$EXIT_FILESYSTEM" 'preflight release file has an invalid initial state.'
+	release_parent="${release_file%/*}"
+	[[ -d "$release_parent" && ! -L "$release_parent" ]] || die "$EXIT_FILESYSTEM" "preflight release-file parent must be a real directory: $release_parent."
+	preflight_parent_is_live "$parent_pid" "$parent_instance" || die "$EXIT_RUNTIME_STATE" 'preflight parent process is not a live process owned by the current user.'
+
+	PREFLIGHT_READY_FILE="$ready_file"
+	PREFLIGHT_RELEASE_FILE="$release_file"
+	PREFLIGHT_ERROR_FILE="$error_file"
+	PREFLIGHT_READY_TOKEN="$ready_token"
+	PREFLIGHT_RELEASE_TOKEN="$release_token"
+	PREFLIGHT_PARENT_PID="$parent_pid"
+	PREFLIGHT_PARENT_INSTANCE="$parent_instance"
+	trap preflight_lock_cleanup EXIT
+
+	resolve_preflight_registry
+	if [[ -d "$REGISTRY_DIR" && ! -L "$REGISTRY_DIR" ]]; then
+		acquire_lock
+	fi
+	"$INIT_SCRIPT" --repo "$REPO_INPUT" --preflight --registry-lock-held >/dev/null || die "$EXIT_FILESYSTEM" 'registry preflight failed while holding the registry lock; preserve state and retry.'
+	if [[ "$LOCK_HELD" -eq 1 ]]; then
+		ready_value='locked'
+	else
+		ready_value='unlocked'
+	fi
+	publish_preflight_ready "ready=$ready_value" || die "$EXIT_FILESYSTEM" "cannot publish preflight readiness: $ready_file."
+	while true; do
+		preflight_parent_is_live "$parent_pid" "$parent_instance" || die "$EXIT_RUNTIME_STATE" 'preflight parent exited or changed identity before registry lock release.'
+		if ! release_state="$(preflight_control_state_read "$release_file")"; then
+			die "$EXIT_FILESYSTEM" 'preflight release file was replaced with an invalid state.'
+		fi
+		case "$release_state" in
+		"release:$release_token") break ;;
+		"hold:$release_token") ;;
+		*) die "$EXIT_FILESYSTEM" 'preflight release file was replaced with an invalid state.' ;;
+		esac
+		sleep 0.01
+	done
 }
 
 atomic_write() {
@@ -838,6 +1079,10 @@ init)
 path)
 	exec "$INIT_SCRIPT" "$@" --existing-path
 	;;
+preflight)
+	exec "$INIT_SCRIPT" "$@" --preflight
+	;;
+preflight-lock) command_preflight_lock "$@" ;;
 reserve) command_reserve "$@" ;;
 bind) command_bind "$@" ;;
 activate) command_activate "$@" ;;

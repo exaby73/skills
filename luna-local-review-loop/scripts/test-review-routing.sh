@@ -95,16 +95,34 @@ rg -q -- '-s read-only' <<<"$regular_output"
 cat >"$probe_dir/codex-snapshot" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-sleep 0.1
+: >"${LUNA_TEST_REVIEW_INVOCATION_MARKER:?}"
+while [[ ! -e "${LUNA_TEST_REVIEW_RELEASE_GATE:?}" ]]; do
+	sleep 0.01
+done
 cat
 EOF
 chmod 700 "$probe_dir/codex-snapshot"
 printf '%s\n' 'original review prompt' >"$probe_dir/snapshot-prompt"
 mkdir "$probe_dir/tmp"
+snapshot_invocation_marker="$probe_dir/snapshot-invoked"
+snapshot_release_gate="$probe_dir/snapshot-release"
+LUNA_TEST_REVIEW_INVOCATION_MARKER="$snapshot_invocation_marker" \
+LUNA_TEST_REVIEW_RELEASE_GATE="$snapshot_release_gate" \
 TMPDIR="$probe_dir/tmp" CODEX_BIN="$probe_dir/codex-snapshot" "$review_script" --repo "$SKILL_ROOT/.." --prompt-file "$probe_dir/snapshot-prompt" >"$probe_dir/snapshot.out" &
 snapshot_pid=$!
-sleep 0.05
+snapshot_wait_attempt=0
+while [[ ! -e "$snapshot_invocation_marker" && "$snapshot_wait_attempt" -lt 1000 ]]; do
+	sleep 0.01
+	snapshot_wait_attempt=$((snapshot_wait_attempt + 1))
+done
+[[ -e "$snapshot_invocation_marker" ]] || {
+	kill "$snapshot_pid" 2>/dev/null || true
+	wait "$snapshot_pid" 2>/dev/null || true
+	echo 'review did not reach the explicit invocation barrier' >&2
+	exit 1
+}
 printf '%s\n' 'replacement review prompt' >"$probe_dir/snapshot-prompt"
+: >"$snapshot_release_gate"
 wait "$snapshot_pid"
 rg -q 'original review prompt' "$probe_dir/snapshot.out"
 if rg -q 'replacement review prompt' "$probe_dir/snapshot.out"; then
