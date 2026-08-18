@@ -31,6 +31,7 @@ REPO_CHECKOUT_SEAL_PATH=''
 REPO_CHECKOUT_SEAL=''
 REPO_CHECKOUT_SEAL_PHYSICAL_ID=''
 REPO_CHECKOUT_IDENTITY=''
+SHA256_COMMAND=''
 PRINT_PATH=0
 EXISTING_ONLY=0
 LOCK_HELD=0
@@ -215,14 +216,38 @@ require_private_file() {
   [[ "$mode" == 600 ]] || die "$EXIT_FILESYSTEM" "$label must have mode 0600: $path has mode $mode."
 }
 
+select_sha256_command() {
+  [[ -n "$SHA256_COMMAND" ]] && return 0
+  if command -v shasum >/dev/null 2>&1; then
+    SHA256_COMMAND='shasum'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    SHA256_COMMAND='sha256sum'
+  else
+    return 1
+  fi
+}
+
+sha256_digest() {
+  local digest=''
+  select_sha256_command || return 1
+  case "$SHA256_COMMAND" in
+    shasum) digest="$(LC_ALL=C shasum -a 256 "$1" 2>/dev/null | LC_ALL=C awk '{print tolower($1); exit}')" || return 1 ;;
+    sha256sum) digest="$(LC_ALL=C sha256sum "$1" 2>/dev/null | LC_ALL=C awk '{print tolower($1); exit}')" || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
 require_commands() {
   local missing='' command_name
-  local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed wc)
+  local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk stat cat mktemp date chmod sed wc)
   if [[ "$EXISTING_ONLY" -eq 0 ]]; then required_commands+=(od tr sort head mkfifo); fi
   for command_name in "${required_commands[@]}"; do
     command -v "$command_name" >/dev/null 2>&1 || missing="${missing}${missing:+, }${command_name}"
   done
   [[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing runtime prerequisite(s): $missing."
+  select_sha256_command || die "$EXIT_PREREQUISITE" 'missing SHA-256 prerequisite: install shasum or sha256sum.'
   if [[ "$EXISTING_ONLY" -eq 0 ]] && ! command -v "${CODEX_BIN:-codex}" >/dev/null 2>&1; then
     die "$EXIT_PREREQUISITE" "Codex CLI not found: ${CODEX_BIN:-codex}. Use --existing-path only for registry recovery."
   fi
@@ -324,7 +349,7 @@ validate_checkout_seal_file() {
   exec 9<&-
   [[ "$seal" =~ ^[0-9a-f]{64}$ ]] || die "$EXIT_FILESYSTEM" "Git checkout identity seal must be exactly 256-bit lowercase hex: $REPO_CHECKOUT_SEAL_PATH."
   seal_identity="$(physical_file_identity "$REPO_CHECKOUT_SEAL_PATH")" || die "$EXIT_FILESYSTEM" "cannot derive Git checkout identity seal device/inode: $REPO_CHECKOUT_SEAL_PATH."
-  REPO_CHECKOUT_SEAL="$(shasum -a 256 "$REPO_CHECKOUT_SEAL_PATH" | awk '{print $1}')" || die "$EXIT_FILESYSTEM" "cannot digest Git checkout identity seal: $REPO_CHECKOUT_SEAL_PATH."
+  REPO_CHECKOUT_SEAL="$(sha256_digest "$REPO_CHECKOUT_SEAL_PATH")" || die "$EXIT_FILESYSTEM" "cannot digest Git checkout identity seal with the selected SHA-256 implementation: $REPO_CHECKOUT_SEAL_PATH."
   [[ "$REPO_CHECKOUT_SEAL" =~ ^[0-9a-f]{64}$ ]] || die "$EXIT_FILESYSTEM" "Git checkout identity seal digest is invalid: $REPO_CHECKOUT_SEAL_PATH."
   REPO_CHECKOUT_SEAL_PHYSICAL_ID="seal-file:$seal_identity"
   REPO_CHECKOUT_IDENTITY="$REPO_CHECKOUT_PHYSICAL_ID:seal:$REPO_CHECKOUT_SEAL:$REPO_CHECKOUT_SEAL_PHYSICAL_ID"

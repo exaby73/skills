@@ -26,7 +26,8 @@
       "list-read-collect",
       "model-selection",
       "reasoning-selection",
-      "read-only-or-sandbox-control"
+      "read-only-or-sandbox-control",
+      "cross-path-claim"
     ],
     "configuration": {
       "implementation": {
@@ -46,6 +47,22 @@
       "fresh": true,
       "readOnlyReview": false
     },
+    "workerBoundary": {
+      "soleWorker": true,
+      "maySpawnSubagents": false,
+      "mayDelegate": false
+    },
+    "crossPathClaim": {
+      "authority": "host-owned",
+      "scope": [
+        "canonical-checkout-identity",
+        "immutable-scope"
+      ],
+      "acquireBefore": "native-spawn",
+      "heldThrough": "native-lifecycle",
+      "nonTerminalContinuation": "same-owner-reentry",
+      "conflictOutcome": "parent-action"
+    },
     "cases": [
       {
         "id": "native-complete",
@@ -55,6 +72,7 @@
         "reviewerAvailability": "native-sol-high",
         "startup": "not-started",
         "nativeLifecycle": "completed",
+        "crossPathClaim": "acquired",
         "expectedPath": "native",
         "expectedOutcome": "completed"
       },
@@ -66,6 +84,7 @@
         "reviewerAvailability": "native-sol-high",
         "startup": "started",
         "nativeLifecycle": "interrupted",
+        "crossPathClaim": "held",
         "expectedPath": "native",
         "expectedOutcome": "interrupted"
       },
@@ -77,6 +96,7 @@
         "reviewerAvailability": "native-sol-high",
         "startup": "started",
         "nativeLifecycle": "failed",
+        "crossPathClaim": "held",
         "expectedPath": "native",
         "expectedOutcome": "failed-no-fallback"
       },
@@ -88,6 +108,7 @@
         "reviewerAvailability": "cli-sol-high",
         "startup": "started",
         "nativeLifecycle": "failed",
+        "crossPathClaim": "held",
         "expectedPath": "native",
         "expectedOutcome": "failed-no-fallback"
       },
@@ -99,6 +120,7 @@
         "reviewerAvailability": "native-sol-high",
         "startup": "started",
         "nativeLifecycle": "completed",
+        "crossPathClaim": "held",
         "expectedPath": "native",
         "expectedOutcome": "Evidence blocked"
       },
@@ -110,6 +132,7 @@
         "reviewerAvailability": "unavailable",
         "startup": "started",
         "nativeLifecycle": "completed",
+        "crossPathClaim": "held",
         "expectedPath": "native",
         "expectedOutcome": "Evidence blocked"
       },
@@ -121,8 +144,33 @@
         "reviewerAvailability": "unverifiable",
         "startup": "started",
         "nativeLifecycle": "completed",
+        "crossPathClaim": "held",
         "expectedPath": "native",
         "expectedOutcome": "Evidence blocked"
+      },
+      {
+        "id": "native-cross-path-claim-unavailable",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "native-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "crossPathClaim": "unavailable",
+        "expectedPath": "parent-action",
+        "expectedOutcome": "cross-path-claim-blocked"
+      },
+      {
+        "id": "native-cross-path-claim-conflict",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "native-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "crossPathClaim": "conflict",
+        "expectedPath": "parent-action",
+        "expectedOutcome": "cross-path-claim-conflict"
       },
       {
         "id": "capability-incomplete",
@@ -132,6 +180,7 @@
         "reviewerAvailability": "cli-sol-high",
         "startup": "not-started",
         "nativeLifecycle": "not-started",
+        "crossPathClaim": "acquired",
         "expectedPath": "cli-fallback",
         "expectedOutcome": "fallback"
       },
@@ -143,6 +192,7 @@
         "reviewerAvailability": "cli-sol-high",
         "startup": "not-started",
         "nativeLifecycle": "not-started",
+        "crossPathClaim": "acquired",
         "expectedPath": "cli-fallback",
         "expectedOutcome": "fallback"
       },
@@ -154,6 +204,7 @@
         "reviewerAvailability": "unavailable",
         "startup": "not-started",
         "nativeLifecycle": "not-started",
+        "crossPathClaim": "acquired",
         "expectedPath": "cli-fallback",
         "expectedOutcome": "Evidence blocked"
       },
@@ -165,6 +216,7 @@
         "reviewerAvailability": "cli-sol-high",
         "startup": "not-started",
         "nativeLifecycle": "not-started",
+        "crossPathClaim": "held",
         "expectedPath": "cli-fallback",
         "expectedOutcome": "fallback-active-pinned"
       },
@@ -176,8 +228,21 @@
         "reviewerAvailability": "unavailable",
         "startup": "not-started",
         "nativeLifecycle": "not-started",
+        "crossPathClaim": "acquired",
         "expectedPath": "cli-fallback",
         "expectedOutcome": "Evidence blocked"
+      },
+      {
+        "id": "fallback-cross-path-claim-unavailable",
+        "capabilityResult": "incomplete",
+        "configurationResult": "incomplete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "cli-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "crossPathClaim": "unavailable",
+        "expectedPath": "parent-action",
+        "expectedOutcome": "cross-path-claim-blocked"
       },
       {
         "id": "fallback-state-ambiguous",
@@ -187,6 +252,7 @@
         "reviewerAvailability": "cli-sol-high",
         "startup": "not-started",
         "nativeLifecycle": "not-started",
+        "crossPathClaim": "acquired",
         "expectedPath": "parent-action",
         "expectedOutcome": "preflight-blocked"
       }
@@ -203,6 +269,27 @@
     },
     "allowedOnlyBeforeNativeStartup": true,
     "nativeMustNotReadOrWriteRegistry": true,
+    "crossPathClaim": {
+      "authority": "host-owned",
+      "scope": [
+        "canonical-checkout-identity",
+        "immutable-scope"
+      ],
+      "acquireBefore": "fallback-registry-reserve",
+      "heldThrough": "fallback-lifecycle",
+      "nonTerminalContinuation": "same-owner-reentry",
+      "rejectsActiveNativeClaim": true,
+      "unavailableOutcome": "parent-action"
+    },
+    "workerBoundary": {
+      "soleWorker": true,
+      "maySpawnSubagents": false,
+      "mayDelegate": false,
+      "injectedInto": [
+        "initial-cli-worker-prompt",
+        "continuation-cli-worker-prompt"
+      ]
+    },
     "solReviewRoute": {
       "script": "scripts/run-review.sh",
       "model": "gpt-5.6-sol",

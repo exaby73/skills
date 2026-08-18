@@ -7,6 +7,7 @@ readonly SCRIPT_DIR
 readonly INIT_SCRIPT="$SCRIPT_DIR/init.sh"
 readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
 readonly RUNNER_SCRIPT="$SCRIPT_DIR/run-worker.sh"
+readonly WORKER_BOUNDARY_INSTRUCTION='You are the sole worker for this immutable task. Perform the owned scope directly; never spawn, delegate to, or hand work to another subagent.'
 
 fail() {
 	printf 'FAIL: %s\n' "$*" >&2
@@ -92,6 +93,7 @@ readonly CODEX_FAST_REPARENT_PID_FILE="$TEST_ROOT/codex-fast-reparent.pid"
 readonly CODEX_PROMPT_CAPTURE="$TEST_ROOT/codex-prompt-capture"
 readonly PROMPT_RACE_MARKER="$TEST_ROOT/prompt-race-handshake"
 readonly PROMPT_RACE_RELEASE="$TEST_ROOT/prompt-race-release"
+readonly PROMPT_RACE_MARKER_WAIT_ATTEMPTS=1000
 readonly TRACKER_PS_COUNT_FILE="$TEST_ROOT/tracker-ps-count"
 readonly TRACKER_HANDSHAKE_COMPLETED_MARKER="$TEST_ROOT/tracker-handshake-completed"
 readonly TRACKER_LEASE_WRITER_READY_MARKER="$TEST_ROOT/tracker-lease-writer-ready"
@@ -1018,14 +1020,22 @@ prompt_race_status=0
 FAKE_HANDSHAKE_PROMPT_RACE=1 FAKE_REQUIRE_CLOSED_PROMPT_FD=1 FAKE_REQUIRE_WORKSPACE_WRITE_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id prompt-race-worker --scope 'open immutable prompt before workspace-write resume' --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/prompt-race.out" 2>"$TEST_ROOT/prompt-race.err" &
 prompt_race_runner_pid=$!
 poll_attempt=0
-while [[ ! -e "$PROMPT_RACE_MARKER" && "$poll_attempt" -lt 200 ]]; do
+while [[ ! -e "$PROMPT_RACE_MARKER" && "$poll_attempt" -lt "$PROMPT_RACE_MARKER_WAIT_ATTEMPTS" ]] && process_is_live_non_zombie "$prompt_race_runner_pid"; do
 	sleep 0.01
 	poll_attempt=$((poll_attempt + 1))
 done
-[[ -e "$PROMPT_RACE_MARKER" ]] || fail 'prompt race handshake did not reach its controlled pause'
+if [[ ! -e "$PROMPT_RACE_MARKER" ]]; then
+	process_is_live_non_zombie "$prompt_race_runner_pid" && kill -TERM "$prompt_race_runner_pid" 2>/dev/null || true
+	prompt_race_status=0
+	wait "$prompt_race_runner_pid" || prompt_race_status=$?
+	prompt_race_runner_pid=''
+	prompt_race_error="$(cat "$TEST_ROOT/prompt-race.err" 2>/dev/null || true)"
+	fail "prompt race handshake did not reach its controlled pause (runner status: $prompt_race_status; stderr: ${prompt_race_error:-empty})"
+fi
 prompt_snapshot_path="$registry_dir/artifacts/prompt-race-worker/.task-prompt"
 [[ -f "$prompt_snapshot_path" && ! -L "$prompt_snapshot_path" ]] || fail 'launch did not create a private prompt snapshot before handshake'
-[[ "$(cat "$prompt_snapshot_path")" == "$prompt_race_original" ]] || fail 'prompt snapshot did not preserve validated prompt contents before handshake'
+prompt_snapshot_contents="$(cat "$prompt_snapshot_path")"
+[[ "$prompt_snapshot_contents" == "$WORKER_BOUNDARY_INSTRUCTION"*"$prompt_race_original"*"$WORKER_BOUNDARY_INSTRUCTION" ]] || fail 'prompt snapshot did not preserve validated prompt contents and worker boundary before handshake'
 jq -e 'any(.workers[]; .task_id == "prompt-race-worker" and .status == "reserved")' "$registry_path" >/dev/null || fail 'prompt race did not prove snapshot creation preceded registry reservation'
 printf '%s\n' 'caller replacement during handshake' >"$PROMPT_FILE"
 printf '%s\n' 'task artifact replacement during handshake' >"$TEST_ROOT/prompt-race-replacement"
@@ -1036,7 +1046,8 @@ wait "$prompt_race_runner_pid" || prompt_race_status=$?
 prompt_race_runner_pid=''
 [[ "$prompt_race_status" -eq 0 ]] || fail 'prompt snapshot race worker did not complete'
 jq -e '.outcome == "completed"' <"$TEST_ROOT/prompt-race.out" >/dev/null || fail 'prompt snapshot race worker returned invalid result'
-[[ "$(cat "$CODEX_PROMPT_CAPTURE")" == "$prompt_race_original" ]] || fail 'first workspace-write resume consumed a task-artifact replacement during handshake'
+captured_prompt_contents="$(cat "$CODEX_PROMPT_CAPTURE")"
+[[ "$captured_prompt_contents" == "$WORKER_BOUNDARY_INSTRUCTION"*"$prompt_race_original"*"$WORKER_BOUNDARY_INSTRUCTION" ]] || fail 'first workspace-write resume consumed a task-artifact replacement or lost the worker boundary'
 snapshot_link_count="$(stat -c '%h' "$prompt_snapshot_path" 2>/dev/null || stat -f '%l' "$prompt_snapshot_path" 2>/dev/null)"
 [[ "$snapshot_link_count" == '1' ]] || fail 'prompt snapshot did not retain single-link ownership'
 

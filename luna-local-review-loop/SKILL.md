@@ -9,7 +9,7 @@ Use native host collaboration when its complete lifecycle capability set is avai
 
 ## Roles
 
-Parent owns decomposition, permissions, durable goals/plans, validation judgment, review, commits, delivery, CI, and GitHub state. Worker owns exactly one immutable task. Worker never delegates, stages, commits, pushes, reviews combined changes, manages GitHub/CI, daemonizes, double-forks, or starts persistent background services.
+Parent owns decomposition, permissions, durable goals/plans, validation judgment, review, commits, delivery, CI, and GitHub state. Worker owns exactly one immutable task and is the sole worker for that task. Worker performs its scope directly and never spawns, delegates to, or hands work to another subagent. Worker never stages, commits, pushes, reviews combined changes, manages GitHub/CI, daemonizes, double-forks, or starts persistent background services.
 
 Both roles read target repository AGENTS.md hierarchy and project-local .agents/skills/caveman/SKILL.md. Use project-local Caveman for user-facing output. The parent orchestrates each code-reviewer pass through a fresh Sol-High reviewer and retains the final review decision.
 
@@ -17,17 +17,17 @@ Both roles read target repository AGENTS.md hierarchy and project-local .agents/
 
 The parent/controller is model-agnostic. This skill never names, pins, or implies a concrete parent model or reasoning setting.
 
-Use native host collaboration only when the host exposes the complete lifecycle contract: spawn, unique task identity, message/follow-up, wait, interruption/close, and list/read/collect. The pre-start capability result must also prove exact model selection, exact reasoning selection, and an enforceable read-only or sandbox control for both implementation and review roles. Select this from the host capability result, never from shell or environment guesses.
+Use native host collaboration only when the host exposes the complete lifecycle contract: spawn, unique task identity, message/follow-up, wait, interruption/close, list/read/collect, and the atomic cross-path claim primitive. The pre-start capability result must also prove exact model selection, exact reasoning selection, and an enforceable read-only or sandbox control for both implementation and review roles. Select this from the host capability result, never from shell or environment guesses.
 
 Implementation and validation workers always use a fresh Luna Max worker: model `gpt-5.6-luna`, reasoning `max`, and the smallest useful context. Every code-review pass and re-review always uses a fresh, read-only Sol-High reviewer: model `gpt-5.6-sol`, reasoning `high`. The parent evaluates the review and owns the final decision; the parent model is not a substitute reviewer.
 
-Record the selected path and the exact worker/reviewer configuration in the parent-owned evidence. Before selecting native, the parent performs a read-only fallback-ownership preflight: after validating the canonical repository and registry authority, a missing project-local fallback registry is recorded as `not-initialized` (a clear ownership state); when it exists, inspect its active workers for the repository and immutable scope. An active or awaiting-continue fallback task pins that scope to its existing CLI task until it is retired. A malformed, unreadable, ambiguous, or conflicting fallback state is a parent-action stop. This preflight is the only registry inspection permitted before native startup; native execution itself must never create or read the fallback registry. If native startup has begun and then fails, stop with an explicit failure; do not silently switch paths. Use the CLI fallback only when the complete native capability set was unavailable before startup and the fallback review gate is recorded.
+Record the selected path and the exact worker/reviewer configuration in the parent-owned evidence. Before selecting native, the parent performs a read-only fallback-ownership preflight: after validating the canonical repository and registry authority, a missing project-local fallback registry is recorded as `not-initialized` (a clear ownership state); when it exists, inspect its active workers for the repository and immutable scope. An active or awaiting-continue fallback task pins that scope to its existing CLI task until it is retired. A malformed, unreadable, ambiguous, or conflicting fallback state is a parent-action stop. Immediately after this preflight and before native spawn, the parent acquires an atomic host-owned cross-path claim keyed by canonical physical checkout identity and immutable scope. The fallback reservation must acquire that same claim before its registry reservation. The claim is separate from the fallback registry, is held through the selected native or CLI lifecycle and cleanup, and is released only after the owner is terminal. A non-terminal CLI checkpoint retains the claim; a same-owner continuation re-enters it with the stable task identity before resuming. Native never creates, reads, or writes fallback registry state. If the claim is unavailable or conflicts, stop with parent action before either path starts. This claim closes the check-then-start race between native startup and fallback reservation. If native startup has begun and then fails, stop with an explicit failure; do not silently switch paths. Use the CLI fallback only when the complete native capability set was unavailable before startup and the fallback review gate and cross-path claim are recorded.
 
 ## Native implementation and validation path
 
-When the complete native capability set is available, the parent launches one fresh Luna Max worker for each immutable implementation or validation task. Give every task a unique host identity and a self-contained prompt containing the owned scope, target revisions, governing guidance, validator, exclusions, no-stage/no-commit rule, interruption boundary, and the exact structured-result contract at `references/worker-result.schema.json`.
+When the complete native capability set is available, the parent launches one fresh Luna Max worker for each immutable implementation or validation task. Give every task a unique host identity and a self-contained prompt containing the owned scope, target revisions, governing guidance, validator, exclusions, explicit instruction that this worker is the sole worker and must not spawn or delegate to subagents, no-stage/no-commit rule, interruption boundary, and the exact structured-result contract at `references/worker-result.schema.json`.
 
-The native worker configuration is always model `gpt-5.6-luna` with reasoning `max`; the host must return evidence that those settings were selected and verified, not merely that arbitrary configuration is supported. The parent uses the native lifecycle directly: spawn, send a follow-up when needed, wait, inspect/list the task, interrupt or close when required, and collect the final structured result. Do not initialize the fallback registry, invoke `codex exec`, or use a second process/index for native work.
+The native worker configuration is always model `gpt-5.6-luna` with reasoning `max`; the host must return evidence that those settings were selected and verified, not merely that arbitrary configuration is supported. The parent uses the native lifecycle directly: invoke `bash scripts/cross-path-claim.sh acquire --repo "$repo_root" --scope "$scope" --token "$native_task_id"` with the stable unique native task identity as token, spawn, send a follow-up when needed, wait, inspect/list the task, interrupt or close when required, collect the final structured result, explicitly re-enter with `--reenter` and the same `--token "$native_task_id"` for non-terminal continuation, and invoke `bash scripts/cross-path-claim.sh release --repo "$repo_root" --scope "$scope" --token "$native_task_id"` only after cleanup. Preserve any release failure as parent action. Do not initialize the fallback registry, invoke `codex exec`, or use a second process/index for native work.
 
 A native lifecycle failure after spawn is a failed native run, not a reason to switch paths. Preserve the failure evidence and stop for parent action. The CLI fallback is eligible only when the complete native capability set was unavailable before any native worker started.
 
@@ -57,7 +57,7 @@ That route selects and verifies only `gpt-5.6-sol` with reasoning `high` under `
 
 ## CLI fallback: initialize
 
-Run this section only after the host capability gate proves native collaboration is unavailable before startup, the fallback-ownership preflight has pinned or cleared any existing task, and the CLI Sol-High review route is available or has been explicitly recorded as `Evidence blocked`. Native work never initializes or uses this registry.
+Run this section only after the host capability gate proves native collaboration is unavailable before startup, the fallback-ownership preflight has pinned or cleared any existing task, the cross-path claim is acquired for the canonical checkout and immutable scope, and the CLI Sol-High review route is available or has been explicitly recorded as `Evidence blocked`. Native work never initializes or uses this registry.
 
 Run from any path inside target Git checkout:
 
@@ -73,7 +73,9 @@ Fallback registry path is always:
 <repository-root>/.agents/agent-registry/registry.json
 ~~~
 
-Every registry lock, prompt snapshot, JSONL stream, stderr log, structured result, descendant tracker, lease, and other skill-owned durable artifact stays below <repository-root>/.agents/agent-registry/. Launch, continue, and tracker paths derive from dirname of exact project-local registry authority; repository-root `artifacts/` is never created or accepted. Never derive or read registry state from environment variables, temporary directories, home directories, runtime-state directories, Codex state directories, Git administration directories, or caller-provided paths.
+Registry-owned fallback artifacts—registry locks, prompt snapshots, JSONL streams, stderr logs, structured results, descendant trackers, leases, task directories, and all other fallback state—stay below <repository-root>/.agents/agent-registry/. Launch, continue, and tracker paths derive from dirname of the exact project-local registry authority; repository-root `artifacts/` is never created or accepted. Never derive or read registry state from environment variables, temporary directories, home directories, runtime-state directories, Codex state directories, Git administration directories, or caller-provided paths.
+
+Two host-owned coordination artifacts are explicit exceptions to this registry-owned path boundary: `.luna-checkout-identity` lives in the physical Git administration directory, and `<git-common-dir>/.luna-cross-path-claims/<sha256-key>` lives in Git common metadata. They provide checkout-identity sealing and atomic native/fallback serialization; they are not fallback registry state, registry authority, worker/task artifacts, or alternate locators. No other skill-owned durable artifact uses Git administration/common metadata. Native still never initializes, reads, or writes the project-local fallback registry; fallback still acquires the claim before reserving that exact registry authority. Claim or seal validation remains fail-closed; unavailable or conflicting claims require parent action.
 
 Init is idempotent. It may create `.agents/agent-registry/` with mode 0700, state files with mode 0600, and exactly one `.agents/agent-registry/` line in a regular root `.gitignore`. The registry-local `.gitignore` is private mode 0600 and ends with `*`. These ignore rules are for Git visibility/confidentiality, never write protection: workspace-write requires Codex CLI `>= 0.147.0` with its compiled recursive OS sandbox boundary protecting project `.agents`; malformed/older versions fail before reservation, while read-only remains supported. The parent separately grants Codex runtime state. Existing `.gitignore` mode stays unchanged when it is owned by the caller and not group- or world-writable; new `.gitignore` mode is 0644; all other lines stay unchanged. Init rejects symlinked or non-directory boundary ancestors, path escape, unsafe ownership or permissions, symlinked/non-regular or multiply-linked state files, unsafe `.gitignore`, and unsafe nested ignore negations. `--existing-path` validates only and never rewrites ignore files or other project metadata.
 
@@ -90,6 +92,10 @@ Schema-v3 identity_ledger is append-only lifetime history. workers contains only
 Use parent-direct handling only for clearly trivial work. For non-trivial work, parent creates one task with immutable scope, expected result, sandbox, validator, exclusions, Caveman requirement, no-stage/no-commit rule, and explicit lifecycle-escape prohibition. One session serves one task. Parent performs validation and evaluates the fresh Sol-High review result; worker reports evidence.
 
 ## CLI fallback: launch
+
+The fallback controller acquires the host-owned cross-path claim before `registry.sh reserve`, holds it through the CLI worker and cleanup lifecycle, and releases it only after the registry task is terminal. A non-terminal `needs_parent_action` checkpoint retains the claim, and the same task identity re-enters it for continuation. A claim held by native, unavailable, or conflicting cannot be bypassed by reserving the fallback registry.
+
+The fallback controller materializes both the initial worker prompt and every continuation prompt with the exact sole-worker boundary before Codex starts or resumes: the worker must perform its immutable scope directly and never spawn, delegate to, or hand work to another subagent. A caller-provided prompt cannot remove that boundary.
 
 ~~~sh
 "$skill_root/scripts/run-worker.sh" launch \
@@ -112,7 +118,7 @@ Registry transitions use an atomic lock whose owner PID and process-start identi
 
 Every Codex child runs in its own process group behind a start gate. The descendant tracker records every observed PID with process-start identity, verifies parent identity before expansion, inherits a private FIFO lease, independently enumerates token-bearing processes, and publishes clean only after process and lease evidence is empty. Cleanup signals only verified process instances. Zombies count as exited; unverifiable processes remain live for recovery. INT, TERM, and HUP preserve active registry state when cleanup cannot be proven.
 
-Artifacts are created exclusively as single-link regular files with mode 0600; task and artifact directories are real directories with mode 0700. Existing symlinked, hard-linked, non-regular, or unsafe artifacts are never overwritten. Sparse attempt numbering advances from greatest existing numeric suffix.
+Registry-owned task artifacts are created exclusively as single-link regular files with mode 0600; task and artifact directories are real directories with mode 0700. Host-owned claim and seal files follow their separate Git metadata paths and the same private-file requirements. Existing symlinked, hard-linked, non-regular, or unsafe artifacts are never overwritten. Sparse attempt numbering advances from greatest existing numeric suffix.
 
 ## CLI fallback: continue, retry, and finish
 
@@ -156,6 +162,7 @@ Run:
 
 ~~~sh
 ./luna-local-review-loop/scripts/test-init.sh
+bash luna-local-review-loop/scripts/test-cross-path-claim.sh
 bash luna-local-review-loop/scripts/test-path-selection.sh
 bash luna-local-review-loop/scripts/test-review-routing.sh
 bash -n luna-local-review-loop/scripts/*.sh
