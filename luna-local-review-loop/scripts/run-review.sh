@@ -5,6 +5,7 @@ umask 077
 readonly EXIT_OK=0
 readonly EXIT_USAGE=2
 readonly EXIT_PREREQUISITE=3
+readonly EXIT_RUNTIME_STATE=11
 
 REPO_INPUT='.'
 PROMPT_FILE=''
@@ -30,6 +31,35 @@ die() {
 	exit "$exit_code"
 }
 
+open_verified_prompt_descriptor() {
+	local prompt_parent
+	local prompt_name
+	local metadata
+	local prompt_type
+	local prompt_links
+	if [[ "$PROMPT_FILE" == */* ]]; then
+		prompt_parent="${PROMPT_FILE%/*}"
+		prompt_name="${PROMPT_FILE##*/}"
+	else
+		prompt_parent='.'
+		prompt_name="$PROMPT_FILE"
+	fi
+	prompt_parent="$(cd -P "$prompt_parent" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve review prompt parent: $PROMPT_FILE."
+	PROMPT_FILE="$prompt_parent/$prompt_name"
+	[[ -f "$PROMPT_FILE" && ! -L "$PROMPT_FILE" && -r "$PROMPT_FILE" ]] || die "$EXIT_USAGE" "review prompt is not a readable regular file: $PROMPT_FILE."
+	exec 8<"$PROMPT_FILE" || die "$EXIT_RUNTIME_STATE" "cannot open review prompt descriptor: $PROMPT_FILE."
+	if metadata="$(stat -Lc '%F|%h' "/proc/$$/fd/8" 2>/dev/null)"; then
+		:
+	elif metadata="$(stat -f '%HT|%l' /dev/fd/8 2>/dev/null)"; then
+		:
+	else
+		die "$EXIT_RUNTIME_STATE" 'cannot verify review prompt descriptor.'
+	fi
+	IFS='|' read -r prompt_type prompt_links <<<"$metadata"
+	[[ "$prompt_type" == 'regular file' || "$prompt_type" == 'Regular File' ]] || die "$EXIT_RUNTIME_STATE" 'review prompt descriptor is not a regular file.'
+	[[ "$prompt_links" == '1' ]] || die "$EXIT_RUNTIME_STATE" 'review prompt descriptor is multiply linked; refusing to review mutable input.'
+}
+
 [[ $# -gt 0 ]] || usage "$EXIT_USAGE"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -51,11 +81,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$PROMPT_FILE" ]] || die "$EXIT_USAGE" 'review requires --prompt-file.'
-[[ -f "$PROMPT_FILE" && ! -L "$PROMPT_FILE" && -r "$PROMPT_FILE" ]] || die "$EXIT_USAGE" "review prompt is not a readable regular file: $PROMPT_FILE."
 [[ -x "$(command -v "$CODEX_BIN" 2>/dev/null || true)" ]] || die "$EXIT_PREREQUISITE" "Codex CLI is unavailable: $CODEX_BIN."
 
 REPO_ROOT="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve repository path: $REPO_INPUT."
 [[ -d "$REPO_ROOT/.git" || -f "$REPO_ROOT/.git" ]] || die "$EXIT_USAGE" "review repository is not a Git checkout: $REPO_ROOT."
+open_verified_prompt_descriptor
 
 exec "$CODEX_BIN" exec \
 	--ignore-user-config \
@@ -65,4 +95,4 @@ exec "$CODEX_BIN" exec \
 	-s read-only \
 	-C "$REPO_ROOT" \
 	--json \
-	- <"$PROMPT_FILE"
+	- <&8

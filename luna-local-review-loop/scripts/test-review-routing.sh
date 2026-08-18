@@ -62,6 +62,9 @@ rg -q 'fresh read-only Sol-High reviewer' "$SKILL_ROOT/README.md"
 rg -q 'run-review\.sh' "$SKILL_ROOT/README.md"
 
 review_script="$SKILL_ROOT/scripts/run-review.sh"
+rg -q 'exec 8<' "$review_script"
+rg -q '<&8' "$review_script"
+rg -q 'prompt descriptor is not a regular file' "$review_script"
 rg -q 'gpt-5\.6-sol' "$review_script"
 rg -q 'model_reasoning_effort=high' "$review_script"
 rg -q -- '-s read-only' "$review_script"
@@ -69,5 +72,17 @@ if rg -q 'gpt-5\.6-luna|workspace-write|registry\.sh|run-worker\.sh' "$review_sc
     echo 'CLI review route is not Sol-only/read-only' >&2
     exit 1
 fi
+
+probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/luna-review-routing.XXXXXX")"
+trap 'rm -rf -- "$probe_dir"' EXIT
+printf 'review prompt\n' >"$probe_dir/prompt"
+regular_output="$(CODEX_BIN=/bin/echo "$review_script" --repo "$SKILL_ROOT/.." --prompt-file "$probe_dir/prompt")"
+rg -q -- '-s read-only' <<<"$regular_output"
+ln "$probe_dir/prompt" "$probe_dir/hardlink"
+if CODEX_BIN=/bin/echo "$review_script" --repo "$SKILL_ROOT/.." --prompt-file "$probe_dir/hardlink" >"$probe_dir/hardlink.out" 2>"$probe_dir/hardlink.err"; then
+    echo 'hard-linked review prompt was accepted' >&2
+    exit 1
+fi
+rg -q 'multiply linked' "$probe_dir/hardlink.err"
 
 printf 'PASS: Sol-High review-routing contract\n'

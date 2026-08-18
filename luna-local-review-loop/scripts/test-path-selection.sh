@@ -53,6 +53,19 @@ assert native["implementationWorker"] == {
 
 def select_path(case):
     """Derive the route/outcome from the pre-start and lifecycle inputs."""
+    if case["startup"] == "started":
+        if case["nativeLifecycle"] == "failed":
+            return "native", "failed-no-fallback"
+        if case["nativeLifecycle"] == "interrupted":
+            return "native", "interrupted"
+        if (
+            case["capabilityResult"] != "complete"
+            or case["configurationResult"] != "complete"
+        ):
+            return "native", "Evidence blocked"
+        if case["reviewerAvailability"] != "native-sol-high":
+            return "native", "Evidence blocked"
+        return "native", case["nativeLifecycle"]
     if case["fallbackState"] == "active":
         return "cli-fallback", "fallback-active-pinned"
     if case["fallbackState"] not in {"clear", "not-initialized"}:
@@ -64,11 +77,6 @@ def select_path(case):
         and case["reviewerAvailability"] == "native-sol-high"
     )
     if native_ready:
-        if case["startup"] == "started":
-            if case["nativeLifecycle"] == "failed":
-                return "native", "failed-no-fallback"
-            if case["nativeLifecycle"] == "interrupted":
-                return "native", "interrupted"
         return "native", case["nativeLifecycle"]
     if case["reviewerAvailability"] == "cli-sol-high":
         return "cli-fallback", "fallback"
@@ -110,6 +118,7 @@ rg -q 'native startup has begun and then fails' "$SKILL_ROOT/SKILL.md"
 rg -q 'CLI fallback only when the complete native capability set' "$SKILL_ROOT/SKILL.md"
 rg -q 'worker-result\.schema\.json' "$SKILL_ROOT/SKILL.md"
 rg -q 'Native work uses no project-local registry' "$SKILL_ROOT/README.md"
+rg -q 'Before closing a parent goal for a CLI-fallback run' "$SKILL_ROOT/README.md"
 rg -q 'run-review\.sh' "$SKILL_ROOT/README.md"
 
 printf 'PASS: native-first path-selection contract\n'

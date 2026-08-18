@@ -92,14 +92,14 @@ The prompt is read-only and must include the complete current contract, applicab
 - Prompt snapshot is immutable for first resume; sparse attempts never overwrite existing files.
 - Workers never daemonize, double-fork, start persistent services, stage, commit, push, review combined changes, or manage GitHub/CI.
 
-Before closing parent goal:
+Before closing a parent goal for a CLI-fallback run:
 
 ~~~sh
 ./luna-local-review-loop/scripts/registry.sh assert-no-active --repo /absolute/path/to/repository
 ./luna-local-review-loop/scripts/registry.sh assert-empty --repo /absolute/path/to/repository
 ~~~
 
-If cleanup cannot be proven, preserve active state and report blocker. Do not delete registry state or Codex history.
+Do not run these registry cleanup commands for a native run. If CLI-fallback cleanup cannot be proven, preserve active state and report the blocker. Never delete registry state or Codex history.
 
 ## Structured result
 

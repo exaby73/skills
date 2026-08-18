@@ -81,6 +81,50 @@
         "expectedOutcome": "failed-no-fallback"
       },
       {
+        "id": "native-post-start-configuration-failure",
+        "capabilityResult": "complete",
+        "configurationResult": "incomplete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "cli-sol-high",
+        "startup": "started",
+        "nativeLifecycle": "failed",
+        "expectedPath": "native",
+        "expectedOutcome": "failed-no-fallback"
+      },
+      {
+        "id": "native-post-start-configuration-unverified",
+        "capabilityResult": "complete",
+        "configurationResult": "incomplete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "native-sol-high",
+        "startup": "started",
+        "nativeLifecycle": "completed",
+        "expectedPath": "native",
+        "expectedOutcome": "Evidence blocked"
+      },
+      {
+        "id": "native-post-start-reviewer-unavailable",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "unavailable",
+        "startup": "started",
+        "nativeLifecycle": "completed",
+        "expectedPath": "native",
+        "expectedOutcome": "Evidence blocked"
+      },
+      {
+        "id": "native-post-start-reviewer-unverifiable",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "clear",
+        "reviewerAvailability": "unverifiable",
+        "startup": "started",
+        "nativeLifecycle": "completed",
+        "expectedPath": "native",
+        "expectedOutcome": "Evidence blocked"
+      },
+      {
         "id": "capability-incomplete",
         "capabilityResult": "incomplete",
         "configurationResult": "complete",
