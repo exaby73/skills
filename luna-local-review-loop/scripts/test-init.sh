@@ -52,7 +52,7 @@ readonly TEST_ROOT
 cleanup_test_root() {
 	local fixture_pid
 	local runner_pid
-	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}"; do
+	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}" "${reservation_race_runner_pid:-}"; do
 		[[ -n "$runner_pid" ]] || continue
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
@@ -1140,6 +1140,66 @@ for parent_claim_candidate in "$launch_pre_reservation_claim_root"/*; do
 done
 [[ -n "$parent_claim_path" ]] || fail 'parent-held claim was released after rejected retry reservation'
 bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" >/dev/null
+
+printf '%s\n' 'interrupt after reservation publication' >"$PROMPT_FILE"
+reservation_race_task_id='reservation-publication-interrupt-race'
+reservation_race_scope='preserve claim after committed reservation interrupt'
+reservation_race_bin="$TEST_ROOT/reservation-race-bin"
+reservation_race_mv="$reservation_race_bin/mv"
+reservation_race_published_marker="$TEST_ROOT/reservation-race-published"
+reservation_race_release_marker="$TEST_ROOT/reservation-race-release"
+reservation_race_real_mv="$(command -v mv)"
+mkdir -m 0700 "$reservation_race_bin"
+cat >"$reservation_race_mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${LUNA_TEST_RESERVE_GATE:-0}" == 1 && "$#" -eq 2 && "$1" == */.registry.* && "$2" == "${LUNA_TEST_REGISTRY_PATH:-}" ]]; then
+	"$LUNA_TEST_REAL_MV" "$@"
+	: >"$LUNA_TEST_RESERVE_PUBLISHED_MARKER"
+	while [[ ! -e "$LUNA_TEST_RESERVE_RELEASE_MARKER" ]]; do
+		sleep 0.01
+	done
+	exit 0
+fi
+exec "$LUNA_TEST_REAL_MV" "$@"
+EOF
+chmod 0700 "$reservation_race_mv"
+reservation_race_runner_pid=''
+LUNA_TEST_RESERVE_GATE=1 \
+LUNA_TEST_RESERVE_PUBLISHED_MARKER="$reservation_race_published_marker" \
+LUNA_TEST_RESERVE_RELEASE_MARKER="$reservation_race_release_marker" \
+LUNA_TEST_REGISTRY_PATH="$registry_path" \
+LUNA_TEST_REAL_MV="$reservation_race_real_mv" \
+PATH="$reservation_race_bin:$PATH" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$reservation_race_task_id" --scope "$reservation_race_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/reservation-race.out" 2>&1 &
+reservation_race_runner_pid=$!
+poll_attempt=0
+while [[ ! -e "$reservation_race_published_marker" ]] && process_is_live_non_zombie "$reservation_race_runner_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$reservation_race_published_marker" ]] || fail 'reservation race did not reach post-publication gate'
+jq -e --arg task_id "$reservation_race_task_id" --arg scope "$reservation_race_scope" 'any(.workers[]; .task_id == $task_id and .scope == $scope and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'reservation race did not publish exact live reservation before parent acknowledgement'
+kill -TERM "$reservation_race_runner_pid"
+: >"$reservation_race_release_marker"
+reservation_race_status=0
+wait "$reservation_race_runner_pid" || reservation_race_status=$?
+reservation_race_runner_pid=''
+[[ "$reservation_race_status" -ne 0 ]] || fail 'reservation publication interrupt unexpectedly succeeded'
+jq -e --arg task_id "$reservation_race_task_id" --arg scope "$reservation_race_scope" 'any(.workers[]; .task_id == $task_id and .scope == $scope and .status == "reserved")' "$registry_path" >/dev/null || fail 'reservation publication interrupt retired committed registry state'
+reservation_race_claim_present=0
+reservation_race_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+for reservation_race_candidate in "$reservation_race_claim_root"/*; do
+	[[ -f "$reservation_race_candidate" && ! -L "$reservation_race_candidate" ]] || continue
+	if rg -q "^token=task-$reservation_race_task_id$" "$reservation_race_candidate"; then
+		reservation_race_claim_present=1
+		break
+	fi
+done
+[[ "$reservation_race_claim_present" -eq 1 ]] || fail 'committed reservation interrupt released launcher cross-path claim'
+reservation_race_invocation_token="$(jq -er --arg task_id "$reservation_race_task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token' "$registry_path")"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$reservation_race_task_id" --status interrupted --evidence 'reservation publication interrupt claim-retention fixture complete' --invocation-token "$reservation_race_invocation_token" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$reservation_race_scope" --token "task-$reservation_race_task_id" >/dev/null
 
 printf '%s\n' 'blocked worker' >"$PROMPT_FILE"
 blocked_output="$(FAKE_BLOCKED_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id blocked-runner --scope 'blocked runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/blocked-runner.err")"

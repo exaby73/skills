@@ -675,6 +675,50 @@ command_reserve() {
 	printf 'Reserved task=%s\n' "$task_id"
 }
 
+# Internal locked read used by launch cleanup. It proves whether a reserve
+# outcome was rejected before allowing a launcher-acquired cross-path claim to
+# be released.
+command_reservation_status() {
+	local task_id=''
+	local scope=''
+	local token=''
+	while [[ $# -gt 0 ]]; do
+		if parse_common "$@"; then
+			shift "$PARSE_SHIFT"
+			continue
+		fi
+		case "$1" in
+		--task-id)
+			task_id="${2:-}"
+			shift 2
+			;;
+		--scope)
+			scope="${2:-}"
+			shift 2
+			;;
+		--token)
+			token="${2:-}"
+			shift 2
+			;;
+		*) die "$EXIT_USAGE" "unknown reservation-status argument: $1." ;;
+		esac
+	done
+	[[ -n "$task_id" && -n "$scope" && -n "$token" ]] || die "$EXIT_USAGE" 'reservation-status requires --task-id, --scope, and --token.'
+	validate_task_id 'task-id' "$task_id"
+	validate_scope "$scope"
+	validate_identity 'invocation-token' "$token"
+	resolve_registry
+	acquire_lock
+	if jq -e --arg task_id "$task_id" --arg scope "$scope" --arg token "$token" 'any(.workers[]; .task_id == $task_id and .scope == $scope and .invocation_token == $token)' "$REGISTRY_PATH" >/dev/null; then
+		printf 'committed\n'
+		return 0
+	fi
+	if jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id) or any(.identity_ledger[]; .task_id == $task_id and (.status == "reserved" or .status == "bound" or .status == "active"))' "$REGISTRY_PATH" >/dev/null; then
+		die "$EXIT_CONFLICT" "reservation status is ambiguous for task $task_id; preserve registry state and cross-path claim for explicit recovery."
+	fi
+	printf 'not-committed\n'
+}
+
 command_bind() {
 	local task_id=''
 	local session_id=''
@@ -1091,6 +1135,7 @@ claim-invocation) command_claim_invocation "$@" ;;
 release-invocation) command_release_invocation "$@" ;;
 record-child | clear-child) command_child_registration "$command" "$@" ;;
 complete-and-retire) command_complete_and_retire "$@" ;;
+reservation-status) command_reservation_status "$@" ;;
 query | active | assert-no-active | assert-empty) parse_read_args "$command" "$@" ;;
 *) die "$EXIT_USAGE" "unknown command: $command. Use --help for usage." ;;
 esac
