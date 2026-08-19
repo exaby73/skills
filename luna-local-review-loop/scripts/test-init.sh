@@ -1083,9 +1083,9 @@ failed_runner_artifact_dir="$registry_dir/artifacts/failed-runner"
 retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id failed-runner-retry --scope 'runner retry scope' --retry-of failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/retry.err")"
 jq -e '.outcome == "completed"' <<<"$retry_output" >/dev/null || fail 'runner retry did not complete'
 
-printf '%s\n' 'retain claim when launch fails before reservation' >"$PROMPT_FILE"
+printf '%s\n' 'reject launch before claim publication' >"$PROMPT_FILE"
 launch_pre_reservation_task_id='launch-pre-reservation-claim'
-launch_pre_reservation_scope='retain claim when launch fails before reservation'
+launch_pre_reservation_scope='reject launch before claim publication'
 launch_pre_reservation_artifacts_backup="$TEST_ROOT/launch-pre-reservation-artifacts"
 mv "$registry_dir/artifacts" "$launch_pre_reservation_artifacts_backup"
 ln -s "$launch_pre_reservation_artifacts_backup" "$registry_dir/artifacts"
@@ -1103,8 +1103,43 @@ for launch_pre_reservation_candidate in "$launch_pre_reservation_claim_root"/*; 
 		break
 	fi
 done
-[[ -n "$launch_pre_reservation_claim_path" && -f "$launch_pre_reservation_claim_path" && ! -L "$launch_pre_reservation_claim_path" ]] || fail 'pre-reservation launch cleanup released stable task claim'
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$launch_pre_reservation_scope" --token "task-$launch_pre_reservation_task_id" >/dev/null
+[[ -z "$launch_pre_reservation_claim_path" ]] || fail 'preflight rejection published a stable task claim'
+jq -e --arg task_id "$launch_pre_reservation_task_id" 'all(.workers[]; .task_id != $task_id) and all(.identity_ledger[]; .task_id != $task_id)' "$registry_path" >/dev/null || fail 'preflight rejection reserved fallback registry state'
+
+invalid_retry_scope='release launcher-created claim after invalid retry sandbox'
+invalid_retry_parent='invalid-retry-sandbox-parent'
+invalid_retry_task='invalid-retry-sandbox-child'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$invalid_retry_parent" --scope "$invalid_retry_scope" --sandbox read-only >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$invalid_retry_parent" --status failed --evidence 'invalid sandbox retry fixture parent' >/dev/null
+invalid_retry_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$invalid_retry_task" --scope "$invalid_retry_scope" --retry-of "$invalid_retry_parent" --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/invalid-retry-sandbox.out" 2>&1 || invalid_retry_status=$?
+[[ "$invalid_retry_status" -eq 6 ]] || fail "invalid explicit retry sandbox returned $invalid_retry_status instead of conflict"
+jq -e --arg task_id "$invalid_retry_task" 'all(.workers[]; .task_id != $task_id) and all(.identity_ledger[]; .task_id != $task_id)' "$registry_path" >/dev/null || fail 'invalid explicit retry sandbox reserved registry state'
+for invalid_retry_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$invalid_retry_candidate" && ! -L "$invalid_retry_candidate" ]] || continue
+	if rg -q "^token=task-$invalid_retry_task$" "$invalid_retry_candidate"; then
+		fail 'launcher-created claim survived rejected retry reservation'
+	fi
+done
+
+parent_claim_scope='preserve parent-held claim after invalid retry sandbox'
+parent_claim_task='parent-held-invalid-retry-sandbox'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$parent_claim_task-parent" --scope "$parent_claim_scope" --sandbox read-only >/dev/null
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$parent_claim_task-parent" --status failed --evidence 'parent-held claim fixture parent' >/dev/null
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" >/dev/null
+parent_claim_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$parent_claim_task" --scope "$parent_claim_scope" --retry-of "$parent_claim_task-parent" --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/parent-held-invalid-retry-sandbox.out" 2>&1 || parent_claim_status=$?
+[[ "$parent_claim_status" -eq 6 ]] || fail "parent-held invalid retry sandbox returned $parent_claim_status instead of conflict"
+parent_claim_path=''
+for parent_claim_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$parent_claim_candidate" && ! -L "$parent_claim_candidate" ]] || continue
+	if rg -q "^token=task-$parent_claim_task$" "$parent_claim_candidate"; then
+		parent_claim_path="$parent_claim_candidate"
+		break
+	fi
+done
+[[ -n "$parent_claim_path" ]] || fail 'parent-held claim was released after rejected retry reservation'
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" >/dev/null
 
 printf '%s\n' 'blocked worker' >"$PROMPT_FILE"
 blocked_output="$(FAKE_BLOCKED_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id blocked-runner --scope 'blocked runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/blocked-runner.err")"

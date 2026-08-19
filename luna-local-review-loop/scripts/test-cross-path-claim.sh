@@ -397,6 +397,40 @@ bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token token-
 	exit 1
 }
 
+linked_main="$TEST_ROOT/linked-main"
+linked_worktree="$TEST_ROOT/linked-worktree"
+linked_copy="$TEST_ROOT/linked-worktree-copy"
+mkdir -m 0700 "$linked_main"
+git init -q "$linked_main"
+git -C "$linked_main" config user.email test@example.com
+git -C "$linked_main" config user.name test
+printf '%s\n' linked >"$linked_main/file"
+git -C "$linked_main" add file
+git -C "$linked_main" commit -qm 'linked worktree fixture'
+git -C "$linked_main" worktree add -q "$linked_worktree" -b linked-claim-test
+cp -R "$linked_worktree" "$linked_copy"
+linked_copy_status=0
+bash "$CLAIM_SCRIPT" acquire --repo "$linked_copy" --scope 'reject copied linked-worktree administration backlink' --token linked-copy >"$TEST_ROOT/linked-copy.out" 2>"$TEST_ROOT/linked-copy.err" || linked_copy_status=$?
+[[ "$linked_copy_status" -eq 10 ]] || {
+	printf 'copied linked worktree backlink returned status %s instead of filesystem rejection\n' "$linked_copy_status" >&2
+	sed -n '1,40p' "$TEST_ROOT/linked-copy.err" >&2 || true
+	exit 1
+}
+linked_admin="$(git -C "$linked_worktree" rev-parse --absolute-git-dir)"
+[[ ! -e "$linked_admin/.luna-checkout-identity" && ! -L "$linked_admin/.luna-checkout-identity" ]] || {
+	echo 'copied linked worktree rejection created a checkout seal' >&2
+	exit 1
+}
+linked_claim_root="$(git -C "$linked_worktree" rev-parse --git-common-dir)"
+case "$linked_claim_root" in /*) ;; *) linked_claim_root="$linked_worktree/$linked_claim_root" ;; esac
+linked_claim_root="$(cd -P "$linked_claim_root" && pwd -P)/.luna-cross-path-claims"
+[[ ! -e "$linked_claim_root" && ! -L "$linked_claim_root" ]] || {
+	echo 'copied linked worktree rejection created cross-path claim coordination state' >&2
+	exit 1
+}
+bash "$CLAIM_SCRIPT" acquire --repo "$linked_worktree" --scope 'accept valid linked-worktree administration backlink' --token linked-owner >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$linked_worktree" --scope 'accept valid linked-worktree administration backlink' --token linked-owner >/dev/null
+
 seal_race_repo="$TEST_ROOT/shared-seal-race-repository"
 seal_race_scope_a='shared seal cleanup scope A'
 seal_race_scope_b='shared seal cleanup scope B'

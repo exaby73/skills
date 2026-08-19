@@ -89,7 +89,12 @@ fi
 probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/luna-review-routing.XXXXXX")"
 trap 'rm -rf -- "$probe_dir"' EXIT
 printf 'review prompt\n' >"$probe_dir/prompt"
-regular_output="$(CODEX_BIN=/bin/echo "$review_script" --repo "$SKILL_ROOT/.." --prompt-file "$probe_dir/prompt")"
+review_repo="$(git -C "$SKILL_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$review_repo" || (! -d "$review_repo/.git" && ! -f "$review_repo/.git") ]]; then
+	review_repo="$probe_dir/review-repo"
+	git init -q "$review_repo"
+fi
+regular_output="$(CODEX_BIN=/bin/echo "$review_script" --repo "$review_repo" --prompt-file "$probe_dir/prompt")"
 rg -q -- '-s read-only' <<<"$regular_output"
 
 cat >"$probe_dir/codex-snapshot" <<'EOF'
@@ -108,7 +113,7 @@ snapshot_invocation_marker="$probe_dir/snapshot-invoked"
 snapshot_release_gate="$probe_dir/snapshot-release"
 LUNA_TEST_REVIEW_INVOCATION_MARKER="$snapshot_invocation_marker" \
 LUNA_TEST_REVIEW_RELEASE_GATE="$snapshot_release_gate" \
-TMPDIR="$probe_dir/tmp" CODEX_BIN="$probe_dir/codex-snapshot" "$review_script" --repo "$SKILL_ROOT/.." --prompt-file "$probe_dir/snapshot-prompt" >"$probe_dir/snapshot.out" &
+TMPDIR="$probe_dir/tmp" CODEX_BIN="$probe_dir/codex-snapshot" "$review_script" --repo "$review_repo" --prompt-file "$probe_dir/snapshot-prompt" >"$probe_dir/snapshot.out" &
 snapshot_pid=$!
 snapshot_wait_attempt=0
 while [[ ! -e "$snapshot_invocation_marker" && "$snapshot_wait_attempt" -lt 1000 ]]; do
@@ -142,7 +147,7 @@ exit 37
 EOF
 chmod 700 "$probe_dir/codex-fail"
 set +e
-TMPDIR="$probe_dir/tmp" CODEX_BIN="$probe_dir/codex-fail" "$review_script" --repo "$SKILL_ROOT/.." --prompt-file "$probe_dir/snapshot-prompt" >"$probe_dir/failure.out" 2>"$probe_dir/failure.err"
+TMPDIR="$probe_dir/tmp" CODEX_BIN="$probe_dir/codex-fail" "$review_script" --repo "$review_repo" --prompt-file "$probe_dir/snapshot-prompt" >"$probe_dir/failure.out" 2>"$probe_dir/failure.err"
 failure_status=$?
 set -e
 if [[ "$failure_status" -ne 37 ]]; then
@@ -155,7 +160,7 @@ if [[ -n "$(find "$probe_dir/tmp" -mindepth 1 -maxdepth 1 -name 'luna-review.*' 
 fi
 
 ln "$probe_dir/prompt" "$probe_dir/hardlink"
-if CODEX_BIN=/bin/echo "$review_script" --repo "$SKILL_ROOT/.." --prompt-file "$probe_dir/hardlink" >"$probe_dir/hardlink.out" 2>"$probe_dir/hardlink.err"; then
+if CODEX_BIN=/bin/echo "$review_script" --repo "$review_repo" --prompt-file "$probe_dir/hardlink" >"$probe_dir/hardlink.out" 2>"$probe_dir/hardlink.err"; then
     echo 'hard-linked review prompt was accepted' >&2
     exit 1
 fi
