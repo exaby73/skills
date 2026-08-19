@@ -266,7 +266,7 @@ acquire_cross_path_claim() {
 	prepare_cross_path_token
 	local claim_status=0
 	local claim_output=''
-	local claim_args=(acquire --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN")
+	local claim_args=(acquire --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" --pid "$$")
 	case "$mode" in
 	initial)
 		# A parent may already hold the documented fallback claim. Re-enter that
@@ -302,7 +302,7 @@ acquire_cross_path_claim() {
 
 release_cross_path_claim() {
 	if [[ "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
-		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" >/dev/null || return 1
+		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" --pid "$$" >/dev/null || return 1
 		CROSS_PATH_CLAIMED=0
 		CROSS_PATH_CLAIM_ACQUIRED=0
 		CROSS_PATH_CLAIM_REENTERED=0
