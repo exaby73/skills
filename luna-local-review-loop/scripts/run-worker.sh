@@ -229,7 +229,9 @@ finish_on_error() {
 		fi
 	fi
 	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
-		if [[ "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
+		if [[ "$MODE" == launch && "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 0 ]]; then
+			release_claim_owned_by_launcher=1
+		elif [[ "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
 			reservation_probe_status=0
 			reservation_outcome_is_rejected || reservation_probe_status=$?
 			case "$reservation_probe_status" in
@@ -264,17 +266,17 @@ acquire_cross_path_claim() {
 	prepare_cross_path_token
 	local claim_status=0
 	local claim_output=''
-	local claim_args=(acquire --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN")
+	local claim_args=(acquire --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" --pid "$$")
 	case "$mode" in
 	initial)
 		# A parent may already hold the documented fallback claim. Re-enter that
 		# exact stable task token; otherwise acquire the claim atomically here.
 		claim_args+=(--reenter-or-acquire --fallback-preflight)
 		;;
-	recover) ;;
+	recover) claim_args+=(--preserve-owner-pid) ;;
 	reenter) claim_args+=(--reenter) ;;
 	legacy)
-		claim_args+=(--reenter-or-acquire --fallback-preflight)
+		claim_args+=(--reenter-or-acquire --fallback-preflight --preserve-owner-pid)
 		;;
 	*) die "$EXIT_USAGE" "unknown cross-path claim acquisition mode: $mode." ;;
 	esac
@@ -298,9 +300,15 @@ acquire_cross_path_claim() {
 	CROSS_PATH_CLAIMED=1
 }
 
+handoff_cross_path_claim() {
+	# Continuation/recovery must win registry invocation ownership before its
+	# process can become the claim's release authority.
+	acquire_cross_path_claim reenter
+}
+
 release_cross_path_claim() {
 	if [[ "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
-		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" >/dev/null || return 1
+		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" --pid "$$" >/dev/null || return 1
 		CROSS_PATH_CLAIMED=0
 		CROSS_PATH_CLAIM_ACQUIRED=0
 		CROSS_PATH_CLAIM_REENTERED=0
@@ -1225,6 +1233,7 @@ continue_worker() {
 	# rejects a competing owner before this process can claim the registry task.
 	acquire_cross_path_claim legacy
 	claim_invocation
+	handoff_cross_path_claim
 	resume_task "$artifact_dir" "$PROMPT_FILE"
 }
 
@@ -1237,6 +1246,7 @@ finish_worker() {
 	trap finish_on_error EXIT
 	acquire_cross_path_claim recover
 	claim_invocation
+	handoff_cross_path_claim
 	run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status "$FINISH_STATUS" --evidence "$FINISH_EVIDENCE" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 	REGISTRY_TASK_RETIRED_BY_RUN=1
 	INVOCATION_CLAIMED=0

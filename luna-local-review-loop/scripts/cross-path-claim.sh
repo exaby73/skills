@@ -17,9 +17,11 @@ readonly SCRIPT_DIR
 REPO_INPUT='.'
 SCOPE=''
 TOKEN=''
+REQUESTED_PID=''
 REENTER=0
 REENTER_OR_ACQUIRE=0
 FALLBACK_PREFLIGHT=0
+PRESERVE_OWNER_PID=0
 CLAIM_ROOT=''
 CLAIM_PATH=''
 CLAIM_KEY=''
@@ -40,11 +42,11 @@ usage() {
 	local exit_code="${1:-0}"
 	cat <<'EOF'
 Usage:
-  cross-path-claim.sh acquire --repo PATH --scope TEXT --token TOKEN
-  cross-path-claim.sh acquire --reenter --repo PATH --scope TEXT --token TOKEN
-  cross-path-claim.sh acquire --reenter-or-acquire --repo PATH --scope TEXT --token TOKEN
-  cross-path-claim.sh acquire --fallback-preflight --repo PATH --scope TEXT --token TOKEN
-  cross-path-claim.sh release --repo PATH --scope TEXT --token TOKEN
+  cross-path-claim.sh acquire --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
+  cross-path-claim.sh acquire --reenter --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
+  cross-path-claim.sh acquire --reenter-or-acquire --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
+  cross-path-claim.sh acquire --fallback-preflight --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
+  cross-path-claim.sh release --repo PATH --scope TEXT --token TOKEN [--pid PID]
 
 The claim is shared by native startup and the CLI fallback reservation. It is
 keyed by physical checkout identity plus immutable scope and is separate from
@@ -57,6 +59,9 @@ matches, including legacy fallback continuation after its active registry row
 has been validated. Acquire and release serialize through a short-lived
 private lock. Fallback preflight runs under that lock before checkout-seal
 creation and claim publication.
+When --preserve-owner-pid is supplied, same-owner re-entry validates the claim
+without handing off its release PID; the caller must win its registry-side
+ownership step before re-entering again to hand off release authority.
 EOF
 	exit "$exit_code"
 }
@@ -642,9 +647,10 @@ acquire_claim_lock() {
 
 write_owner() {
 	local owner_tmp=''
+	local owner_pid="${REQUESTED_PID:-$$}"
 	owner_tmp="$(mktemp "$CLAIM_ROOT/.claim.XXXXXX")" || return 1
 	if ! printf 'version=1\nidentity=%s\nscope=%s\ntoken=%s\npid=%s\n' \
-		"$CHECKOUT_IDENTITY" "$CLAIM_KEY" "$TOKEN" "$$" >"$owner_tmp"; then
+		"$CHECKOUT_IDENTITY" "$CLAIM_KEY" "$TOKEN" "$owner_pid" >"$owner_tmp"; then
 		rm -f "$owner_tmp"
 		return 1
 	fi
@@ -664,6 +670,30 @@ write_owner() {
 		rm -f "$CLAIM_PATH" "$owner_tmp"
 		return 1
 	fi
+}
+
+refresh_owner_pid() {
+	local owner_tmp=''
+	local owner_pid="${REQUESTED_PID:-$$}"
+	owner_tmp="$(mktemp "$CLAIM_ROOT/.claim.XXXXXX")" || return 1
+	if ! printf 'version=1\nidentity=%s\nscope=%s\ntoken=%s\npid=%s\n' \
+		"$CHECKOUT_IDENTITY" "$CLAIM_KEY" "$TOKEN" "$owner_pid" >"$owner_tmp"; then
+		rm -f "$owner_tmp"
+		return 1
+	fi
+	if ! chmod 0600 "$owner_tmp" || ! private_file_is_valid "$owner_tmp" || ! owner_metadata_shape_is_valid "$owner_tmp"; then
+		rm -f "$owner_tmp"
+		return 1
+	fi
+	if ! [[ -f "$CLAIM_PATH" && ! -L "$CLAIM_PATH" ]] || ! claim_owner_matches; then
+		rm -f "$owner_tmp"
+		return 1
+	fi
+	if ! mv "$owner_tmp" "$CLAIM_PATH"; then
+		rm -f "$owner_tmp"
+		return 1
+	fi
+	private_file_is_valid "$CLAIM_PATH" && owner_metadata_shape_is_valid "$CLAIM_PATH"
 }
 
 read_owner_field() {
@@ -698,10 +728,13 @@ acquire_claim() {
 			die "$EXIT_FILESYSTEM" "cross-path claim path is not a real regular file: $CLAIM_PATH."
 		fi
 		if [[ -f "$CLAIM_PATH" ]] && claim_owner_matches; then
-			printf 'Re-entered cross-path claim=%s\n' "$CLAIM_KEY"
 			if [[ "$FALLBACK_PREFLIGHT" -eq 1 ]]; then
 				finish_fallback_preflight
 			fi
+			if [[ "$PRESERVE_OWNER_PID" -eq 0 ]]; then
+				refresh_owner_pid || die "$EXIT_FILESYSTEM" 'cannot hand off cross-path claim ownership after re-entry.'
+			fi
+			printf 'Re-entered cross-path claim=%s\n' "$CLAIM_KEY"
 			release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after re-entry.'
 			return 0
 		fi
@@ -739,6 +772,7 @@ release_claim() {
 	local stored_identity
 	local stored_scope
 	local stored_token
+	local stored_pid
 	resolve_claim
 	acquire_claim_lock
 	[[ -e "$GIT_DIR_REAL/.luna-checkout-identity" || -L "$GIT_DIR_REAL/.luna-checkout-identity" ]] || die "$EXIT_FILESYSTEM" 'Git checkout identity seal is missing; refusing to release a claim.'
@@ -753,8 +787,10 @@ release_claim() {
 	stored_identity="$(read_owner_field identity)" || die "$EXIT_CONFLICT" 'cross-path claim owner identity is missing; refusing to guess ownership.'
 	stored_scope="$(read_owner_field scope)" || die "$EXIT_CONFLICT" 'cross-path claim owner scope is missing; refusing to guess ownership.'
 	stored_token="$(read_owner_field token)" || die "$EXIT_CONFLICT" 'cross-path claim owner token is missing; refusing to guess ownership.'
+	stored_pid="$(read_owner_field pid)" || die "$EXIT_CONFLICT" 'cross-path claim owner PID is missing; refusing to guess ownership.'
 	[[ "$stored_version" == 1 && "$stored_identity" == "$CHECKOUT_IDENTITY" && "$stored_scope" == "$CLAIM_KEY" ]] || die "$EXIT_CONFLICT" 'cross-path claim owner metadata does not match this checkout and scope.'
 	[[ "$stored_token" == "$TOKEN" ]] || die "$EXIT_CONFLICT" 'cross-path claim token does not match its owner.'
+	[[ -z "$REQUESTED_PID" || "$stored_pid" == "$REQUESTED_PID" ]] || die "$EXIT_CONFLICT" 'cross-path claim owner PID changed; preserving the current owner.'
 	rm "$CLAIM_PATH" || die "$EXIT_FILESYSTEM" 'cannot remove cross-path claim file.'
 	release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after claim removal.'
 	printf 'Released cross-path claim=%s\n' "$CLAIM_KEY"
@@ -779,6 +815,15 @@ while [[ $# -gt 0 ]]; do
 		[[ $# -ge 2 ]] || die "$EXIT_USAGE" 'missing token.'
 		TOKEN="$2"
 		shift 2
+		;;
+	--pid)
+		[[ $# -ge 2 ]] || die "$EXIT_USAGE" 'missing value for --pid.'
+		REQUESTED_PID="$2"
+		shift 2
+		;;
+	--preserve-owner-pid)
+		PRESERVE_OWNER_PID=1
+		shift
 		;;
 		--reenter)
 			REENTER=1
@@ -806,8 +851,14 @@ release)
 esac
 [[ "$REENTER" -eq 0 || "$REENTER_OR_ACQUIRE" -eq 0 ]] || die "$EXIT_USAGE" '--reenter and --reenter-or-acquire cannot be combined.'
 [[ "$FALLBACK_PREFLIGHT" -eq 0 || "$MODE" == acquire ]] || die "$EXIT_USAGE" '--fallback-preflight is only valid with acquire.'
+[[ "$PRESERVE_OWNER_PID" -eq 0 || "$MODE" == acquire ]] || die "$EXIT_USAGE" '--preserve-owner-pid is only valid with acquire.'
 validate_scope
 validate_token
+if [[ -n "$REQUESTED_PID" ]]; then
+	case "$REQUESTED_PID" in
+	'' | 0 | *[!0-9]*) die "$EXIT_USAGE" '--pid must be a positive numeric process ID.' ;;
+	esac
+fi
 case "$MODE" in
 acquire) acquire_claim ;;
 release) release_claim ;;
