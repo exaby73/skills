@@ -7,6 +7,8 @@ readonly SCRIPT_DIR
 readonly INIT_SCRIPT="$SCRIPT_DIR/init.sh"
 readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
 readonly RUNNER_SCRIPT="$SCRIPT_DIR/run-worker.sh"
+readonly CLAIM_SCRIPT="$SCRIPT_DIR/cross-path-claim.sh"
+readonly WORKER_BOUNDARY_INSTRUCTION='You are the sole worker for this immutable task. Perform the owned scope directly; never spawn, delegate to, or hand work to another subagent.'
 
 fail() {
 	printf 'FAIL: %s\n' "$*" >&2
@@ -19,6 +21,15 @@ file_mode() {
 		return 0
 	fi
 	stat -f '%Lp' "$path"
+}
+
+file_sha256() {
+	local path="$1"
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$path" | awk '{print $1}'
+		return 0
+	fi
+	sha256sum "$path" | awk '{print $1}'
 }
 
 process_is_live_non_zombie() {
@@ -46,7 +57,7 @@ cleanup_test_root() {
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
 	done
-	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}"; do
+	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}"; do
 		[[ -n "$fixture_pid" ]] || continue
 		kill -TERM "$fixture_pid" 2>/dev/null || true
 		wait "$fixture_pid" 2>/dev/null || true
@@ -92,6 +103,7 @@ readonly CODEX_FAST_REPARENT_PID_FILE="$TEST_ROOT/codex-fast-reparent.pid"
 readonly CODEX_PROMPT_CAPTURE="$TEST_ROOT/codex-prompt-capture"
 readonly PROMPT_RACE_MARKER="$TEST_ROOT/prompt-race-handshake"
 readonly PROMPT_RACE_RELEASE="$TEST_ROOT/prompt-race-release"
+readonly PROMPT_RACE_MARKER_WAIT_ATTEMPTS=1000
 readonly TRACKER_PS_COUNT_FILE="$TEST_ROOT/tracker-ps-count"
 readonly TRACKER_HANDSHAKE_COMPLETED_MARKER="$TEST_ROOT/tracker-handshake-completed"
 readonly TRACKER_LEASE_WRITER_READY_MARKER="$TEST_ROOT/tracker-lease-writer-ready"
@@ -412,6 +424,68 @@ for v2_invalid_case in malformed unsafe; do
 	expect_normal_init_failure "$v2_invalid_repo" "$TEST_ROOT/v2-$v2_invalid_case.out"
 	[[ "$(cat "$v2_invalid_path")" == "$v2_invalid_before" ]] || fail "$v2_invalid_case schema-v2 state changed before safe migration rejection"
 	[[ ! -e "$v2_invalid_seal" && ! -L "$v2_invalid_seal" ]] || fail "$v2_invalid_case schema-v2 rejection created checkout seal"
+	if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$v2_invalid_repo" --task-id "fallback-v2-$v2_invalid_case" --scope "reject unsafe schema-v2 fallback preflight: $v2_invalid_case" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/fallback-v2-$v2_invalid_case.out" 2>&1; then
+		fail "$v2_invalid_case schema-v2 fallback preflight unexpectedly started"
+	fi
+	[[ "$(cat "$v2_invalid_path")" == "$v2_invalid_before" ]] || fail "$v2_invalid_case fallback preflight changed registry bytes"
+	[[ ! -e "$v2_invalid_seal" && ! -L "$v2_invalid_seal" ]] || fail "$v2_invalid_case fallback preflight created checkout seal"
+done
+
+for fallback_ignore_case in symlink wrong-mode malformed root-negation; do
+	fallback_ignore_repo="$TEST_ROOT/fallback-ignore-$fallback_ignore_case-repo"
+	make_test_repo "$fallback_ignore_repo"
+	fallback_ignore_path="$("$INIT_SCRIPT" --repo "$fallback_ignore_repo" --print-path)"
+	fallback_ignore_dir="$(dirname "$fallback_ignore_path")"
+	fallback_ignore_file="$fallback_ignore_dir/.gitignore"
+	fallback_ignore_git_dir="$(git -C "$fallback_ignore_repo" rev-parse --absolute-git-dir)"
+	fallback_ignore_seal="$fallback_ignore_git_dir/.luna-checkout-identity"
+	jq '.schema_version = 2 | del(.repository_checkout_identity)' "$fallback_ignore_path" >"$fallback_ignore_path.tmp"
+	mv "$fallback_ignore_path.tmp" "$fallback_ignore_path"
+	chmod 0600 "$fallback_ignore_path"
+	case "$fallback_ignore_case" in
+	symlink)
+		fallback_ignore_target="$TEST_ROOT/fallback-ignore-symlink-target"
+		printf '%s\n' preserve >"$fallback_ignore_target"
+		rm "$fallback_ignore_file"
+		ln -s "$fallback_ignore_target" "$fallback_ignore_file"
+		;;
+	wrong-mode)
+		chmod 0644 "$fallback_ignore_file"
+		;;
+	malformed)
+		printf '%s\n' invalid-private-rule >"$fallback_ignore_file"
+		chmod 0600 "$fallback_ignore_file"
+		;;
+	root-negation)
+		printf '%s\n' '.agents/agent-registry/' '!.agents/agent-registry/registry.json' >"$fallback_ignore_repo/.gitignore"
+		;;
+	esac
+	rm "$fallback_ignore_seal"
+	fallback_ignore_registry_before="$TEST_ROOT/fallback-ignore-$fallback_ignore_case-registry.before"
+	fallback_ignore_root_before="$TEST_ROOT/fallback-ignore-$fallback_ignore_case-root.before"
+	cp "$fallback_ignore_path" "$fallback_ignore_registry_before"
+	cp "$fallback_ignore_repo/.gitignore" "$fallback_ignore_root_before"
+	if [[ "$fallback_ignore_case" == symlink ]]; then
+		fallback_ignore_private_before='symlink'
+	else
+		fallback_ignore_private_before="$TEST_ROOT/fallback-ignore-$fallback_ignore_case-private.before"
+		cp "$fallback_ignore_file" "$fallback_ignore_private_before"
+	fi
+	fallback_ignore_status=0
+	CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$fallback_ignore_repo" --task-id "fallback-ignore-$fallback_ignore_case" --scope "reject unsafe fallback ignore state: $fallback_ignore_case" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/fallback-ignore-$fallback_ignore_case.out" 2>&1 || fallback_ignore_status=$?
+	[[ "$fallback_ignore_status" -ne 0 ]] || fail "unsafe fallback ignore state unexpectedly started: $fallback_ignore_case"
+	cmp -s "$fallback_ignore_registry_before" "$fallback_ignore_path" || fail "fallback ignore rejection changed registry bytes: $fallback_ignore_case"
+	cmp -s "$fallback_ignore_root_before" "$fallback_ignore_repo/.gitignore" || fail "fallback ignore rejection changed root ignore bytes: $fallback_ignore_case"
+	[[ ! -e "$fallback_ignore_seal" && ! -L "$fallback_ignore_seal" ]] || fail "fallback ignore rejection created checkout seal: $fallback_ignore_case"
+	case "$fallback_ignore_case" in
+	symlink)
+		[[ -L "$fallback_ignore_file" ]] || fail 'fallback symlink ignore was replaced'
+		[[ "$(cat "$fallback_ignore_target")" == preserve ]] || fail 'fallback symlink ignore target changed'
+		;;
+	*)
+		cmp -s "$fallback_ignore_private_before" "$fallback_ignore_file" || fail "fallback private ignore bytes changed: $fallback_ignore_case"
+		;;
+	esac
 done
 
 v2_history_repo="$TEST_ROOT/v2-history-repo"
@@ -639,10 +713,26 @@ jq -e '.repository_checkout_identity | test("^gitdir:[0-9]+:[0-9]+:seal:[0-9a-f]
 jq -e 'any(.identity_ledger[]; .task_id == "retired-history" and .terminal_evidence == "historical completion")' "$preseal_path" >/dev/null || fail 'pre-seal migration discarded retired identity history'
 jq -e '.updated_at != "2020-01-01T00:00:00Z" and .preserved_state == {ledger:"keep",number:7}' "$preseal_path" >/dev/null || fail 'checkout seal migration did not atomically update timestamp while preserving registry state'
 
+sealed_legacy_checkout_identity="$(jq -r '.repository_checkout_identity' "$preseal_path" | sed -E 's/:seal-file:[0-9]+:[0-9]+$//')"
+[[ "$sealed_legacy_checkout_identity" =~ ^gitdir:[0-9]+:[0-9]+:seal:[0-9a-f]{64}$ ]] || fail 'sealed legacy fixture did not omit only seal-file identity component'
+jq --arg checkout "$sealed_legacy_checkout_identity" '.repository_checkout_identity = $checkout' "$preseal_path" >"$preseal_path.tmp"
+mv "$preseal_path.tmp" "$preseal_path"
+sealed_legacy_before_file="$TEST_ROOT/sealed-legacy-before.json"
+cp "$preseal_path" "$sealed_legacy_before_file"
+sealed_legacy_registry_sha_before="$(file_sha256 "$preseal_path")"
+sealed_legacy_seal_sha_before="$(file_sha256 "$preseal_seal")"
+"$REGISTRY_SCRIPT" preflight --repo "$preseal_repo" >/dev/null || fail 'valid sealed legacy schema-v3 registry failed read-only preflight'
+sealed_legacy_registry_sha_after="$(file_sha256 "$preseal_path")"
+sealed_legacy_seal_sha_after="$(file_sha256 "$preseal_seal")"
+[[ "$sealed_legacy_registry_sha_after" == "$sealed_legacy_registry_sha_before" ]] || fail 'sealed legacy schema-v3 preflight changed registry SHA-256'
+cmp -s "$sealed_legacy_before_file" "$preseal_path" || fail 'sealed legacy schema-v3 preflight changed registry bytes'
+[[ "$sealed_legacy_seal_sha_after" == "$sealed_legacy_seal_sha_before" ]] || fail 'sealed legacy schema-v3 preflight changed checkout seal'
+
 preseal_live_repo="$TEST_ROOT/preseal-live-repo"
 make_test_repo "$preseal_live_repo"
 preseal_live_path="$("$INIT_SCRIPT" --repo "$preseal_live_repo" --print-path)"
 preseal_live_git_dir="$(git -C "$preseal_live_repo" rev-parse --absolute-git-dir)"
+preseal_live_seal="$preseal_live_git_dir/.luna-checkout-identity"
 preseal_live_identity="$(stat -c '%d:%i' "$preseal_live_git_dir" 2>/dev/null || stat -f '%d:%i' "$preseal_live_git_dir")"
 jq --arg checkout "gitdir:$preseal_live_identity" '
   .repository_checkout_identity = $checkout
@@ -681,9 +771,15 @@ jq --arg checkout "gitdir:$preseal_live_identity" '
     }]
 ' "$preseal_live_path" >"$preseal_live_path.tmp"
 mv "$preseal_live_path.tmp" "$preseal_live_path"
+rm "$preseal_live_seal"
 preseal_live_before="$(cat "$preseal_live_path")"
 expect_init_failure "$preseal_live_repo" "$TEST_ROOT/preseal-live.out"
 [[ "$(cat "$preseal_live_path")" == "$preseal_live_before" ]] || fail 'live pre-seal registry changed during refused migration'
+if CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$preseal_live_repo" --task-id fallback-preseal-live --scope 'reject live pre-seal fallback preflight' --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/fallback-preseal-live.out" 2>&1; then
+	fail 'live pre-seal fallback preflight unexpectedly started'
+fi
+[[ "$(cat "$preseal_live_path")" == "$preseal_live_before" ]] || fail 'live pre-seal fallback preflight changed registry bytes'
+[[ ! -e "$preseal_live_seal" && ! -L "$preseal_live_seal" ]] || fail 'live pre-seal fallback preflight created checkout seal'
 
 preseal_unproven_repo="$TEST_ROOT/preseal-unproven-repo"
 make_test_repo "$preseal_unproven_repo"
@@ -987,6 +1083,29 @@ failed_runner_artifact_dir="$registry_dir/artifacts/failed-runner"
 retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id failed-runner-retry --scope 'runner retry scope' --retry-of failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/retry.err")"
 jq -e '.outcome == "completed"' <<<"$retry_output" >/dev/null || fail 'runner retry did not complete'
 
+printf '%s\n' 'retain claim when launch fails before reservation' >"$PROMPT_FILE"
+launch_pre_reservation_task_id='launch-pre-reservation-claim'
+launch_pre_reservation_scope='retain claim when launch fails before reservation'
+launch_pre_reservation_artifacts_backup="$TEST_ROOT/launch-pre-reservation-artifacts"
+mv "$registry_dir/artifacts" "$launch_pre_reservation_artifacts_backup"
+ln -s "$launch_pre_reservation_artifacts_backup" "$registry_dir/artifacts"
+launch_pre_reservation_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$launch_pre_reservation_task_id" --scope "$launch_pre_reservation_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/launch-pre-reservation.out" 2>&1 || launch_pre_reservation_status=$?
+rm "$registry_dir/artifacts"
+mv "$launch_pre_reservation_artifacts_backup" "$registry_dir/artifacts"
+[[ "$launch_pre_reservation_status" -ne 0 ]] || fail 'pre-reservation launch failure fixture unexpectedly succeeded'
+launch_pre_reservation_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+launch_pre_reservation_claim_path=''
+for launch_pre_reservation_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$launch_pre_reservation_candidate" && ! -L "$launch_pre_reservation_candidate" ]] || continue
+	if rg -q "^token=task-$launch_pre_reservation_task_id$" "$launch_pre_reservation_candidate"; then
+		launch_pre_reservation_claim_path="$launch_pre_reservation_candidate"
+		break
+	fi
+done
+[[ -n "$launch_pre_reservation_claim_path" && -f "$launch_pre_reservation_claim_path" && ! -L "$launch_pre_reservation_claim_path" ]] || fail 'pre-reservation launch cleanup released stable task claim'
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$launch_pre_reservation_scope" --token "task-$launch_pre_reservation_task_id" >/dev/null
+
 printf '%s\n' 'blocked worker' >"$PROMPT_FILE"
 blocked_output="$(FAKE_BLOCKED_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id blocked-runner --scope 'blocked runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/blocked-runner.err")"
 jq -e '.outcome == "blocked"' <<<"$blocked_output" >/dev/null || fail 'runner did not return a blocked result'
@@ -1018,14 +1137,22 @@ prompt_race_status=0
 FAKE_HANDSHAKE_PROMPT_RACE=1 FAKE_REQUIRE_CLOSED_PROMPT_FD=1 FAKE_REQUIRE_WORKSPACE_WRITE_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id prompt-race-worker --scope 'open immutable prompt before workspace-write resume' --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/prompt-race.out" 2>"$TEST_ROOT/prompt-race.err" &
 prompt_race_runner_pid=$!
 poll_attempt=0
-while [[ ! -e "$PROMPT_RACE_MARKER" && "$poll_attempt" -lt 200 ]]; do
+while [[ ! -e "$PROMPT_RACE_MARKER" && "$poll_attempt" -lt "$PROMPT_RACE_MARKER_WAIT_ATTEMPTS" ]] && process_is_live_non_zombie "$prompt_race_runner_pid"; do
 	sleep 0.01
 	poll_attempt=$((poll_attempt + 1))
 done
-[[ -e "$PROMPT_RACE_MARKER" ]] || fail 'prompt race handshake did not reach its controlled pause'
+if [[ ! -e "$PROMPT_RACE_MARKER" ]]; then
+	process_is_live_non_zombie "$prompt_race_runner_pid" && kill -TERM "$prompt_race_runner_pid" 2>/dev/null || true
+	prompt_race_status=0
+	wait "$prompt_race_runner_pid" || prompt_race_status=$?
+	prompt_race_runner_pid=''
+	prompt_race_error="$(cat "$TEST_ROOT/prompt-race.err" 2>/dev/null || true)"
+	fail "prompt race handshake did not reach its controlled pause (runner status: $prompt_race_status; stderr: ${prompt_race_error:-empty})"
+fi
 prompt_snapshot_path="$registry_dir/artifacts/prompt-race-worker/.task-prompt"
 [[ -f "$prompt_snapshot_path" && ! -L "$prompt_snapshot_path" ]] || fail 'launch did not create a private prompt snapshot before handshake'
-[[ "$(cat "$prompt_snapshot_path")" == "$prompt_race_original" ]] || fail 'prompt snapshot did not preserve validated prompt contents before handshake'
+prompt_snapshot_contents="$(cat "$prompt_snapshot_path")"
+[[ "$prompt_snapshot_contents" == "$WORKER_BOUNDARY_INSTRUCTION"*"$prompt_race_original"*"$WORKER_BOUNDARY_INSTRUCTION" ]] || fail 'prompt snapshot did not preserve validated prompt contents and worker boundary before handshake'
 jq -e 'any(.workers[]; .task_id == "prompt-race-worker" and .status == "reserved")' "$registry_path" >/dev/null || fail 'prompt race did not prove snapshot creation preceded registry reservation'
 printf '%s\n' 'caller replacement during handshake' >"$PROMPT_FILE"
 printf '%s\n' 'task artifact replacement during handshake' >"$TEST_ROOT/prompt-race-replacement"
@@ -1036,7 +1163,8 @@ wait "$prompt_race_runner_pid" || prompt_race_status=$?
 prompt_race_runner_pid=''
 [[ "$prompt_race_status" -eq 0 ]] || fail 'prompt snapshot race worker did not complete'
 jq -e '.outcome == "completed"' <"$TEST_ROOT/prompt-race.out" >/dev/null || fail 'prompt snapshot race worker returned invalid result'
-[[ "$(cat "$CODEX_PROMPT_CAPTURE")" == "$prompt_race_original" ]] || fail 'first workspace-write resume consumed a task-artifact replacement during handshake'
+captured_prompt_contents="$(cat "$CODEX_PROMPT_CAPTURE")"
+[[ "$captured_prompt_contents" == "$WORKER_BOUNDARY_INSTRUCTION"*"$prompt_race_original"*"$WORKER_BOUNDARY_INSTRUCTION" ]] || fail 'first workspace-write resume consumed a task-artifact replacement or lost the worker boundary'
 snapshot_link_count="$(stat -c '%h' "$prompt_snapshot_path" 2>/dev/null || stat -f '%l' "$prompt_snapshot_path" 2>/dev/null)"
 [[ "$snapshot_link_count" == '1' ]] || fail 'prompt snapshot did not retain single-link ownership'
 
@@ -1074,6 +1202,112 @@ runner_output="$(cd "$TEST_ROOT" && CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" 
 jq -e '.outcome == "completed" and .summary == "worker concise result" and (.validators | length == 1) and .validators[0].status == "passed"' <<<"$runner_output" >/dev/null || fail 'runner did not return concise structured output with valid completion evidence'
 "$REGISTRY_SCRIPT" assert-no-active --repo "$REPO_ROOT" >/dev/null || fail 'completed worker was not atomically retired'
 jq -e 'any(.identity_ledger[]; .task_id == "fast-worker" and (.session_id | startswith("01fake-session-")) and .status == "retired" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'fast worker identity/result was not retained'
+
+printf '%s\n' 'legacy claimless continuation' >"$PROMPT_FILE"
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id legacy-claimless-continuation --scope 'legacy claimless continuation' >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id legacy-claimless-continuation --session-id 01legacy-session >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id legacy-claimless-continuation --session-id 01legacy-session >/dev/null
+mkdir -m 0700 "$registry_dir/artifacts/legacy-claimless-continuation"
+legacy_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --task-id legacy-claimless-continuation --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/legacy-continue.err")"
+jq -e '.outcome == "completed" and .summary == "worker concise result" and (.validators | length == 1) and .validators[0].status == "passed"' <<<"$legacy_output" >/dev/null || fail 'legacy claimless continuation did not complete through the shared claim'
+jq -e 'any(.identity_ledger[]; .task_id == "legacy-claimless-continuation" and .status == "retired" and .terminal_status == "completed") and (.workers | length == 0)' "$registry_path" >/dev/null || fail 'legacy claimless continuation did not retire atomically'
+
+printf '%s\n' 'legacy continuation loses invocation race' >"$PROMPT_FILE"
+legacy_race_task_id='legacy-claimless-invocation-race'
+legacy_race_scope='retain claim when legacy continuation loses invocation race'
+legacy_race_unrelated_scope='preserve unrelated claim during legacy invocation race'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --scope "$legacy_race_scope" >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --session-id 01legacy-race-session >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --session-id 01legacy-race-session >/dev/null
+mkdir -m 0700 "$registry_dir/artifacts/$legacy_race_task_id"
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$legacy_race_unrelated_scope" --token legacy-race-unrelated >/dev/null
+# Legacy controller that won registry invocation has no cross-path claim. The
+# continuation under test acquires the previously absent claim, then loses
+# claim-invocation. Its failure cleanup must retain that new claim until
+# explicit registry recovery/retirement protects the old controller.
+sleep 30 &
+legacy_race_owner_pid=$!
+"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --pid "$legacy_race_owner_pid" --token legacy-race-winner >/dev/null
+legacy_race_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/legacy-race.out" 2>&1 || legacy_race_status=$?
+[[ "$legacy_race_status" -ne 0 ]] || fail 'legacy continuation unexpectedly bypassed competing invocation ownership'
+jq -e --arg pid "$legacy_race_owner_pid" 'any(.workers[]; .task_id == "legacy-claimless-invocation-race" and .status == "active" and .invocation_token == "legacy-race-winner" and .invocation_pid == $pid)' "$registry_path" >/dev/null || fail 'competing registry invocation owner was not preserved'
+legacy_race_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+legacy_race_claim_present=0
+legacy_race_unrelated_present=0
+for legacy_race_candidate in "$legacy_race_claim_root"/*; do
+	[[ -f "$legacy_race_candidate" && ! -L "$legacy_race_candidate" ]] || continue
+	if rg -q '^token=task-legacy-claimless-invocation-race$' "$legacy_race_candidate"; then
+		legacy_race_claim_present=1
+	fi
+	if rg -q '^token=legacy-race-unrelated$' "$legacy_race_candidate"; then
+		legacy_race_unrelated_present=1
+	fi
+done
+[[ "$legacy_race_claim_present" -eq 1 ]] || fail 'legacy invocation-race cleanup released newly-created claim'
+[[ "$legacy_race_unrelated_present" -eq 1 ]] || fail 'legacy invocation-race cleanup removed unrelated claim'
+"$REGISTRY_SCRIPT" release-invocation --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --token legacy-race-winner >/dev/null
+kill "$legacy_race_owner_pid" 2>/dev/null || true
+wait "$legacy_race_owner_pid" 2>/dev/null || true
+legacy_race_owner_pid=''
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --status interrupted --evidence 'legacy invocation-race claim retention test complete' >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$legacy_race_scope" --token "task-$legacy_race_task_id" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$legacy_race_unrelated_scope" --token legacy-race-unrelated >/dev/null
+
+printf '%s\n' 'legacy finish loses invocation race' >"$PROMPT_FILE"
+finish_race_task_id='legacy-finish-invocation-race'
+finish_race_scope='retain claim when legacy finish loses invocation race'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --scope "$finish_race_scope" >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --session-id 01legacy-finish-race-session >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --session-id 01legacy-finish-race-session >/dev/null
+# A legacy controller can own the registry invocation without owning a
+# cross-path claim. Finish recovery must retain its newly acquired claim when
+# it loses the invocation race, so a later native/fallback path cannot enter.
+sleep 30 &
+finish_race_owner_pid=$!
+"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --pid "$finish_race_owner_pid" --token legacy-finish-race-winner >/dev/null
+finish_race_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" finish --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --status interrupted --evidence 'finish invocation race must retain claim' >"$TEST_ROOT/finish-race.out" 2>&1 || finish_race_status=$?
+[[ "$finish_race_status" -ne 0 ]] || fail 'legacy finish unexpectedly bypassed competing invocation ownership'
+jq -e --arg pid "$finish_race_owner_pid" --arg task_id "$finish_race_task_id" 'any(.workers[]; .task_id == $task_id and .status == "active" and .invocation_token == "legacy-finish-race-winner" and .invocation_pid == $pid)' "$registry_path" >/dev/null || fail 'finish race did not preserve competing registry invocation owner'
+finish_race_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+finish_race_claim_present=0
+for finish_race_candidate in "$finish_race_claim_root"/*; do
+	[[ -f "$finish_race_candidate" && ! -L "$finish_race_candidate" ]] || continue
+	if rg -q "^token=task-$finish_race_task_id$" "$finish_race_candidate"; then
+		finish_race_claim_present=1
+		break
+	fi
+done
+[[ "$finish_race_claim_present" -eq 1 ]] || fail 'legacy finish invocation-race cleanup released newly-created claim'
+"$REGISTRY_SCRIPT" release-invocation --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --token legacy-finish-race-winner >/dev/null
+kill "$finish_race_owner_pid" 2>/dev/null || true
+wait "$finish_race_owner_pid" 2>/dev/null || true
+finish_race_owner_pid=''
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --status interrupted --evidence 'legacy finish invocation-race claim retention test complete' >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$finish_race_scope" --token "task-$finish_race_task_id" >/dev/null
+
+printf '%s\n' 'needs parent after re-entered claim' >"$PROMPT_FILE"
+reentered_retirement_task_id='reentered-claim-retirement'
+reentered_retirement_scope='release re-entered claim after terminal cleanup'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$reentered_retirement_task_id" --scope "$reentered_retirement_scope" >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$reentered_retirement_task_id" --session-id 01reentered-retirement-session >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$reentered_retirement_task_id" --session-id 01reentered-retirement-session >/dev/null
+mkdir -m 0700 "$registry_dir/artifacts/$reentered_retirement_task_id"
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$reentered_retirement_scope" --token "task-$reentered_retirement_task_id" >/dev/null
+reentered_retirement_status=0
+FAKE_INVALID_PARENT_ACTION=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --task-id "$reentered_retirement_task_id" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/reentered-retirement.out" 2>&1 || reentered_retirement_status=$?
+[[ "$reentered_retirement_status" -ne 0 ]] || fail 're-entered claim launcher failure unexpectedly succeeded'
+jq -e --arg task_id "$reentered_retirement_task_id" 'any(.identity_ledger[]; .task_id == $task_id and .status == "retired" and .terminal_status == "failed") and all(.workers[]; .task_id != $task_id)' "$registry_path" >/dev/null || fail 're-entered claim launcher failure did not retire the task'
+reentered_retirement_claim_present=0
+for reentered_retirement_candidate in "$finish_race_claim_root"/*; do
+	[[ -f "$reentered_retirement_candidate" && ! -L "$reentered_retirement_candidate" ]] || continue
+	if rg -q "^token=task-$reentered_retirement_task_id$" "$reentered_retirement_candidate"; then
+		reentered_retirement_claim_present=1
+		break
+	fi
+done
+[[ "$reentered_retirement_claim_present" -eq 0 ]] || fail 'terminal cleanup leaked a re-entered claim'
 
 printf '%s\n' 'needs parent' >"$PROMPT_FILE"
 needs_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id continued-worker --scope 'one continued task' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/needs.err")"
@@ -1195,17 +1429,18 @@ fi
 if rg -- '--ephemeral' "$CODEX_CALLS" >/dev/null; then fail 'runner used --ephemeral'; fi
 if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-only find arguments'; fi
 # The rewritten fixture adds local-runner (one resume), the old-Codex
-# read-only task (one resume), and the continuation-runner launch/continue pair
-# (two resumes), while removing the old sparse-continuation resume: 20 - 1 + 1
-# + 1 + 2 = 23.
-resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 23 ]] || fail "expected twenty-three exact-session resumes, got $resume_count"
+# read-only task (one resume), the legacy claimless continuation (one resume),
+# the re-entered-claim failure (one resume), and the continuation-runner
+# launch/continue pair (two resumes), while removing the old
+# sparse-continuation resume: 20 - 1 + 1 + 1 + 1 + 1 + 2 = 25.
+resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation|01legacy-session|01reentered-retirement-session) -' "$CODEX_CALLS")"
+[[ "$resume_count" -eq 25 ]] || fail "expected twenty-five exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 46 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 48 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
 [[ "$read_only_count" -eq 23 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 23 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 25 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
 [[ "$read_only_resume_count" -eq 6 ]] || fail "expected read-only sandbox on retry, blocked retry, and both continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then

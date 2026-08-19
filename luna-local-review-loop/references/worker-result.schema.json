@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Structured final result for one project-local Luna worker session.",
+  "description": "Structured final result contract for one native or project-local Luna worker session.",
   "type": "object",
   "additionalProperties": false,
   "required": ["outcome", "summary", "changedFiles", "validators", "unresolved", "parentAction"],

@@ -5,6 +5,7 @@ umask 077
 readonly EXIT_OK=0
 readonly EXIT_USAGE=2
 readonly EXIT_PREREQUISITE=3
+readonly EXIT_CONFLICT=6
 readonly EXIT_RUNTIME_STATE=11
 readonly EXIT_WORKER=12
 
@@ -21,6 +22,7 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 SCRIPT_DIR="$(cd "$SCRIPT_DIR" && pwd -P)"
 readonly SCRIPT_DIR
 readonly REGISTRY_SCRIPT="$SCRIPT_DIR/registry.sh"
+readonly CLAIM_SCRIPT="$SCRIPT_DIR/cross-path-claim.sh"
 readonly RESULT_SCHEMA="$SCRIPT_DIR/../references/worker-result.schema.json"
 
 MODE='launch'
@@ -35,10 +37,15 @@ MODEL='gpt-5.6-luna'
 REASONING_EFFORT='max'
 CODEX_BIN="${CODEX_BIN:-codex}"
 CODEX_VERSION_VALIDATED=0
+SHA256_COMMAND=''
 FINISHED=0
 SESSION_ID=''
 INVOCATION_TOKEN=''
 INVOCATION_CLAIMED=0
+INVOCATION_OWNERSHIP_PROVEN=0
+REGISTRY_TASK_RETIRED_BY_RUN=0
+CROSS_PATH_CLAIMED=0
+CROSS_PATH_TOKEN=''
 ACTIVE_CODEX_PID=''
 ACTIVE_CODEX_PGID=''
 ACTIVE_CODEX_INSTANCE=''
@@ -51,6 +58,8 @@ PRESERVE_REGISTRY_STATE=0
 # Bash 3 has no allocated-FD syntax; FD 8 carries the launch snapshot and
 # FD 9 remains reserved for each Codex child lease.
 readonly PROMPT_DESCRIPTOR_SOURCE='fd8'
+# Every fallback prompt carries this boundary so a worker cannot create a nested worker.
+readonly WORKER_BOUNDARY_INSTRUCTION='You are the sole worker for this immutable task. Perform the owned scope directly; never spawn, delegate to, or hand work to another subagent.'
 PROMPT_DESCRIPTOR_OPEN=0
 PROMPT_STAGING_PATH=''
 PROMPT_STAGING_IDENTITY=''
@@ -139,6 +148,17 @@ preflight_workspace_write_launch() {
 	require_workspace_write_boundary
 }
 
+select_sha256_command() {
+	[[ -n "$SHA256_COMMAND" ]] && return 0
+	if command -v shasum >/dev/null 2>&1; then
+		SHA256_COMMAND='shasum'
+	elif command -v sha256sum >/dev/null 2>&1; then
+		SHA256_COMMAND='sha256sum'
+	else
+		return 1
+	fi
+}
+
 validate_common() {
 	local codex_discovered=''
 	local codex_parent=''
@@ -148,13 +168,14 @@ validate_common() {
 	local prompt_parent=''
 	local prompt_name=''
 	local repo_candidate=''
-	local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk shasum stat cat mktemp date chmod sed od tr sort head mkfifo)
+	local required_commands=(bash dirname git jq mkdir rm rmdir mv ln kill ps sleep awk stat cat mktemp date chmod sed od tr sort head mkfifo)
 	for command_name in "${required_commands[@]}"; do
 		if ! command -v "$command_name" >/dev/null 2>&1; then
 			missing="${missing}${missing:+, }${command_name}"
 		fi
-	done
+		done
 	[[ -z "$missing" ]] || die "$EXIT_PREREQUISITE" "missing runtime prerequisite(s): $missing. Install them through the approved host mechanism, then retry."
+	select_sha256_command || die "$EXIT_PREREQUISITE" 'missing SHA-256 prerequisite: install shasum or sha256sum.'
 	codex_discovered="$(command -v "$CODEX_BIN" 2>/dev/null)" || die "$EXIT_PREREQUISITE" "Codex CLI not found: $CODEX_BIN."
 	case "$codex_discovered" in /*) ;; *) codex_discovered="$PWD/$codex_discovered" ;; esac
 	codex_parent="${codex_discovered%/*}"
@@ -163,6 +184,7 @@ validate_common() {
 	CODEX_BIN="$codex_parent/$codex_name"
 	[[ -f "$CODEX_BIN" && -x "$CODEX_BIN" ]] || die "$EXIT_PREREQUISITE" "Codex CLI is not an executable file: $CODEX_BIN."
 	[[ -f "$RESULT_SCHEMA" ]] || die "$EXIT_PREREQUISITE" "worker result schema not found: $RESULT_SCHEMA."
+	[[ -f "$CLAIM_SCRIPT" && ! -L "$CLAIM_SCRIPT" ]] || die "$EXIT_PREREQUISITE" "cross-path claim primitive is unavailable: $CLAIM_SCRIPT."
 	[[ -d "$REPO_INPUT" ]] || die "$EXIT_USAGE" "repository path does not exist or is not a directory: $REPO_INPUT."
 	repo_candidate="$(cd -P "$REPO_INPUT" 2>/dev/null && pwd -P)" || die "$EXIT_USAGE" "cannot resolve repository path: $REPO_INPUT."
 	REPO_ROOT="$(git -C "$repo_candidate" rev-parse --show-toplevel 2>/dev/null)" || die "$EXIT_USAGE" "repository path is not inside a Git repository: $REPO_INPUT."
@@ -188,17 +210,80 @@ validate_common() {
 
 finish_on_error() {
 	local exit_code=$?
+	local registry_cleanup_status=0
+	local claim_release_status=0
 	close_prompt_descriptor
 	cleanup_prompt_staging
-	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && -n "$TASK_ID" && -n "$INVOCATION_TOKEN" ]]; then
-		"$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status failed --evidence "worker launcher exited $exit_code before a structured terminal result" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" >/dev/null 2>&1 || true
+	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$INVOCATION_CLAIMED" -eq 1 && -n "$TASK_ID" && -n "$INVOCATION_TOKEN" ]]; then
+		if ! "$REGISTRY_SCRIPT" complete-and-retire --task-id "$TASK_ID" --status failed --evidence "worker launcher exited $exit_code before a structured terminal result" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" >/dev/null 2>&1; then
+			registry_cleanup_status=1
+		else
+			REGISTRY_TASK_RETIRED_BY_RUN=1
+			INVOCATION_CLAIMED=0
+		fi
+	fi
+	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 && ( "$INVOCATION_OWNERSHIP_PROVEN" -eq 1 || "$REGISTRY_TASK_RETIRED_BY_RUN" -eq 1 ) ]]; then
+		release_cross_path_claim || claim_release_status=$?
 	fi
 	INVOCATION_CLAIMED=0
+	[[ "$registry_cleanup_status" -eq 0 && "$claim_release_status" -eq 0 ]] || exit_code="$EXIT_RUNTIME_STATE"
 	exit "$exit_code"
 }
 
 prepare_invocation() {
 	[[ -n "$INVOCATION_TOKEN" ]] || INVOCATION_TOKEN="invocation-$$-${RANDOM:-0}-$(date -u '+%Y%m%dT%H%M%S')"
+}
+
+prepare_cross_path_token() {
+	[[ -n "$TASK_ID" ]] || die "$EXIT_USAGE" 'cross-path claim requires the immutable task ID.'
+	[[ -n "$CROSS_PATH_TOKEN" ]] || CROSS_PATH_TOKEN="task-$TASK_ID"
+}
+
+acquire_cross_path_claim() {
+	local mode="${1:-initial}"
+	[[ -n "$SCOPE" ]] || die "$EXIT_USAGE" 'cross-path claim requires the immutable task scope.'
+	prepare_cross_path_token
+	local claim_status=0
+	local claim_output=''
+	local claim_args=(acquire --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN")
+	case "$mode" in
+	initial)
+		# A parent may already hold the documented fallback claim. Re-enter that
+		# exact stable task token; otherwise acquire the claim atomically here.
+		claim_args+=(--reenter-or-acquire --fallback-preflight)
+		;;
+	recover) ;;
+	reenter) claim_args+=(--reenter) ;;
+	legacy)
+		claim_args+=(--reenter-or-acquire --fallback-preflight)
+		;;
+	*) die "$EXIT_USAGE" "unknown cross-path claim acquisition mode: $mode." ;;
+	esac
+	claim_output="$(bash "$CLAIM_SCRIPT" "${claim_args[@]}" )" || claim_status=$?
+	if [[ "$mode" == recover && "$claim_status" -eq 6 ]]; then
+		claim_args+=(--reenter)
+		claim_status=0
+		claim_output="$(bash "$CLAIM_SCRIPT" "${claim_args[@]}" )" || claim_status=$?
+	fi
+	case "$claim_status" in
+	0)
+		case "$claim_output" in
+		'Re-entered cross-path claim='*) : ;;
+		'Acquired cross-path claim='*) : ;;
+		*) die "$EXIT_RUNTIME_STATE" 'cross-path claim returned an unrecognized successful acquisition result.' ;;
+		esac
+		;;
+	6) die "$EXIT_CONFLICT" "cross-path claim is already held for task scope: $SCOPE." ;;
+	*) die "$EXIT_RUNTIME_STATE" "cross-path claim is unavailable for task scope: $SCOPE; stopping before worker startup." ;;
+	esac
+	CROSS_PATH_CLAIMED=1
+}
+
+release_cross_path_claim() {
+	if [[ "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
+		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" >/dev/null || return 1
+		CROSS_PATH_CLAIMED=0
+	fi
 }
 
 claim_invocation() {
@@ -207,6 +292,7 @@ claim_invocation() {
 	[[ "$MODE" != continue ]] || claim_args+=(--require-status active)
 	run_registry_quiet "${claim_args[@]}"
 	INVOCATION_CLAIMED=1
+	INVOCATION_OWNERSHIP_PROVEN=1
 }
 
 release_invocation() {
@@ -731,12 +817,19 @@ create_owned_artifact_file() {
 snapshot_prompt_file() {
 	local source_path="$1"
 	local snapshot_path="$2"
+	local include_worker_boundary="${3:-0}"
 	create_owned_artifact_file "$snapshot_path" 'task prompt snapshot'
 	if [[ "$snapshot_path" == "$PROMPT_STAGING_PATH" ]]; then
 		remember_prompt_staging "$snapshot_path"
 	fi
-	if ! cat "$source_path" >"$snapshot_path"; then
+	if [[ "$include_worker_boundary" == 1 ]]; then
+		printf '%s\n\n' "$WORKER_BOUNDARY_INSTRUCTION" >"$snapshot_path" || die "$EXIT_RUNTIME_STATE" "cannot write worker boundary to task prompt: $snapshot_path"
+	fi
+	if ! cat "$source_path" >>"$snapshot_path"; then
 		die "$EXIT_RUNTIME_STATE" "cannot snapshot validated task prompt: $source_path"
+	fi
+	if [[ "$include_worker_boundary" == 1 ]]; then
+		printf '\n\n%s\n' "$WORKER_BOUNDARY_INSTRUCTION" >>"$snapshot_path" || die "$EXIT_RUNTIME_STATE" "cannot finish worker boundary in task prompt: $snapshot_path"
 	fi
 	require_owned_artifact_file "$snapshot_path" 'task prompt snapshot'
 }
@@ -931,6 +1024,7 @@ resume_task() {
 	local stream_stderr
 	local result_path
 	local existing_artifact
+	local continuation_prompt=''
 	attempt=0
 	for existing_artifact in "$artifact_dir"/stream-*.jsonl "$artifact_dir"/stream-*.stderr.log "$artifact_dir"/result-*.json; do
 		[[ -e "$existing_artifact" || -L "$existing_artifact" ]] || continue
@@ -946,6 +1040,11 @@ resume_task() {
 	create_owned_artifact_file "$stream_log" 'Codex JSONL artifact'
 	create_owned_artifact_file "$stream_stderr" 'Codex stderr artifact'
 	create_owned_artifact_file "$result_path" 'worker result artifact'
+	if [[ "$resume_prompt_source" != "$PROMPT_DESCRIPTOR_SOURCE" ]]; then
+		continuation_prompt="$artifact_dir/parent-prompt-$attempt"
+		snapshot_prompt_file "$resume_prompt_source" "$continuation_prompt" 1
+		resume_prompt_source="$continuation_prompt"
+	fi
 
 	local codex_status=0
 	run_gated_codex "$artifact_dir" "$stream_log" "$stream_stderr" "$resume_prompt_source" "$REPO_ROOT" "$CODEX_BIN" exec resume \
@@ -974,13 +1073,17 @@ resume_task() {
 	case "$outcome" in
 	completed)
 		run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status completed --evidence "$evidence" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
-		FINISHED=1
+		REGISTRY_TASK_RETIRED_BY_RUN=1
 		INVOCATION_CLAIMED=0
+		release_cross_path_claim || die "$EXIT_RUNTIME_STATE" "cannot release cross-path claim after completing task $TASK_ID."
+		FINISHED=1
 		;;
 	blocked)
 		run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status blocked --evidence "$evidence" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
-		FINISHED=1
+		REGISTRY_TASK_RETIRED_BY_RUN=1
 		INVOCATION_CLAIMED=0
+		release_cross_path_claim || die "$EXIT_RUNTIME_STATE" "cannot release cross-path claim after blocking task $TASK_ID."
+		FINISHED=1
 		;;
 	needs_parent_action)
 		run_registry_quiet checkpoint --task-id "$TASK_ID" --evidence "$evidence" --repo "$REPO_INPUT"
@@ -1004,17 +1107,19 @@ launch_worker() {
 	local prompt_staging
 	local prompt_snapshot
 	prepare_invocation
+	acquire_cross_path_claim
 	registry_path="$($REGISTRY_SCRIPT init --repo "$REPO_INPUT" --print-path)"
 	registry_dir="$(resolve_registry_directory "$registry_path")"
 	artifact_root="$(create_real_child_directory "$registry_dir" artifacts 'artifact root')"
 	prompt_staging="$artifact_root/.prompt-$INVOCATION_TOKEN"
 	PROMPT_STAGING_PATH="$prompt_staging"
-	snapshot_prompt_file "$PROMPT_FILE" "$prompt_staging"
+	snapshot_prompt_file "$PROMPT_FILE" "$prompt_staging" 1
 	local reserve_args=(reserve --task-id "$TASK_ID" --scope "$SCOPE" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT")
 	[[ -z "$RETRY_OF" ]] || reserve_args+=(--retry-of "$RETRY_OF")
 	[[ -z "$TASK_SANDBOX" ]] || reserve_args+=(--sandbox "$TASK_SANDBOX")
 	run_registry_quiet "${reserve_args[@]}"
 	INVOCATION_CLAIMED=1
+	INVOCATION_OWNERSHIP_PROVEN=1
 	TASK_SANDBOX="$("$REGISTRY_SCRIPT" query --task-id "$TASK_ID" --repo "$REPO_INPUT" | jq -r '.sandbox')"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
 
@@ -1067,11 +1172,23 @@ continue_worker() {
 	artifact_root="$(require_real_child_directory "$registry_dir" artifacts 'artifact root')"
 	artifact_dir="$(require_real_child_directory "$artifact_root" "$TASK_ID" 'task artifact directory')"
 	trap finish_on_error EXIT
-	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT")"
-	SESSION_ID="$(jq -r '.session_id' <<<"$worker")"
-	TASK_SANDBOX="$(jq -r '.sandbox' <<<"$worker")"
+	worker="$($REGISTRY_SCRIPT active --repo "$REPO_INPUT")"
+	worker="$(jq -e --arg task_id "$TASK_ID" '
+		map(select(.task_id == $task_id))
+		| if length != 1 then error("continuation task is missing or ambiguous")
+		  elif .[0].status != "active" then error("continuation task is not active")
+		  else .[0]
+		  end
+	' <<<"$worker")"
+	SESSION_ID="$(jq -er '.session_id | select(type == "string" and length > 0)' <<<"$worker")"
+	SCOPE="$(jq -er '.scope | select(type == "string" and length > 0)' <<<"$worker")"
+	TASK_SANDBOX="$(jq -er '.sandbox | select(. == "read-only" or . == "workspace-write")' <<<"$worker")"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
 	[[ "$TASK_SANDBOX" == read-only ]] || require_workspace_write_boundary
+	# Active rows created before cross-path claims have no shared claim to re-enter.
+	# The claim primitive still preserves exact same-owner reentry and atomically
+	# rejects a competing owner before this process can claim the registry task.
+	acquire_cross_path_claim legacy
 	claim_invocation
 	resume_task "$artifact_dir" "$PROMPT_FILE"
 }
@@ -1079,11 +1196,17 @@ continue_worker() {
 finish_worker() {
 	[[ -n "$TASK_ID" && -n "$FINISH_STATUS" && -n "$FINISH_EVIDENCE" ]] || die "$EXIT_USAGE" 'finish requires --task-id, --status, and --evidence.'
 	case "$FINISH_STATUS" in failed | blocked | interrupted) ;; *) die "$EXIT_USAGE" 'finish status must be failed, blocked, or interrupted.' ;; esac
+	local worker
+	worker="$($REGISTRY_SCRIPT query --task-id "$TASK_ID" --repo "$REPO_INPUT")"
+	SCOPE="$(jq -r '.scope' <<<"$worker")"
 	trap finish_on_error EXIT
+	acquire_cross_path_claim recover
 	claim_invocation
 	run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status "$FINISH_STATUS" --evidence "$FINISH_EVIDENCE" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
-	FINISHED=1
+	REGISTRY_TASK_RETIRED_BY_RUN=1
 	INVOCATION_CLAIMED=0
+	release_cross_path_claim || die "$EXIT_RUNTIME_STATE" "cannot release cross-path claim after finishing task $TASK_ID."
+	FINISHED=1
 }
 
 [[ $# -gt 0 ]] || usage "$EXIT_USAGE"

@@ -1,4 +1,4 @@
 interface:
   display_name: "Luna Local Review Loop"
-  short_description: "Delegate local work to Luna Max and review fixes"
-  default_prompt: "Use $luna-local-review-loop to run a local Luna Max implementation and code-review loop."
+  short_description: "Run native Luna Max work with Sol-High reviews"
+  default_prompt: "Use $luna-local-review-loop for native-first Luna Max implementation or validation and fresh Sol-High code-review passes."
