@@ -45,7 +45,6 @@ INVOCATION_CLAIMED=0
 INVOCATION_OWNERSHIP_PROVEN=0
 REGISTRY_TASK_RETIRED_BY_RUN=0
 CROSS_PATH_CLAIMED=0
-CROSS_PATH_CLAIM_ACQUIRED_BY_RUN=0
 CROSS_PATH_TOKEN=''
 ACTIVE_CODEX_PID=''
 ACTIVE_CODEX_PGID=''
@@ -223,7 +222,7 @@ finish_on_error() {
 			INVOCATION_CLAIMED=0
 		fi
 	fi
-	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 && ( "$CROSS_PATH_CLAIM_ACQUIRED_BY_RUN" -eq 1 || "$REGISTRY_TASK_RETIRED_BY_RUN" -eq 1 ) && ( "$MODE" == launch || "$INVOCATION_OWNERSHIP_PROVEN" -eq 1 ) ]]; then
+	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 && ( "$INVOCATION_OWNERSHIP_PROVEN" -eq 1 || "$REGISTRY_TASK_RETIRED_BY_RUN" -eq 1 ) ]]; then
 		release_cross_path_claim || claim_release_status=$?
 	fi
 	INVOCATION_CLAIMED=0
@@ -244,7 +243,6 @@ acquire_cross_path_claim() {
 	local mode="${1:-initial}"
 	[[ -n "$SCOPE" ]] || die "$EXIT_USAGE" 'cross-path claim requires the immutable task scope.'
 	prepare_cross_path_token
-	CROSS_PATH_CLAIM_ACQUIRED_BY_RUN=0
 	local claim_status=0
 	local claim_output=''
 	local claim_args=(acquire --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN")
@@ -271,7 +269,7 @@ acquire_cross_path_claim() {
 	0)
 		case "$claim_output" in
 		'Re-entered cross-path claim='*) : ;;
-		'Acquired cross-path claim='*) CROSS_PATH_CLAIM_ACQUIRED_BY_RUN=1 ;;
+		'Acquired cross-path claim='*) : ;;
 		*) die "$EXIT_RUNTIME_STATE" 'cross-path claim returned an unrecognized successful acquisition result.' ;;
 		esac
 		;;
@@ -285,7 +283,6 @@ release_cross_path_claim() {
 	if [[ "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
 		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" >/dev/null || return 1
 		CROSS_PATH_CLAIMED=0
-		CROSS_PATH_CLAIM_ACQUIRED_BY_RUN=0
 	fi
 }
 

@@ -221,6 +221,30 @@
         "expectedOutcome": "fallback-active-pinned"
       },
       {
+        "id": "fallback-active-cross-path-claim-unavailable",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "active",
+        "reviewerAvailability": "cli-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "crossPathClaim": "unavailable",
+        "expectedPath": "parent-action",
+        "expectedOutcome": "cross-path-claim-blocked"
+      },
+      {
+        "id": "fallback-active-cross-path-claim-conflict",
+        "capabilityResult": "complete",
+        "configurationResult": "complete",
+        "fallbackState": "active",
+        "reviewerAvailability": "cli-sol-high",
+        "startup": "not-started",
+        "nativeLifecycle": "not-started",
+        "crossPathClaim": "conflict",
+        "expectedPath": "parent-action",
+        "expectedOutcome": "cross-path-claim-conflict"
+      },
+      {
         "id": "fallback-reviewer-unavailable",
         "capabilityResult": "incomplete",
         "configurationResult": "incomplete",

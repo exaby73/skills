@@ -1083,6 +1083,29 @@ failed_runner_artifact_dir="$registry_dir/artifacts/failed-runner"
 retry_output="$(CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id failed-runner-retry --scope 'runner retry scope' --retry-of failed-runner --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/retry.err")"
 jq -e '.outcome == "completed"' <<<"$retry_output" >/dev/null || fail 'runner retry did not complete'
 
+printf '%s\n' 'retain claim when launch fails before reservation' >"$PROMPT_FILE"
+launch_pre_reservation_task_id='launch-pre-reservation-claim'
+launch_pre_reservation_scope='retain claim when launch fails before reservation'
+launch_pre_reservation_artifacts_backup="$TEST_ROOT/launch-pre-reservation-artifacts"
+mv "$registry_dir/artifacts" "$launch_pre_reservation_artifacts_backup"
+ln -s "$launch_pre_reservation_artifacts_backup" "$registry_dir/artifacts"
+launch_pre_reservation_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$launch_pre_reservation_task_id" --scope "$launch_pre_reservation_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/launch-pre-reservation.out" 2>&1 || launch_pre_reservation_status=$?
+rm "$registry_dir/artifacts"
+mv "$launch_pre_reservation_artifacts_backup" "$registry_dir/artifacts"
+[[ "$launch_pre_reservation_status" -ne 0 ]] || fail 'pre-reservation launch failure fixture unexpectedly succeeded'
+launch_pre_reservation_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+launch_pre_reservation_claim_path=''
+for launch_pre_reservation_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$launch_pre_reservation_candidate" && ! -L "$launch_pre_reservation_candidate" ]] || continue
+	if rg -q "^token=task-$launch_pre_reservation_task_id$" "$launch_pre_reservation_candidate"; then
+		launch_pre_reservation_claim_path="$launch_pre_reservation_candidate"
+		break
+	fi
+done
+[[ -n "$launch_pre_reservation_claim_path" && -f "$launch_pre_reservation_claim_path" && ! -L "$launch_pre_reservation_claim_path" ]] || fail 'pre-reservation launch cleanup released stable task claim'
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$launch_pre_reservation_scope" --token "task-$launch_pre_reservation_task_id" >/dev/null
+
 printf '%s\n' 'blocked worker' >"$PROMPT_FILE"
 blocked_output="$(FAKE_BLOCKED_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id blocked-runner --scope 'blocked runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/blocked-runner.err")"
 jq -e '.outcome == "blocked"' <<<"$blocked_output" >/dev/null || fail 'runner did not return a blocked result'

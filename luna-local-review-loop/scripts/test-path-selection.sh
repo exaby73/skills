@@ -84,14 +84,14 @@ def select_path(case):
         if case["reviewerAvailability"] != "native-sol-high":
             return "native", "Evidence blocked"
         return "native", case["nativeLifecycle"]
-    if case["fallbackState"] == "active":
-        return "cli-fallback", "fallback-active-pinned"
-    if case["fallbackState"] not in {"clear", "not-initialized"}:
-        return "parent-action", "preflight-blocked"
     if case["crossPathClaim"] == "unavailable":
         return "parent-action", "cross-path-claim-blocked"
     if case["crossPathClaim"] == "conflict":
         return "parent-action", "cross-path-claim-conflict"
+    if case["fallbackState"] == "active":
+        return "cli-fallback", "fallback-active-pinned"
+    if case["fallbackState"] not in {"clear", "not-initialized"}:
+        return "parent-action", "preflight-blocked"
     native_ready = (
         case["capabilityResult"] == "complete"
         and case["configurationResult"] == "complete"
@@ -153,7 +153,7 @@ rg -q 'sole worker.*must not spawn or delegate' "$SKILL_ROOT/SKILL.md"
 rg -q 'never spawns, delegates to, or hands work' "$SKILL_ROOT/SKILL.md"
 rg -q 'fallback-ownership preflight' "$SKILL_ROOT/SKILL.md"
 rg -q 'atomic host-owned cross-path claim' "$SKILL_ROOT/SKILL.md"
-rg -q 'bash scripts/cross-path-claim\.sh acquire' "$SKILL_ROOT/SKILL.md"
+rg -q 'bash "\$skill_root/scripts/cross-path-claim\.sh" acquire' "$SKILL_ROOT/SKILL.md"
 rg -q 'fallback launcher uses that same claim' "$SKILL_ROOT/SKILL.md"
 rg -q 'held through the selected native or CLI lifecycle' "$SKILL_ROOT/SKILL.md"
 rg -q 'fallback controller uses.*before `registry\.sh reserve`' "$SKILL_ROOT/SKILL.md"
