@@ -250,7 +250,9 @@ acquire_cross_path_claim() {
 	local claim_args=(acquire --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN")
 	case "$mode" in
 	initial)
-		claim_args+=(--fallback-preflight)
+		# A parent may already hold the documented fallback claim. Re-enter that
+		# exact stable task token; otherwise acquire the claim atomically here.
+		claim_args+=(--reenter-or-acquire --fallback-preflight)
 		;;
 	recover) ;;
 	reenter) claim_args+=(--reenter) ;;

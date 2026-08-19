@@ -711,4 +711,227 @@ assert_fallback_preflight_failure unsafe 10 'unsafe fallback boundary'
 assert_fallback_preflight_failure malformed 5 'malformed fallback registry'
 assert_fallback_preflight_failure ineligible 4 'fallback registry belongs to another checkout'
 
+identity_exit_repo="$TEST_ROOT/fallback-preflight-identity-exit"
+identity_exit_bin="$TEST_ROOT/fallback-preflight-identity-exit-bin"
+identity_exit_ps_count="$TEST_ROOT/fallback-preflight-identity-exit-ps-count"
+identity_exit_output="$TEST_ROOT/fallback-preflight-identity-exit.out"
+identity_exit_error="$TEST_ROOT/fallback-preflight-identity-exit.err"
+identity_exit_claim_root="$identity_exit_repo/.git/.luna-cross-path-claims"
+mkdir -m 0700 "$identity_exit_repo" "$identity_exit_bin"
+git init -q "$identity_exit_repo"
+cat >"$identity_exit_bin/ps" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+format=''
+while [[ "$#" -gt 0 ]]; do
+	case "$1" in
+	-p)
+		shift 2
+		;;
+	-o)
+		format="$2"
+		shift 2
+		;;
+	*)
+		shift
+		;;
+	esac
+done
+count=0
+if [[ -f "${LUNA_TEST_PS_COUNT:?}" ]]; then
+	count="$(command cat "$LUNA_TEST_PS_COUNT")"
+fi
+count=$((count + 1))
+printf '%s\n' "$count" >"$LUNA_TEST_PS_COUNT"
+case "$format" in
+lstart=)
+	[[ "$count" -eq 1 ]] || exit 1
+	printf '%s\n' 'Wed Aug 19 00:00:00 2026'
+	;;
+stat=)
+	printf '%s\n' 'Z'
+	;;
+*)
+	exit 1
+	;;
+esac
+EOF
+chmod 0700 "$identity_exit_bin/ps"
+identity_exit_status=0
+if LUNA_TEST_PS_COUNT="$identity_exit_ps_count" \
+	LUNA_TEST_PREFLIGHT_STATUS=10 \
+	LUNA_TEST_PREFLIGHT_MESSAGE='identity probe preflight diagnostic' \
+	PATH="$identity_exit_bin:$PATH" \
+	bash "$fallback_script_dir/cross-path-claim.sh" acquire \
+		--fallback-preflight \
+		--repo "$identity_exit_repo" \
+		--scope "$fallback_scope/identity-exit" \
+		--token fallback-identity-exit >"$identity_exit_output" 2>"$identity_exit_error"; then
+	identity_exit_status=0
+else
+	identity_exit_status=$?
+fi
+[[ "$identity_exit_status" -eq 11 ]] || {
+	printf 'pre-probe helper exit returned %s instead of runtime-state status 11\n' "$identity_exit_status" >&2
+	sed -n '1,80p' "$identity_exit_error" >&2 || true
+	exit 1
+}
+rg -Fq -- 'fake registry preflight: identity probe preflight diagnostic' "$identity_exit_error" || {
+	printf 'pre-probe helper exit lost its actionable diagnostic\n' >&2
+	sed -n '1,80p' "$identity_exit_error" >&2 || true
+	exit 1
+}
+rg -Fq -- 'fallback registry preflight failed with status 10 before checkout-seal creation and claim publication' "$identity_exit_error" || {
+	printf 'pre-probe helper exit lost its validated status\n' >&2
+	sed -n '1,80p' "$identity_exit_error" >&2 || true
+	exit 1
+}
+[[ -d "$identity_exit_claim_root" && ! -L "$identity_exit_claim_root" ]] || {
+	printf 'pre-probe helper exit did not create its private coordination root\n' >&2
+	exit 1
+}
+[[ -z "$(find "$identity_exit_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)" ]] || {
+	printf 'pre-probe helper exit published a claim after failure\n' >&2
+	exit 1
+}
+[[ ! -e "$identity_exit_repo/.git/.luna-checkout-identity" && ! -L "$identity_exit_repo/.git/.luna-checkout-identity" ]] || {
+	printf 'pre-probe helper exit created a checkout seal after failure\n' >&2
+	exit 1
+}
+
+launch_fixture_repo="$TEST_ROOT/fallback-launch-repository"
+launch_fixture_scripts="$TEST_ROOT/fallback-launch-scripts"
+launch_fixture_references="$TEST_ROOT/references"
+launch_fixture_bin="$TEST_ROOT/fallback-launch-bin"
+launch_fixture_codex_home="$TEST_ROOT/fallback-launch-codex-home"
+launch_fixture_prompt="$TEST_ROOT/fallback-launch-prompt"
+launch_fixture_init_marker="$TEST_ROOT/fallback-launch-registry-init"
+launch_fixture_scope='documented fallback launch claim scope'
+launch_fixture_task_id='fallback-launch-owner'
+launch_fixture_token="task-$launch_fixture_task_id"
+launch_fixture_claim_root="$launch_fixture_repo/.git/.luna-cross-path-claims"
+launch_fixture_claim_path=''
+
+mkdir -m 0700 "$launch_fixture_repo" "$launch_fixture_scripts" "$launch_fixture_references" "$launch_fixture_bin" "$launch_fixture_codex_home"
+git init -q "$launch_fixture_repo"
+cp "$CLAIM_SCRIPT" "$launch_fixture_scripts/cross-path-claim.sh"
+cp "$SCRIPT_DIR/run-worker.sh" "$launch_fixture_scripts/run-worker.sh"
+cp "$SCRIPT_DIR/../references/worker-result.schema.json" "$launch_fixture_references/worker-result.schema.json"
+cat >"$launch_fixture_bin/codex" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0700 "$launch_fixture_bin/codex"
+cat >"$launch_fixture_scripts/registry.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+mode="${1:-}"
+shift
+ready_file=''
+release_file=''
+ready_token=''
+release_token=''
+while [[ "$#" -gt 0 ]]; do
+	case "$1" in
+	--ready-file) ready_file="$2"; shift 2 ;;
+	--release-file) release_file="$2"; shift 2 ;;
+	--ready-token) ready_token="$2"; shift 2 ;;
+	--release-token) release_token="$2"; shift 2 ;;
+	--error-file | --parent-pid | --parent-instance | --repo) shift 2 ;;
+	--print-path) shift ;;
+	*) shift ;;
+	esac
+done
+case "$mode" in
+preflight-lock)
+	[[ -n "$ready_file" && -n "$release_file" && -n "$ready_token" && -n "$release_token" ]] || exit 2
+	printf 'ready=unlocked:%s\n' "$ready_token" >"$ready_file"
+	while [[ "$(cat "$release_file")" != "release:$release_token" ]]; do
+		sleep 0.01
+	done
+	;;
+init)
+	: >"${LUNA_TEST_REGISTRY_INIT_MARKER:?}"
+	exit 42
+	;;
+*) exit 0 ;;
+esac
+EOF
+chmod 0700 "$launch_fixture_scripts/registry.sh"
+printf '%s\n' 'documented fallback launch regression prompt' >"$launch_fixture_prompt"
+chmod 0600 "$launch_fixture_prompt"
+
+PATH="$launch_fixture_bin:$PATH" \
+bash "$launch_fixture_scripts/cross-path-claim.sh" acquire \
+	--fallback-preflight \
+	--repo "$launch_fixture_repo" \
+	--scope "$launch_fixture_scope" \
+	--token "$launch_fixture_token" >/dev/null
+
+launch_fixture_status=0
+if CODEX_BIN=codex \
+	CODEX_HOME="$launch_fixture_codex_home" \
+	LUNA_TEST_REGISTRY_INIT_MARKER="$launch_fixture_init_marker" \
+	PATH="$launch_fixture_bin:$PATH" \
+	bash "$launch_fixture_scripts/run-worker.sh" launch \
+		--repo "$launch_fixture_repo" \
+		--task-id "$launch_fixture_task_id" \
+		--scope "$launch_fixture_scope" \
+		--sandbox read-only \
+		--prompt-file "$launch_fixture_prompt" \
+		>"$TEST_ROOT/fallback-launch-owner.out" 2>"$TEST_ROOT/fallback-launch-owner.err"; then
+	launch_fixture_status=0
+else
+	launch_fixture_status=$?
+fi
+[[ "$launch_fixture_status" -eq 42 && -f "$launch_fixture_init_marker" ]] || {
+	printf 'same-owner fallback launch did not re-enter its parent-held claim before registry startup: status=%s\n' "$launch_fixture_status" >&2
+	sed -n '1,80p' "$TEST_ROOT/fallback-launch-owner.err" >&2 || true
+	exit 1
+}
+launch_fixture_claim_path="$(find "$launch_fixture_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)"
+[[ -f "$launch_fixture_claim_path" && ! -L "$launch_fixture_claim_path" ]] || {
+	printf 'same-owner fallback launch did not preserve parent-held claim\n' >&2
+	exit 1
+}
+rg -Fq -- "token=$launch_fixture_token" "$launch_fixture_claim_path" || {
+	printf 'same-owner fallback launch changed parent-held claim owner\n' >&2
+	exit 1
+}
+
+rm -f "$launch_fixture_init_marker"
+launch_fixture_competing_status=0
+if CODEX_BIN=codex \
+	CODEX_HOME="$launch_fixture_codex_home" \
+	LUNA_TEST_REGISTRY_INIT_MARKER="$launch_fixture_init_marker" \
+	PATH="$launch_fixture_bin:$PATH" \
+	bash "$launch_fixture_scripts/run-worker.sh" launch \
+		--repo "$launch_fixture_repo" \
+		--task-id fallback-launch-competing \
+		--scope "$launch_fixture_scope" \
+		--sandbox read-only \
+		--prompt-file "$launch_fixture_prompt" \
+		>"$TEST_ROOT/fallback-launch-competing.out" 2>"$TEST_ROOT/fallback-launch-competing.err"; then
+	launch_fixture_competing_status=0
+else
+	launch_fixture_competing_status=$?
+fi
+[[ "$launch_fixture_competing_status" -eq 6 && ! -e "$launch_fixture_init_marker" ]] || {
+	printf 'competing fallback launch bypassed parent-held claim: status=%s\n' "$launch_fixture_competing_status" >&2
+	sed -n '1,80p' "$TEST_ROOT/fallback-launch-competing.err" >&2 || true
+	exit 1
+}
+rg -Fq -- "token=$launch_fixture_token" "$launch_fixture_claim_path" || {
+	printf 'competing fallback launch changed existing claim owner\n' >&2
+	exit 1
+}
+bash "$launch_fixture_scripts/cross-path-claim.sh" release \
+	--repo "$launch_fixture_repo" \
+	--scope "$launch_fixture_scope" \
+	--token "$launch_fixture_token" >/dev/null
+[[ -z "$(find "$launch_fixture_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)" ]] || {
+	printf 'fallback launch regression fixture left a live claim\n' >&2
+	exit 1
+}
+
 printf 'PASS: atomic cross-path claim serialization\n'

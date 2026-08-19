@@ -48,13 +48,15 @@ Usage:
 
 The claim is shared by native startup and the CLI fallback reservation. It is
 keyed by physical checkout identity plus immutable scope and is separate from
-the project-local fallback registry. Initial acquisition is exclusive; a
-continuation must explicitly use --reenter with the stable owner token. A
-legacy fallback continuation may use --reenter-or-acquire only after its active
-registry row has been validated; missing claims are acquired atomically, while
-existing claims still require exact owner/token matches. Acquire and release
-serialize through a short-lived private lock. Fallback preflight runs under
-that lock before checkout-seal creation and claim publication.
+the project-local fallback registry. Native initial acquisition is exclusive;
+continuation must explicitly use --reenter with the stable owner token. The
+fallback launcher uses --reenter-or-acquire with its stable task token so a
+parent-held same-owner claim is explicitly re-entered, while a missing claim
+is acquired atomically. Existing claims still require exact owner/token
+matches, including legacy fallback continuation after its active registry row
+has been validated. Acquire and release serialize through a short-lived
+private lock. Fallback preflight runs under that lock before checkout-seal
+creation and claim publication.
 EOF
 	exit "$exit_code"
 }
@@ -472,6 +474,26 @@ wait_for_registry_preflight_helper() {
 	wait "$pid" 2>/dev/null
 }
 
+collect_fallback_preflight_exit() {
+	local pid="$1"
+	local preflight_status=0
+	if wait "$pid"; then
+		preflight_status=0
+	else
+		preflight_status=$?
+	fi
+	REGISTRY_PREFLIGHT_PID=''
+	REGISTRY_PREFLIGHT_INSTANCE=''
+	if [[ -s "$REGISTRY_PREFLIGHT_ERROR_PATH" ]]; then
+		cat "$REGISTRY_PREFLIGHT_ERROR_PATH" >&2 || true
+	fi
+	if [[ -s "$REGISTRY_PREFLIGHT_LOG_PATH" ]]; then
+		cat "$REGISTRY_PREFLIGHT_LOG_PATH" >&2 || true
+	fi
+	[[ "$preflight_status" -eq 0 ]] || die "$EXIT_RUNTIME_STATE" "fallback registry preflight failed with status $preflight_status before checkout-seal creation and claim publication. Resolve the preflight diagnostic and retry."
+	die "$EXIT_RUNTIME_STATE" 'fallback registry preflight exited without publishing readiness before checkout-seal creation and claim publication.'
+}
+
 cleanup_coordination() {
 	local exit_code=$?
 	local cleanup_status=0
@@ -491,7 +513,6 @@ trap 'exit 129' HUP
 
 run_fallback_preflight() {
 	local parent_instance=''
-	local preflight_status=0
 	local ready_state=''
 	[[ -f "$SCRIPT_DIR/registry.sh" && ! -L "$SCRIPT_DIR/registry.sh" ]] || die "$EXIT_FILESYSTEM" "fallback registry preflight primitive is unavailable: $SCRIPT_DIR/registry.sh."
 	parent_instance="$(process_instance_identity "$$")" || die "$EXIT_RUNTIME_STATE" 'cannot identify fallback preflight parent process.'
@@ -519,7 +540,12 @@ run_fallback_preflight() {
 		--parent-instance "$parent_instance" \
 		>/dev/null 2>"$REGISTRY_PREFLIGHT_LOG_PATH" &
 	REGISTRY_PREFLIGHT_PID=$!
-	REGISTRY_PREFLIGHT_INSTANCE="$(process_instance_identity "$REGISTRY_PREFLIGHT_PID")" || die "$EXIT_RUNTIME_STATE" 'cannot identify fallback preflight helper process.'
+	if ! REGISTRY_PREFLIGHT_INSTANCE="$(process_instance_identity "$REGISTRY_PREFLIGHT_PID")"; then
+		if ! process_is_live_non_zombie "$REGISTRY_PREFLIGHT_PID"; then
+			collect_fallback_preflight_exit "$REGISTRY_PREFLIGHT_PID"
+		fi
+		die "$EXIT_RUNTIME_STATE" 'cannot identify fallback preflight helper process.'
+	fi
 	while true; do
 		ready_state="$(cat "$REGISTRY_PREFLIGHT_READY_PATH" 2>/dev/null || true)"
 		case "$ready_state" in
@@ -528,21 +554,7 @@ run_fallback_preflight() {
 		*) die "$EXIT_RUNTIME_STATE" 'fallback registry preflight published invalid readiness state.' ;;
 		esac
 		if ! process_is_live_non_zombie "$REGISTRY_PREFLIGHT_PID"; then
-			if wait "$REGISTRY_PREFLIGHT_PID"; then
-				preflight_status=0
-			else
-				preflight_status=$?
-			fi
-			REGISTRY_PREFLIGHT_PID=''
-			REGISTRY_PREFLIGHT_INSTANCE=''
-			if [[ -s "$REGISTRY_PREFLIGHT_ERROR_PATH" ]]; then
-				cat "$REGISTRY_PREFLIGHT_ERROR_PATH" >&2 || true
-			fi
-			if [[ -s "$REGISTRY_PREFLIGHT_LOG_PATH" ]]; then
-				cat "$REGISTRY_PREFLIGHT_LOG_PATH" >&2 || true
-			fi
-			[[ "$preflight_status" -eq 0 ]] || die "$EXIT_RUNTIME_STATE" "fallback registry preflight failed with status $preflight_status before checkout-seal creation and claim publication. Resolve the preflight diagnostic and retry."
-			die "$EXIT_RUNTIME_STATE" 'fallback registry preflight exited without publishing readiness before checkout-seal creation and claim publication.'
+			collect_fallback_preflight_exit "$REGISTRY_PREFLIGHT_PID"
 		fi
 		process_instance_matches "$REGISTRY_PREFLIGHT_PID" "$REGISTRY_PREFLIGHT_INSTANCE" || die "$EXIT_RUNTIME_STATE" 'fallback registry preflight helper process identity changed before readiness.'
 		sleep 0.01
