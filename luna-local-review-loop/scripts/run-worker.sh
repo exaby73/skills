@@ -229,7 +229,9 @@ finish_on_error() {
 		fi
 	fi
 	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
-		if [[ "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
+		if [[ "$MODE" == launch && "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 0 ]]; then
+			release_claim_owned_by_launcher=1
+		elif [[ "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
 			reservation_probe_status=0
 			reservation_outcome_is_rejected || reservation_probe_status=$?
 			case "$reservation_probe_status" in
