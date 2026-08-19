@@ -273,10 +273,10 @@ acquire_cross_path_claim() {
 		# exact stable task token; otherwise acquire the claim atomically here.
 		claim_args+=(--reenter-or-acquire --fallback-preflight)
 		;;
-	recover) ;;
+	recover) claim_args+=(--preserve-owner-pid) ;;
 	reenter) claim_args+=(--reenter) ;;
 	legacy)
-		claim_args+=(--reenter-or-acquire --fallback-preflight)
+		claim_args+=(--reenter-or-acquire --fallback-preflight --preserve-owner-pid)
 		;;
 	*) die "$EXIT_USAGE" "unknown cross-path claim acquisition mode: $mode." ;;
 	esac
@@ -298,6 +298,12 @@ acquire_cross_path_claim() {
 	*) die "$EXIT_RUNTIME_STATE" "cross-path claim is unavailable for task scope: $SCOPE; stopping before worker startup." ;;
 	esac
 	CROSS_PATH_CLAIMED=1
+}
+
+handoff_cross_path_claim() {
+	# Continuation/recovery must win registry invocation ownership before its
+	# process can become the claim's release authority.
+	acquire_cross_path_claim reenter
 }
 
 release_cross_path_claim() {
@@ -1227,6 +1233,7 @@ continue_worker() {
 	# rejects a competing owner before this process can claim the registry task.
 	acquire_cross_path_claim legacy
 	claim_invocation
+	handoff_cross_path_claim
 	resume_task "$artifact_dir" "$PROMPT_FILE"
 }
 
@@ -1239,6 +1246,7 @@ finish_worker() {
 	trap finish_on_error EXIT
 	acquire_cross_path_claim recover
 	claim_invocation
+	handoff_cross_path_claim
 	run_registry_quiet complete-and-retire --task-id "$TASK_ID" --status "$FINISH_STATUS" --evidence "$FINISH_EVIDENCE" --invocation-token "$INVOCATION_TOKEN" --repo "$REPO_INPUT"
 	REGISTRY_TASK_RETIRED_BY_RUN=1
 	INVOCATION_CLAIMED=0

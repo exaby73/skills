@@ -57,7 +57,7 @@ cleanup_test_root() {
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
 	done
-	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}"; do
+	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}" "${continue_claim_race_owner_pid:-}"; do
 		[[ -n "$fixture_pid" ]] || continue
 		kill -TERM "$fixture_pid" 2>/dev/null || true
 		wait "$fixture_pid" 2>/dev/null || true
@@ -1508,6 +1508,28 @@ wait "$finish_race_owner_pid" 2>/dev/null || true
 finish_race_owner_pid=''
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --status interrupted --evidence 'legacy finish invocation-race claim retention test complete' >/dev/null
 bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$finish_race_scope" --token "task-$finish_race_task_id" >/dev/null
+
+printf '%s\n' 'preserve active claim when continuation loses invocation race' >"$PROMPT_FILE"
+continue_claim_race_task_id='continue-claim-invocation-race'
+continue_claim_race_scope='preserve active owner during rejected continuation'
+"$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$continue_claim_race_task_id" --scope "$continue_claim_race_scope" >/dev/null
+"$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$continue_claim_race_task_id" --session-id 01continue-claim-race-session >/dev/null
+"$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$continue_claim_race_task_id" --session-id 01continue-claim-race-session >/dev/null
+mkdir -m 0700 "$registry_dir/artifacts/$continue_claim_race_task_id"
+sleep 30 &
+continue_claim_race_owner_pid=$!
+"$REGISTRY_SCRIPT" claim-invocation --repo "$REPO_ROOT" --task-id "$continue_claim_race_task_id" --pid "$continue_claim_race_owner_pid" --token continue-claim-race-winner >/dev/null
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$continue_claim_race_scope" --token "task-$continue_claim_race_task_id" --pid "$continue_claim_race_owner_pid" >/dev/null
+continue_claim_race_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --task-id "$continue_claim_race_task_id" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/continue-claim-race.out" 2>&1 || continue_claim_race_status=$?
+[[ "$continue_claim_race_status" -ne 0 ]] || fail 'rejected continuation unexpectedly bypassed competing invocation ownership'
+jq -e --arg task_id "$continue_claim_race_task_id" 'any(.workers[]; .task_id == $task_id and .status == "active" and .invocation_token == "continue-claim-race-winner")' "$registry_path" >/dev/null || fail 'rejected continuation changed the active invocation owner'
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$continue_claim_race_scope" --token "task-$continue_claim_race_task_id" --pid "$continue_claim_race_owner_pid" >/dev/null || fail 'rejected continuation stole the active claim release authority'
+"$REGISTRY_SCRIPT" release-invocation --repo "$REPO_ROOT" --task-id "$continue_claim_race_task_id" --token continue-claim-race-winner >/dev/null
+kill "$continue_claim_race_owner_pid" 2>/dev/null || true
+wait "$continue_claim_race_owner_pid" 2>/dev/null || true
+continue_claim_race_owner_pid=''
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$continue_claim_race_task_id" --status interrupted --evidence 'rejected continuation claim handoff test complete' >/dev/null
 
 printf '%s\n' 'needs parent after re-entered claim' >"$PROMPT_FILE"
 reentered_retirement_task_id='reentered-claim-retirement'

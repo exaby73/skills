@@ -21,6 +21,7 @@ REQUESTED_PID=''
 REENTER=0
 REENTER_OR_ACQUIRE=0
 FALLBACK_PREFLIGHT=0
+PRESERVE_OWNER_PID=0
 CLAIM_ROOT=''
 CLAIM_PATH=''
 CLAIM_KEY=''
@@ -41,10 +42,10 @@ usage() {
 	local exit_code="${1:-0}"
 	cat <<'EOF'
 Usage:
-  cross-path-claim.sh acquire --repo PATH --scope TEXT --token TOKEN [--pid PID]
-  cross-path-claim.sh acquire --reenter --repo PATH --scope TEXT --token TOKEN [--pid PID]
-  cross-path-claim.sh acquire --reenter-or-acquire --repo PATH --scope TEXT --token TOKEN [--pid PID]
-  cross-path-claim.sh acquire --fallback-preflight --repo PATH --scope TEXT --token TOKEN [--pid PID]
+  cross-path-claim.sh acquire --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
+  cross-path-claim.sh acquire --reenter --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
+  cross-path-claim.sh acquire --reenter-or-acquire --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
+  cross-path-claim.sh acquire --fallback-preflight --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
   cross-path-claim.sh release --repo PATH --scope TEXT --token TOKEN [--pid PID]
 
 The claim is shared by native startup and the CLI fallback reservation. It is
@@ -58,6 +59,9 @@ matches, including legacy fallback continuation after its active registry row
 has been validated. Acquire and release serialize through a short-lived
 private lock. Fallback preflight runs under that lock before checkout-seal
 creation and claim publication.
+When --preserve-owner-pid is supplied, same-owner re-entry validates the claim
+without handing off its release PID; the caller must win its registry-side
+ownership step before re-entering again to hand off release authority.
 EOF
 	exit "$exit_code"
 }
@@ -727,7 +731,9 @@ acquire_claim() {
 			if [[ "$FALLBACK_PREFLIGHT" -eq 1 ]]; then
 				finish_fallback_preflight
 			fi
-			refresh_owner_pid || die "$EXIT_FILESYSTEM" 'cannot hand off cross-path claim ownership after re-entry.'
+			if [[ "$PRESERVE_OWNER_PID" -eq 0 ]]; then
+				refresh_owner_pid || die "$EXIT_FILESYSTEM" 'cannot hand off cross-path claim ownership after re-entry.'
+			fi
 			printf 'Re-entered cross-path claim=%s\n' "$CLAIM_KEY"
 			release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after re-entry.'
 			return 0
@@ -815,6 +821,10 @@ while [[ $# -gt 0 ]]; do
 		REQUESTED_PID="$2"
 		shift 2
 		;;
+	--preserve-owner-pid)
+		PRESERVE_OWNER_PID=1
+		shift
+		;;
 		--reenter)
 			REENTER=1
 			shift
@@ -841,6 +851,7 @@ release)
 esac
 [[ "$REENTER" -eq 0 || "$REENTER_OR_ACQUIRE" -eq 0 ]] || die "$EXIT_USAGE" '--reenter and --reenter-or-acquire cannot be combined.'
 [[ "$FALLBACK_PREFLIGHT" -eq 0 || "$MODE" == acquire ]] || die "$EXIT_USAGE" '--fallback-preflight is only valid with acquire.'
+[[ "$PRESERVE_OWNER_PID" -eq 0 || "$MODE" == acquire ]] || die "$EXIT_USAGE" '--preserve-owner-pid is only valid with acquire.'
 validate_scope
 validate_token
 if [[ -n "$REQUESTED_PID" ]]; then
