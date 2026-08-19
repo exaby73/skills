@@ -239,6 +239,9 @@ verify_checkout_git_pointer() {
 	local git_pointer="$REPO_ROOT/.git"
 	local backlink=''
 	local pointer_path=''
+	local gitdir_backlink=''
+	local backlink_parent=''
+	local backlink_name=''
 	if [[ -d "$git_pointer" ]]; then
 		[[ ! -L "$git_pointer" ]] || die "$EXIT_FILESYSTEM" 'ordinary checkout .git must not be symlinked.'
 		pointer_path="$(cd -P "$git_pointer" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" 'cannot resolve ordinary checkout .git directory.'
@@ -261,6 +264,18 @@ verify_checkout_git_pointer() {
 	backlink="${backlink#gitdir: }"
 	pointer_path="$(resolve_git_path "$backlink")" || die "$EXIT_FILESYSTEM" 'cannot resolve linked-worktree .git backlink.'
 	[[ "$pointer_path" == "$GIT_DIR_REAL" ]] || die "$EXIT_FILESYSTEM" 'linked-worktree .git backlink does not match Git administration evidence.'
+	[[ -f "$GIT_DIR_REAL/gitdir" && ! -L "$GIT_DIR_REAL/gitdir" ]] || die "$EXIT_FILESYSTEM" 'linked-worktree Git administration backlink is missing or unsafe.'
+	[[ "$(regular_file_link_count "$GIT_DIR_REAL/gitdir")" == 1 ]] || die "$EXIT_FILESYSTEM" 'linked-worktree Git administration backlink must have exactly one hard link.'
+	IFS= read -r gitdir_backlink <"$GIT_DIR_REAL/gitdir" || die "$EXIT_FILESYSTEM" 'cannot read linked-worktree Git administration backlink.'
+	case "$gitdir_backlink" in
+	/*) ;;
+	*) gitdir_backlink="$GIT_DIR_REAL/$gitdir_backlink" ;;
+	esac
+	backlink_parent="${gitdir_backlink%/*}"
+	backlink_name="${gitdir_backlink##*/}"
+	[[ -n "$backlink_parent" && -n "$backlink_name" ]] || die "$EXIT_FILESYSTEM" 'linked-worktree administration backlink is incomplete.'
+	backlink_parent="$(cd -P "$backlink_parent" 2>/dev/null && pwd -P)" || die "$EXIT_FILESYSTEM" 'cannot resolve linked-worktree administration backlink.'
+	[[ "$backlink_parent/$backlink_name" == "$REPO_ROOT/.git" ]] || die "$EXIT_FILESYSTEM" 'linked-worktree administration backlink does not name this checkout.'
 }
 
 read_checkout_seal() {

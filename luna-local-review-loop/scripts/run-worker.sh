@@ -45,7 +45,11 @@ INVOCATION_CLAIMED=0
 INVOCATION_OWNERSHIP_PROVEN=0
 REGISTRY_TASK_RETIRED_BY_RUN=0
 CROSS_PATH_CLAIMED=0
+CROSS_PATH_CLAIM_ACQUIRED=0
+CROSS_PATH_CLAIM_REENTERED=0
 CROSS_PATH_TOKEN=''
+REGISTRY_RESERVATION_ATTEMPTED=0
+REGISTRY_RESERVATION_SUCCEEDED=0
 ACTIVE_CODEX_PID=''
 ACTIVE_CODEX_PGID=''
 ACTIVE_CODEX_INSTANCE=''
@@ -212,6 +216,8 @@ finish_on_error() {
 	local exit_code=$?
 	local registry_cleanup_status=0
 	local claim_release_status=0
+	local release_claim_owned_by_launcher=0
+	local reservation_probe_status=0
 	close_prompt_descriptor
 	cleanup_prompt_staging
 	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$INVOCATION_CLAIMED" -eq 1 && -n "$TASK_ID" && -n "$INVOCATION_TOKEN" ]]; then
@@ -222,7 +228,20 @@ finish_on_error() {
 			INVOCATION_CLAIMED=0
 		fi
 	fi
-	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 && ( "$INVOCATION_OWNERSHIP_PROVEN" -eq 1 || "$REGISTRY_TASK_RETIRED_BY_RUN" -eq 1 ) ]]; then
+	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
+		if [[ "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
+			reservation_probe_status=0
+			reservation_outcome_is_rejected || reservation_probe_status=$?
+			case "$reservation_probe_status" in
+			0) release_claim_owned_by_launcher=1 ;;
+			1) : ;; # The exact reservation committed; preserve registry and claim.
+			*) registry_cleanup_status=1 ;; # No locked proof; preserve state and claim.
+			esac
+		elif [[ ( "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 || "$CROSS_PATH_CLAIM_REENTERED" -eq 1 ) && ( "$INVOCATION_OWNERSHIP_PROVEN" -eq 1 || "$REGISTRY_TASK_RETIRED_BY_RUN" -eq 1 ) ]]; then
+			release_claim_owned_by_launcher=1
+		fi
+	fi
+	if [[ "$release_claim_owned_by_launcher" -eq 1 ]]; then
 		release_cross_path_claim || claim_release_status=$?
 	fi
 	INVOCATION_CLAIMED=0
@@ -268,8 +287,8 @@ acquire_cross_path_claim() {
 	case "$claim_status" in
 	0)
 		case "$claim_output" in
-		'Re-entered cross-path claim='*) : ;;
-		'Acquired cross-path claim='*) : ;;
+		'Re-entered cross-path claim='*) CROSS_PATH_CLAIM_REENTERED=1 ;;
+		'Acquired cross-path claim='*) CROSS_PATH_CLAIM_ACQUIRED=1 ;;
 		*) die "$EXIT_RUNTIME_STATE" 'cross-path claim returned an unrecognized successful acquisition result.' ;;
 		esac
 		;;
@@ -283,7 +302,21 @@ release_cross_path_claim() {
 	if [[ "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
 		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" >/dev/null || return 1
 		CROSS_PATH_CLAIMED=0
+		CROSS_PATH_CLAIM_ACQUIRED=0
+		CROSS_PATH_CLAIM_REENTERED=0
 	fi
+}
+
+reservation_outcome_is_rejected() {
+	local reservation_status=''
+	if ! reservation_status="$("$REGISTRY_SCRIPT" reservation-status --task-id "$TASK_ID" --scope "$SCOPE" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT" 2>/dev/null)"; then
+		return 2
+	fi
+	case "$reservation_status" in
+	not-committed) return 0 ;;
+	committed) return 1 ;;
+	*) return 2 ;;
+	esac
 }
 
 claim_invocation() {
@@ -1117,7 +1150,9 @@ launch_worker() {
 	local reserve_args=(reserve --task-id "$TASK_ID" --scope "$SCOPE" --pid "$$" --token "$INVOCATION_TOKEN" --repo "$REPO_INPUT")
 	[[ -z "$RETRY_OF" ]] || reserve_args+=(--retry-of "$RETRY_OF")
 	[[ -z "$TASK_SANDBOX" ]] || reserve_args+=(--sandbox "$TASK_SANDBOX")
+	REGISTRY_RESERVATION_ATTEMPTED=1
 	run_registry_quiet "${reserve_args[@]}"
+	REGISTRY_RESERVATION_SUCCEEDED=1
 	INVOCATION_CLAIMED=1
 	INVOCATION_OWNERSHIP_PROVEN=1
 	TASK_SANDBOX="$("$REGISTRY_SCRIPT" query --task-id "$TASK_ID" --repo "$REPO_INPUT" | jq -r '.sandbox')"
