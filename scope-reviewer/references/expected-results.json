@@ -1,0 +1,290 @@
+{
+  "fixtures": [
+    {
+      "id": "harbor-labels",
+      "expectedDecision": "Approved",
+      "coverage": [
+        {
+          "id": "R1",
+          "status": "Implemented",
+          "contractEvidence": "The label contract requires trimming and rejecting an empty normalized label.",
+          "diffEvidence": "labels/format.py trims the value and raises the established validation error when it is empty."
+        },
+        {
+          "id": "R2",
+          "status": "Implemented",
+          "contractEvidence": "The label contract requires preserving the original value for diagnostics.",
+          "diffEvidence": "labels/format.py returns both normalized and original values."
+        },
+        {
+          "id": "R3",
+          "status": "Implemented",
+          "contractEvidence": "The label contract requires focused whitespace and empty-input tests.",
+          "diffEvidence": "labels/test_format.py covers trimming, original-value preservation, and empty normalized input."
+        },
+        {
+          "id": "R4",
+          "status": "Implemented",
+          "contractEvidence": "The review requires dependency and relationship discovery, the dependency authority/source, its exact revision or immutable identity, relevant evidence, and reload/reconciliation before judgment.",
+          "diffEvidence": "The linked docs/label-contract.md dependency has exact identity 1111111111111111111111111111111111111111; relevant evidence is reconciled after reload before judgment."
+        }
+      ],
+      "blockingFindings": [],
+      "outOfScopeInventory": [],
+      "missingEvidence": [],
+      "contradictoryEvidence": [],
+      "dispositionRequiredBeforeBranchChange": false
+    },
+    {
+      "id": "cobalt-parser",
+      "expectedDecision": "Evidence blocked",
+      "coverage": [
+        {
+          "id": "R1",
+          "status": "Partial",
+          "contractEvidence": "The parser contract requires normalization and rejection of blank normalized input.",
+          "diffEvidence": "parser/token.py trims input but returns an empty value instead of rejecting blank input."
+        },
+        {
+          "id": "R2",
+          "status": "Unverifiable",
+          "contractEvidence": "The parser contract requires returning the original token for diagnostics.",
+          "diffEvidence": "parser/token.py returns the original raw token, but no applicable focused parser validation evidence was supplied."
+        },
+        {
+          "id": "R3",
+          "status": "Missing",
+          "contractEvidence": "The parser contract requires successful-normalization and blank-input tests.",
+          "diffEvidence": "The full diff contains no parser test file or focused test additions."
+        },
+        {
+          "id": "R4",
+          "status": "Unverifiable",
+          "contractEvidence": "The review requires dependency and relationship discovery, the dependency authority/source, its exact revision or immutable identity, relevant evidence, and reload/reconciliation before judgment.",
+          "diffEvidence": "The linked docs/parser-contract.md dependency has exact identity 2222222222222222222222222222222222222222, but no dependency reload/reconciliation evidence was supplied at target head."
+        }
+      ],
+      "blockingFindings": [
+        {
+          "severity": "Major",
+          "kind": "scope-gap",
+          "scenario": "A caller supplies input containing only whitespace.",
+          "impact": "The parser accepts a blank token instead of preserving the required validation behavior.",
+          "failedGuard": "The parser validation control fails because no blank-input rejection or focused test guards the trim-only path.",
+          "evidence": "The exact diff adds trim logic but returns the normalized empty value; no blank-input test is present.",
+          "governingCriterion": "The linked parser contract requires rejecting blank normalized input with ParseError(\"blank\") and testing it.",
+          "fixBoundary": "Add the blank-input rejection and focused parser tests within the token-parser change."
+        }
+      ],
+      "outOfScopeInventory": [],
+      "missingEvidence": [
+        "No focused parser test result was supplied for target head 2222222222222222222222222222222222222222.",
+        "Behavior-focused parser validation required by the repository policy and linked contract is unavailable."
+      ],
+      "contradictoryEvidence": [],
+      "requiredAction": "Supply focused parser validation evidence for target head 2222222222222222222222222222222222222222, then repeat the review from a fresh source reload.",
+      "dispositionRequiredBeforeBranchChange": false
+    },
+    {
+      "id": "linen-export",
+      "expectedDecision": "Approved",
+      "coverage": [
+        {
+          "id": "R1",
+          "status": "Implemented",
+          "contractEvidence": "The export contract requires stable key order.",
+          "diffEvidence": "export/record.py emits id, title, and note in the contract order."
+        },
+        {
+          "id": "R2",
+          "status": "Implemented",
+          "contractEvidence": "The export contract requires omission of null fields.",
+          "diffEvidence": "export/record.py skips values that are None."
+        },
+        {
+          "id": "R3",
+          "status": "Implemented",
+          "contractEvidence": "The export contract requires preserving Unicode characters.",
+          "diffEvidence": "serializeRecord uses ensure_ascii=False and the focused test covers Café."
+        },
+        {
+          "id": "R4",
+          "status": "Implemented",
+          "contractEvidence": "The export contract requires focused tests for each rule.",
+          "diffEvidence": "export/test_record.py covers null omission, ordering, and Unicode output; validation evidence is tied to the target head."
+        },
+        {
+          "id": "R5",
+          "status": "Implemented",
+          "contractEvidence": "The review requires dependency and relationship discovery, the dependency authority/source, its exact revision or immutable identity, relevant evidence, and reload/reconciliation before judgment.",
+          "diffEvidence": "The linked docs/export-contract.md dependency has exact identity 3333333333333333333333333333333333333333; relevant evidence is reconciled after reload before judgment."
+        }
+      ],
+      "blockingFindings": [],
+      "outOfScopeInventory": [],
+      "missingEvidence": [],
+      "contradictoryEvidence": [],
+      "dispositionRequiredBeforeBranchChange": false
+    },
+    {
+      "id": "ember-report",
+      "expectedDecision": "Request changes",
+      "coverage": [
+        {
+          "id": "R1",
+          "status": "Implemented",
+          "contractEvidence": "The report contract requires UTC report-date formatting.",
+          "diffEvidence": "reports/date.py converts the value to UTC and formats the date."
+        },
+        {
+          "id": "R2",
+          "status": "Implemented",
+          "contractEvidence": "The linked report contract requires retaining the current report field order.",
+          "diffEvidence": "The full diff leaves report field-order code unchanged; report changes are limited to reports/date.py and reports/test_date.py."
+        },
+        {
+          "id": "R3",
+          "status": "Implemented",
+          "contractEvidence": "The report contract requires a focused formatter test.",
+          "diffEvidence": "reports/test_date.py covers the UTC day."
+        },
+        {
+          "id": "R4",
+          "status": "Implemented",
+          "contractEvidence": "The review requires dependency and relationship discovery, the dependency authority/source, its exact revision or immutable identity, relevant evidence, and reload/reconciliation before judgment.",
+          "diffEvidence": "The linked docs/report-contract.md dependency has exact identity 4444444444444444444444444444444444444444; relevant evidence is reconciled after reload before judgment."
+        }
+      ],
+      "blockingFindings": [
+        {
+          "severity": "Major",
+          "kind": "out-of-scope",
+          "scenario": "The target is delivered with the requested report formatter and an additional profile-label change.",
+          "impact": "An excluded profile behavior reaches the target without user or parent authorization, so scope cannot be approved.",
+          "failedGuard": "The profile-exclusion control fails because the exact diff admits a profile-label change without a disposition gate or authorization.",
+          "evidence": "The exact full diff adds preferred_name to profiles/labels.txt, while AGENTS.md, docs/report-contract.md, and the explicit exclusions forbid profile changes.",
+          "governingCriterion": "The contract authorizes report-date formatting and explicitly excludes profiles/ and account-facing presentation.",
+          "fixBoundary": "Pause for explicit user choice: Expand this task, Create a follow-up issue, or Explicitly defer/accept the risk; do not choose."
+        }
+      ],
+      "outOfScopeInventory": [
+        {
+          "behavior": "Adding preferred_name to profile labels.",
+          "evidence": "The exact diff changes profiles/labels.txt in commit 4444444.",
+          "authorization": "No contract amendment authorizes profile behavior; the explicit exclusion forbids it.",
+          "dispositionRequired": true,
+          "choices": [
+            "Expand this task",
+            "Create a follow-up issue",
+            "Explicitly defer/accept the risk"
+          ]
+        }
+      ],
+      "missingEvidence": [],
+      "contradictoryEvidence": [],
+      "dispositionRequiredBeforeBranchChange": true
+    },
+    {
+      "id": "maple-schedule",
+      "expectedDecision": "Evidence blocked",
+      "coverage": [
+        {
+          "id": "R1",
+          "status": "Partial",
+          "contractEvidence": "The schedule contract requires converting a local timestamp to UTC.",
+          "diffEvidence": "schedule/next_run.py attaches the local zone but does not convert the parsed value to UTC."
+        },
+        {
+          "id": "R2",
+          "status": "Unverifiable",
+          "contractEvidence": "The schedule contract requires preserving the invalid-time error.",
+          "diffEvidence": "The exact diff delegates invalid input to parse_local and includes an invalid-path test, but no applicable focused schedule validation result was supplied."
+        },
+        {
+          "id": "R3",
+          "status": "Missing",
+          "contractEvidence": "The schedule contract requires a daylight-saving boundary test.",
+          "diffEvidence": "The full diff contains no daylight-saving boundary test."
+        },
+        {
+          "id": "R4",
+          "status": "Unverifiable",
+          "contractEvidence": "The review requires dependency and relationship discovery, the dependency authority/source, its exact revision or immutable identity, relevant evidence, and reload/reconciliation before judgment.",
+          "diffEvidence": "The linked docs/schedule-contract.md dependency has exact identity 5555555555555555555555555555555555555555, but no dependency reload/reconciliation evidence was supplied at target head."
+        }
+      ],
+      "blockingFindings": [
+        {
+          "severity": "Major",
+          "kind": "scope-gap",
+          "scenario": "A scheduled job crosses a daylight-saving boundary and asks for its next run.",
+          "impact": "The returned timestamp remains in the local zone, so the required UTC scheduling behavior is incomplete and untested at the boundary.",
+          "failedGuard": "The UTC conversion and boundary-test controls fail because next_run only attaches the local zone and no daylight-saving test guards conversion to UTC.",
+          "evidence": "schedule/next_run.py calls parsed.replace(tzinfo=zone) and the full diff lacks the required daylight-saving test.",
+          "governingCriterion": "The linked schedule contract requires local-to-UTC conversion and a daylight-saving boundary test.",
+          "fixBoundary": "Complete the UTC conversion and add the focused boundary test within the schedule change."
+        },
+        {
+          "severity": "Major",
+          "kind": "out-of-scope",
+          "scenario": "The schedule change also removes the currency field from account summaries.",
+          "impact": "An explicitly excluded account behavior changes in the same target and requires user or parent disposition before branch changes.",
+          "failedGuard": "The account-summary exclusion control fails because accounts/summary.py changes the excluded currency field without a disposition gate.",
+          "evidence": "accounts/summary.py drops currency in the exact diff; AGENTS.md and the explicit exclusions forbid account changes.",
+          "governingCriterion": "The contract authorizes next-run scheduling and explicitly excludes accounts/ and account-summary fields.",
+          "fixBoundary": "Obtain user choice before branch changes: Expand this task, Create a follow-up issue, or Explicitly defer/accept the risk; do not choose."
+        }
+      ],
+      "outOfScopeInventory": [
+        {
+          "behavior": "Removing currency from account summaries.",
+          "evidence": "The exact diff changes accounts/summary.py in commit 5555555.",
+          "authorization": "No amendment authorizes account behavior; the explicit exclusion forbids it.",
+          "dispositionRequired": true,
+          "choices": [
+            "Expand this task",
+            "Create a follow-up issue",
+            "Explicitly defer/accept the risk"
+          ]
+        }
+      ],
+      "missingEvidence": [
+        "The daylight-saving boundary test result was not supplied for target head 5555555555555555555555555555555555555555.",
+        "Required behavior-focused schedule validation evidence is unavailable."
+      ],
+      "contradictoryEvidence": [],
+      "requiredAction": "Supply daylight-saving boundary validation evidence for target head 5555555555555555555555555555555555555555, resolve the recorded account-summary disposition, then repeat the review from a fresh source reload.",
+      "dispositionRequiredBeforeBranchChange": true
+    },
+    {
+      "id": "quartz-policy",
+      "expectedDecision": "Evidence blocked",
+      "coverage": [
+        {
+          "id": "R1",
+          "status": "Unverifiable",
+          "contractEvidence": "The contract and amendment permit a migration only under conditions whose source precedence is unresolved.",
+          "diffEvidence": "The exact diff changes the mode for both existing and new records, but the governing sources conflict about existing records."
+        },
+        {
+          "id": "R2",
+          "status": "Unverifiable",
+          "contractEvidence": "The review requires dependency and relationship discovery, each dependency authority/source, exact revision or immutable identity, relevant evidence, and reload/reconciliation before judgment.",
+          "diffEvidence": "The linked docs/compatibility.md and docs/migration-notes.md dependencies are recorded; each dependency has exact identity 6666666666666666666666666666666666666666, but their conflicting evidence and unresolved reload/reconciliation prevent judgment."
+        }
+      ],
+      "blockingFindings": [],
+      "outOfScopeInventory": [],
+      "missingEvidence": [
+        "An authoritative precedence decision between docs/compatibility.md and docs/migration-notes.md",
+        "A resolved interpretation of the amendment's migration condition",
+        "Migration evidence proving which existing-record behavior the exact head is authorized to change"
+      ],
+      "contradictoryEvidence": [
+        "docs/compatibility.md requires existing records to retain their stored mode, while docs/migration-notes.md requires existing records to change in the same release"
+      ],
+      "requiredAction": "Resolve source precedence and the amendment condition, provide the required migration evidence for target head 6666666666666666666666666666666666666666, then repeat the review from a fresh source reload.",
+      "dispositionRequiredBeforeBranchChange": false
+    }
+  ]
+}

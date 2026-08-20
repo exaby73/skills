@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scope Compliance Reviewer"
+  short_description: "Requirement- and scope-gated review"
+  default_prompt: "Use $scope-reviewer to verify this change against its exact contract and report scope compliance."
