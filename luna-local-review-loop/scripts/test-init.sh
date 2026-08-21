@@ -52,12 +52,12 @@ readonly TEST_ROOT
 cleanup_test_root() {
 	local fixture_pid
 	local runner_pid
-	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}" "${reservation_race_runner_pid:-}" "${reentry_reservation_runner_pid:-}" "${pre_reservation_runner_pid:-}" "${two_launcher_a_pid:-}" "${two_launcher_b_pid:-}" "${reverse_launcher_a_pid:-}" "${reverse_launcher_b_pid:-}" "${missing_launcher_a_pid:-}" "${missing_launcher_b_pid:-}"; do
+	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}" "${reservation_race_runner_pid:-}" "${reentry_reservation_runner_pid:-}" "${post_reservation_return_runner_pid:-}" "${pre_reservation_runner_pid:-}" "${two_launcher_a_pid:-}" "${two_launcher_b_pid:-}" "${reverse_launcher_a_pid:-}" "${reverse_launcher_b_pid:-}" "${missing_launcher_a_pid:-}" "${missing_launcher_b_pid:-}"; do
 		[[ -n "$runner_pid" ]] || continue
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
 	done
-	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}" "${continue_claim_race_owner_pid:-}" "${reentry_reservation_owner_pid:-}"; do
+	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}" "${continue_claim_race_owner_pid:-}" "${reentry_reservation_owner_pid:-}" "${post_reservation_return_owner_pid:-}"; do
 		[[ -n "$fixture_pid" ]] || continue
 		kill -TERM "$fixture_pid" 2>/dev/null || true
 		wait "$fixture_pid" 2>/dev/null || true
@@ -1505,6 +1505,74 @@ reentry_reservation_invocation_token="$(jq -er --arg task_id "$reentry_reservati
 bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$$" >/dev/null
 bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$$" >/dev/null
 [[ ! -e "$reentry_reservation_claim_path" && ! -L "$reentry_reservation_claim_path" ]] || fail 're-entry reservation ambiguity fixture left a cross-path claim after recovery'
+
+printf '%s\n' 'preserve parent-held claim after post-reservation handoff interrupt' >"$PROMPT_FILE"
+post_reservation_return_task_id='post-reservation-handoff-interrupt-race'
+post_reservation_return_scope='preserve claim after post-reservation handoff interrupt'
+post_reservation_return_bash_env="$TEST_ROOT/post-reservation-return-bash-env"
+post_reservation_return_marker="$TEST_ROOT/post-reservation-return-marker"
+post_reservation_return_release_marker="$TEST_ROOT/post-reservation-return-release"
+cat >"$post_reservation_return_bash_env" <<'EOF'
+if [[ "${LUNA_TEST_POST_RESERVATION_RETURN_GATE:-0}" == 1 ]]; then
+  set -T
+  trap '
+    if [[ "$BASH_COMMAND" == *INVOCATION_CLAIMED=1* && "${LUNA_TEST_POST_RESERVATION_RETURN_TRIGGERED:-0}" != 1 ]]; then
+      LUNA_TEST_POST_RESERVATION_RETURN_TRIGGERED=1
+      : >"${LUNA_TEST_POST_RESERVATION_RETURN_MARKER:?}"
+      while [[ ! -e "${LUNA_TEST_POST_RESERVATION_RETURN_RELEASE_MARKER:?}" ]]; do
+        sleep 0.01
+      done
+    fi
+  ' DEBUG
+fi
+EOF
+chmod 0600 "$post_reservation_return_bash_env"
+post_reservation_return_owner_pid=''
+sleep 30 &
+post_reservation_return_owner_pid=$!
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$post_reservation_return_scope" --token "task-$post_reservation_return_task_id" --pid "$post_reservation_return_owner_pid" >/dev/null
+post_reservation_return_runner_pid=''
+LUNA_TEST_POST_RESERVATION_RETURN_GATE=1 \
+LUNA_TEST_POST_RESERVATION_RETURN_MARKER="$post_reservation_return_marker" \
+LUNA_TEST_POST_RESERVATION_RETURN_RELEASE_MARKER="$post_reservation_return_release_marker" \
+BASH_ENV="$post_reservation_return_bash_env" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$post_reservation_return_task_id" --scope "$post_reservation_return_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/post-reservation-return.out" 2>&1 &
+post_reservation_return_runner_pid=$!
+poll_attempt=0
+while [[ ! -e "$post_reservation_return_marker" ]] && process_is_live_non_zombie "$post_reservation_return_runner_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$post_reservation_return_marker" ]] || fail 'post-reservation handoff fixture did not reach its controlled interrupt boundary'
+jq -e --arg task_id "$post_reservation_return_task_id" --arg scope "$post_reservation_return_scope" 'any(.workers[]; .task_id == $task_id and .scope == $scope and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'post-reservation handoff fixture did not publish its token-bearing reservation'
+post_reservation_return_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+post_reservation_return_claim_path=''
+for post_reservation_return_candidate in "$post_reservation_return_claim_root"/*; do
+	[[ -f "$post_reservation_return_candidate" && ! -L "$post_reservation_return_candidate" ]] || continue
+	if rg -q "^token=task-$post_reservation_return_task_id$" "$post_reservation_return_candidate"; then
+		post_reservation_return_claim_path="$post_reservation_return_candidate"
+		break
+	fi
+done
+[[ -n "$post_reservation_return_claim_path" ]] || fail 'post-reservation handoff fixture did not retain the parent-held claim'
+rg -q "^lease=$post_reservation_return_runner_pid\\|.+$" "$post_reservation_return_claim_path" || fail 'post-reservation handoff fixture did not retain the runner lease'
+kill "$post_reservation_return_owner_pid" 2>/dev/null || true
+wait "$post_reservation_return_owner_pid" 2>/dev/null || true
+post_reservation_return_owner_pid=''
+kill -TERM "$post_reservation_return_runner_pid"
+: >"$post_reservation_return_release_marker"
+post_reservation_return_status=0
+wait "$post_reservation_return_runner_pid" || post_reservation_return_status=$?
+post_reservation_return_runner_pid=''
+[[ "$post_reservation_return_status" -ne 0 ]] || fail 'post-reservation handoff interrupt unexpectedly succeeded'
+[[ -f "$post_reservation_return_claim_path" && ! -L "$post_reservation_return_claim_path" ]] || fail 'post-reservation handoff interrupt released the last cross-path claim'
+rg -q '^lease=' "$post_reservation_return_claim_path" || fail 'post-reservation handoff interrupt released its ambiguity-preserving lease'
+jq -e --arg task_id "$post_reservation_return_task_id" 'any(.workers[]; .task_id == $task_id and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'post-reservation handoff interrupt lost the committed reservation'
+post_reservation_return_invocation_token="$(jq -er --arg task_id "$post_reservation_return_task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token' "$registry_path")"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$post_reservation_return_task_id" --status interrupted --evidence 'post-reservation handoff interrupt fixture complete' --invocation-token "$post_reservation_return_invocation_token" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$post_reservation_return_scope" --token "task-$post_reservation_return_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$post_reservation_return_scope" --token "task-$post_reservation_return_task_id" --pid "$$" >/dev/null
+[[ ! -e "$post_reservation_return_claim_path" && ! -L "$post_reservation_return_claim_path" ]] || fail 'post-reservation handoff fixture left a cross-path claim after recovery'
 
 printf '%s\n' 'interrupt after reservation publication' >"$PROMPT_FILE"
 reservation_race_task_id='reservation-publication-interrupt-race'

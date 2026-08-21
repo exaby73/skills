@@ -233,9 +233,10 @@ finish_on_error() {
 		if [[ "$CROSS_PATH_LEASE_HELD" -eq 1 ]]; then
 			# A preserved re-entry owns only its matching lease until the
 			# registry handoff. If reservation publication was attempted but
-			# not acknowledged, probe its locked outcome before releasing the
-			# lease: only a proven tokenless rejection may release it.
-			if [[ "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
+			# registry-side invocation ownership is not proven, probe its locked
+			# outcome before releasing the lease: only a proven tokenless
+			# rejection may release it.
+			if [[ "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && ( "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 || "$INVOCATION_OWNERSHIP_PROVEN" -eq 0 ) ]]; then
 				reservation_probe_status=0
 				reservation_outcome_is_rejected || reservation_probe_status=$?
 				case "$reservation_probe_status" in
