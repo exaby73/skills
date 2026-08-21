@@ -1,18 +1,28 @@
 {
   "version": 1,
+  "packagePaths": [
+    "SKILL.md",
+    "agents/openai.yaml",
+    "references/expected-results.json",
+    "references/fixture-catalog.md",
+    "scripts/test_fixtures.py"
+  ],
+  "catalogSha256": "67fa68f26740de35bd3fadc20191c5bd58b2ca2319fffa2f812e8d264ce97f15",
   "fixtures": [
     {
       "id": "unbounded-natural-language",
+      "kind": "negative",
       "expectedConclusion": "Reject as unbounded",
       "requiredSignals": [
         "reject every equivalent way",
         "reviewer-discovered paraphrases",
         "No finite input domain",
-        "stopping condition"
+        "## Stopping conditions"
       ]
     },
     {
       "id": "bounded-structural",
+      "kind": "positive",
       "expectedConclusion": "Ready to publish",
       "requiredSignals": [
         "R1`: In bounded domain",
@@ -23,6 +33,7 @@
     },
     {
       "id": "finite-universal",
+      "kind": "positive",
       "expectedConclusion": "Ready to publish",
       "requiredSignals": [
         "six-value lifecycle enum",
@@ -33,6 +44,7 @@
     },
     {
       "id": "ambiguous-evidence",
+      "kind": "negative",
       "expectedConclusion": "Needs clarification",
       "requiredSignals": [
         "Make the workflow better",
@@ -43,6 +55,7 @@
     },
     {
       "id": "fixture-boundary",
+      "kind": "positive",
       "expectedConclusion": "Ready to publish",
       "requiredSignals": [
         "declared endpoint fixture set",

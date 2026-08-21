@@ -26,18 +26,38 @@ Related issue
 Proposed contract
 
 ```md
+## Outcome
+
+Add a browser-use guard with finite validation evidence.
+
+## In scope
+
+- The one known browser-use mutation path.
+
+## Explicit exclusions
+
+- No claim about arbitrary future inputs or paraphrases.
+
 ## Acceptance criteria
 
 - The validator must reject every equivalent way to request browser use.
-```
 
-Validation plan
+## Validation evidence
 
 - Keep adding reviewer-discovered paraphrases until no more can be found.
 
-Owner decisions
+## Dependencies and relationships
 
 - None supplied.
+
+## Stopping conditions
+
+- No finite input domain, threat model, corpus, or semantic parser is supplied.
+
+## Owner decisions
+
+- None supplied.
+```
 
 ## Fixture: bounded-structural
 
@@ -185,18 +205,34 @@ Proposed contract
 
 Make the workflow better.
 
+## In scope
+
+- The unresolved workflow proposal in the linked issue.
+
+## Explicit exclusions
+
+- No implementation scope is authorized until the ambiguity is resolved.
+
 ## Acceptance criteria
 
 - Reviewers confirm the implementation is correct.
-```
 
-Validation evidence
+## Validation evidence
 
 - None named.
 
-Owner decisions
+## Dependencies and relationships
+
+- The linked issue has an unresolved disagreement about whether the change is MVP or future scope.
+
+## Stopping conditions
+
+- Stop while the MVP-versus-future disagreement remains unresolved.
+
+## Owner decisions
 
 - MVP scope and completion owner are unresolved.
+```
 
 ## Fixture: fixture-boundary
 
@@ -241,7 +277,6 @@ Protect two declared team routes and calibrate their finite security fixtures.
 ## Dependencies and relationships
 
 - The production authorization test and fixture validator are separate evidence sources for the same two-route domain.
-```
 
 ## Validation evidence
 
