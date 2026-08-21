@@ -47,6 +47,7 @@ REGISTRY_TASK_RETIRED_BY_RUN=0
 CROSS_PATH_CLAIMED=0
 CROSS_PATH_CLAIM_ACQUIRED=0
 CROSS_PATH_CLAIM_REENTERED=0
+CROSS_PATH_LEASE_HELD=0
 CROSS_PATH_TOKEN=''
 REGISTRY_RESERVATION_ATTEMPTED=0
 REGISTRY_RESERVATION_SUCCEEDED=0
@@ -229,7 +230,13 @@ finish_on_error() {
 		fi
 	fi
 	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
-		if [[ "$MODE" == launch && "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 0 ]]; then
+		if [[ "$CROSS_PATH_LEASE_HELD" -eq 1 ]]; then
+			# A preserved re-entry owns only its matching lease until the
+			# registry handoff. Release that lease on every failure path; the
+			# claim primitive retains a live owner claim and removes an exited
+			# owner claim only after proving no lease remains.
+			release_claim_owned_by_launcher=1
+		elif [[ "$MODE" == launch && "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 0 ]]; then
 			release_claim_owned_by_launcher=1
 		elif [[ "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
 			reservation_probe_status=0
@@ -270,8 +277,10 @@ acquire_cross_path_claim() {
 	case "$mode" in
 	initial)
 		# A parent may already hold the documented fallback claim. Re-enter that
-		# exact stable task token; otherwise acquire the claim atomically here.
-		claim_args+=(--reenter-or-acquire --fallback-preflight)
+		# exact stable task token without taking its release authority; otherwise
+		# acquire the claim atomically here. The registry reservation winner hands
+		# off release authority explicitly below.
+		claim_args+=(--reenter-or-acquire --fallback-preflight --preserve-owner-pid)
 		;;
 	recover) claim_args+=(--preserve-owner-pid) ;;
 	reenter) claim_args+=(--reenter) ;;
@@ -288,9 +297,16 @@ acquire_cross_path_claim() {
 	fi
 	case "$claim_status" in
 	0)
-		case "$claim_output" in
-		'Re-entered cross-path claim='*) CROSS_PATH_CLAIM_REENTERED=1 ;;
-		'Acquired cross-path claim='*) CROSS_PATH_CLAIM_ACQUIRED=1 ;;
+			case "$claim_output" in
+			'Re-entered cross-path claim='*)
+				CROSS_PATH_CLAIM_REENTERED=1
+				if [[ "$mode" == reenter ]]; then
+					CROSS_PATH_LEASE_HELD=0
+				else
+					CROSS_PATH_LEASE_HELD=1
+				fi
+				;;
+			'Acquired cross-path claim='*) CROSS_PATH_CLAIM_ACQUIRED=1 ;;
 		*) die "$EXIT_RUNTIME_STATE" 'cross-path claim returned an unrecognized successful acquisition result.' ;;
 		esac
 		;;
@@ -301,17 +317,22 @@ acquire_cross_path_claim() {
 }
 
 handoff_cross_path_claim() {
-	# Continuation/recovery must win registry invocation ownership before its
-	# process can become the claim's release authority.
+	# A launcher, continuation, or recovery process must win registry-side
+	# invocation ownership before becoming the claim's release authority.
 	acquire_cross_path_claim reenter
 }
 
 release_cross_path_claim() {
 	if [[ "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
-		bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" --pid "$$" >/dev/null || return 1
+		if [[ "$CROSS_PATH_LEASE_HELD" -eq 1 ]]; then
+			bash "$CLAIM_SCRIPT" release --release-reentry --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" --pid "$$" >/dev/null || return 1
+		else
+			bash "$CLAIM_SCRIPT" release --repo "$REPO_INPUT" --scope "$SCOPE" --token "$CROSS_PATH_TOKEN" --pid "$$" >/dev/null || return 1
+		fi
 		CROSS_PATH_CLAIMED=0
 		CROSS_PATH_CLAIM_ACQUIRED=0
 		CROSS_PATH_CLAIM_REENTERED=0
+		CROSS_PATH_LEASE_HELD=0
 	fi
 }
 
@@ -1163,6 +1184,7 @@ launch_worker() {
 	REGISTRY_RESERVATION_SUCCEEDED=1
 	INVOCATION_CLAIMED=1
 	INVOCATION_OWNERSHIP_PROVEN=1
+	handoff_cross_path_claim
 	TASK_SANDBOX="$("$REGISTRY_SCRIPT" query --task-id "$TASK_ID" --repo "$REPO_INPUT" | jq -r '.sandbox')"
 	case "$TASK_SANDBOX" in read-only | workspace-write) ;; *) die "$EXIT_RUNTIME_STATE" "registry returned invalid sandbox for task $TASK_ID." ;; esac
 

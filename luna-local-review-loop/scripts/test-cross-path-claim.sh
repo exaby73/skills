@@ -6,7 +6,7 @@ CLAIM_SCRIPT="$SCRIPT_DIR/cross-path-claim.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/luna-cross-path-claim.XXXXXX")"
 cleanup_test_root() {
 	local process_id
-	for process_id in "${pid_a:-}" "${pid_b:-}" "${release_pid_a:-}" "${release_pid_b:-}" "${new_owner_pid:-}" "${fallback_preflight_pid:-}" "${fallback_competing_pid:-}"; do
+	for process_id in "${pid_a:-}" "${pid_b:-}" "${release_pid_a:-}" "${release_pid_b:-}" "${new_owner_pid:-}" "${handoff_owner_pid:-}" "${fallback_preflight_pid:-}" "${fallback_competing_pid:-}"; do
 		[[ -n "$process_id" ]] || continue
 		kill "$process_id" 2>/dev/null || true
 		wait "$process_id" 2>/dev/null || true
@@ -169,6 +169,107 @@ rg -q '^scope=[0-9a-f]{64}$' "$claim_path" || {
 	exit 1
 }
 
+lease_repo="$TEST_ROOT/lease-repository"
+lease_scope='v2 metadata and stale lease pruning'
+lease_token='lease-owner'
+lease_claim_root="$lease_repo/.git/.luna-cross-path-claims"
+mkdir -m 0700 "$lease_repo"
+git init -q "$lease_repo"
+bash "$CLAIM_SCRIPT" acquire --repo "$lease_repo" --scope "$lease_scope" --token "$lease_token" --pid "$$" >/dev/null
+lease_writer_pid=''
+bash "$CLAIM_SCRIPT" acquire --reenter --preserve-owner-pid --repo "$lease_repo" --scope "$lease_scope" --token "$lease_token" >"$TEST_ROOT/lease-writer.out" 2>"$TEST_ROOT/lease-writer.err" &
+lease_writer_pid=$!
+lease_writer_status=0
+wait "$lease_writer_pid" || lease_writer_status=$?
+lease_writer_pid=''
+[[ "$lease_writer_status" -eq 0 ]] || {
+	printf 'preserved re-entry lease writer failed: status=%s\n' "$lease_writer_status" >&2
+	sed -n '1,40p' "$TEST_ROOT/lease-writer.err" >&2 || true
+	exit 1
+}
+lease_claim_path="$(find "$lease_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)"
+[[ -f "$lease_claim_path" && ! -L "$lease_claim_path" ]] || {
+	printf 'preserved re-entry did not publish a v2 claim: %s\n' "$lease_claim_root" >&2
+	exit 1
+}
+rg -q '^version=2$' "$lease_claim_path" || { printf 'claim metadata did not use v2 format\n' >&2; exit 1; }
+rg -q '^instance=.+$' "$lease_claim_path" || { printf 'v2 claim metadata did not pin owner process instance\n' >&2; exit 1; }
+rg -q '^lease=[0-9]+\|.+$' "$lease_claim_path" || { printf 'v2 claim metadata did not record re-entry lease\n' >&2; exit 1; }
+bash "$CLAIM_SCRIPT" release --repo "$lease_repo" --scope "$lease_scope" --token "$lease_token" --pid "$$" >/dev/null
+[[ -z "$(find "$lease_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)" ]] || {
+	printf 'stale re-entry lease was not pruned by matching owner cleanup\n' >&2
+	exit 1
+}
+
+handoff_repo="$TEST_ROOT/same-token-handoff-repository"
+handoff_scope='same-token handoff rejects stale owner release'
+handoff_token='same-token-handoff-owner'
+handoff_claim_root="$handoff_repo/.git/.luna-cross-path-claims"
+mkdir -m 0700 "$handoff_repo"
+git init -q "$handoff_repo"
+bash "$CLAIM_SCRIPT" acquire --repo "$handoff_repo" --scope "$handoff_scope" --token "$handoff_token" --pid "$$" >/dev/null
+handoff_claim_path="$(find "$handoff_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)"
+[[ -f "$handoff_claim_path" && ! -L "$handoff_claim_path" ]] || {
+	printf 'same-token handoff fixture did not publish its initial claim\n' >&2
+	exit 1
+}
+
+set +e
+bash "$CLAIM_SCRIPT" release --repo "$handoff_repo" --scope "$handoff_scope" --token "$handoff_token" >"$TEST_ROOT/handoff-missing-pid.out" 2>"$TEST_ROOT/handoff-missing-pid.err"
+handoff_missing_pid_status=$?
+set -e
+[[ "$handoff_missing_pid_status" -eq 2 ]] || {
+	printf 'owner release without --pid returned status %s instead of usage failure\n' "$handoff_missing_pid_status" >&2
+	exit 1
+}
+[[ -f "$handoff_claim_path" ]] || {
+	printf 'owner release without --pid removed active claim\n' >&2
+	exit 1
+}
+
+sleep 30 &
+handoff_owner_pid=$!
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$handoff_repo" --scope "$handoff_scope" --token "$handoff_token" --pid "$handoff_owner_pid" >/dev/null
+rg -q "^pid=$handoff_owner_pid$" "$handoff_claim_path" || {
+	printf 'same-token handoff did not publish the winning owner PID\n' >&2
+	exit 1
+}
+
+set +e
+bash "$CLAIM_SCRIPT" release --repo "$handoff_repo" --scope "$handoff_scope" --token "$handoff_token" --pid "$$" >"$TEST_ROOT/handoff-stale-owner.out" 2>"$TEST_ROOT/handoff-stale-owner.err"
+handoff_stale_owner_status=$?
+set -e
+[[ "$handoff_stale_owner_status" -eq 6 ]] || {
+	printf 'stale owner release returned status %s instead of conflict\n' "$handoff_stale_owner_status" >&2
+	exit 1
+}
+[[ -f "$handoff_claim_path" ]] || {
+	printf 'stale owner release removed winning handoff claim\n' >&2
+	exit 1
+}
+
+set +e
+bash "$CLAIM_SCRIPT" acquire --repo "$handoff_repo" --scope "$handoff_scope" --token different-token --pid "$$" >"$TEST_ROOT/handoff-different-token.out" 2>"$TEST_ROOT/handoff-different-token.err"
+handoff_different_token_status=$?
+set -e
+[[ "$handoff_different_token_status" -eq 6 ]] || {
+	printf 'different token acquired during active handoff claim: status=%s\n' "$handoff_different_token_status" >&2
+	exit 1
+}
+[[ -f "$handoff_claim_path" ]] || {
+	printf 'different-token conflict removed winning handoff claim\n' >&2
+	exit 1
+}
+
+bash "$CLAIM_SCRIPT" release --repo "$handoff_repo" --scope "$handoff_scope" --token "$handoff_token" --pid "$handoff_owner_pid" >/dev/null
+[[ -z "$(find "$handoff_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)" ]] || {
+	printf 'current handoff owner could not release its claim\n' >&2
+	exit 1
+}
+kill "$handoff_owner_pid" 2>/dev/null || true
+wait "$handoff_owner_pid" 2>/dev/null || true
+handoff_owner_pid=''
+
 set +e
 bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$SCOPE" --token "$winner" >/dev/null 2>"$TEST_ROOT/reentry-required.err"
 same_owner_status=$?
@@ -178,7 +279,7 @@ set -e
 	exit 1
 }
 
-bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$SCOPE" --token "$winner" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$SCOPE" --token "$winner" --pid "$$" >/dev/null
 
 replacement_seal="$(printf '%064x' 1)"
 printf '%s\n' "$replacement_seal" >"$seal_path"
@@ -283,7 +384,7 @@ LUNA_TEST_CLAIM_KEY="$claim_key" \
 	LUNA_TEST_REAL_MKDIR="$release_real_mkdir" \
 	LUNA_TEST_REAL_RMDIR="$release_real_rmdir" \
 	PATH="$release_bin:$PATH" \
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token "$winner" >"$TEST_ROOT/release-b.out" 2>"$TEST_ROOT/release-b.err" &
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token "$winner" --pid "$$" >"$TEST_ROOT/release-b.out" 2>"$TEST_ROOT/release-b.err" &
 release_pid_b=$!
 release_wait_attempt=0
 while [[ ! -e "$release_marker" && "$release_wait_attempt" -lt 1000 ]]; do
@@ -303,7 +404,7 @@ LUNA_TEST_REAL_RM="$release_real_rm" \
 LUNA_TEST_REAL_MKDIR="$release_real_mkdir" \
 LUNA_TEST_REAL_RMDIR="$release_real_rmdir" \
 PATH="$release_bin:$PATH" \
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token "$winner" >"$TEST_ROOT/release-a.out" 2>"$TEST_ROOT/release-a.err" &
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token "$winner" --pid "$$" >"$TEST_ROOT/release-a.out" 2>"$TEST_ROOT/release-a.err" &
 release_pid_a=$!
 : >"$release_gate"
 race_wait_attempt=0
@@ -320,7 +421,7 @@ LUNA_TEST_REAL_NEW_OWNER_MKDIR="$(command -p -v mkdir)" \
 	LUNA_TEST_NEW_OWNER_LOCK_MARKER="$new_owner_lock_marker" \
 	LUNA_TEST_RELEASE_A_LOCK_RELEASED="$release_a_lock_released" \
 	PATH="$new_owner_bin:$PATH" \
-bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-racing-release >"$TEST_ROOT/new-owner.out" 2>"$TEST_ROOT/new-owner.err" &
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-racing-release --pid "$$" >"$TEST_ROOT/new-owner.out" 2>"$TEST_ROOT/new-owner.err" &
 new_owner_pid=$!
 race_wait_attempt=0
 while [[ ! -e "$new_owner_lock_marker" && "$race_wait_attempt" -lt 1000 ]]; do
@@ -370,7 +471,7 @@ rg -q '^token=token-after-racing-release$' "$claim_path" || {
 	printf 'delayed same-owner release removed a newly acquired claim (release statuses %s/%s)\n' "$release_status_a" "$release_status_b" >&2
 	exit 1
 }
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-racing-release >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-racing-release --pid "$$" >/dev/null
 
 set +e
 bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$SCOPE" --token token-before-initial >/dev/null 2>"$TEST_ROOT/reentry-without-claim.err"
@@ -381,8 +482,10 @@ set -e
 	exit 1
 }
 
-bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-release >/dev/null
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-release >/dev/null
+# Documented native lifecycle: the long-lived controller PID is carried through
+# acquire and release, so terminal cleanup can prove and remove its own claim.
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-release --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$SCOPE" --token token-after-release --pid "$$" >/dev/null
 
 [[ -d "$claim_root" && ! -L "$claim_root" ]] || {
 	echo 'cross-path claim root was not created under Git common metadata' >&2
@@ -428,8 +531,8 @@ linked_claim_root="$(cd -P "$linked_claim_root" && pwd -P)/.luna-cross-path-clai
 	echo 'copied linked worktree rejection created cross-path claim coordination state' >&2
 	exit 1
 }
-bash "$CLAIM_SCRIPT" acquire --repo "$linked_worktree" --scope 'accept valid linked-worktree administration backlink' --token linked-owner >/dev/null
-bash "$CLAIM_SCRIPT" release --repo "$linked_worktree" --scope 'accept valid linked-worktree administration backlink' --token linked-owner >/dev/null
+bash "$CLAIM_SCRIPT" acquire --repo "$linked_worktree" --scope 'accept valid linked-worktree administration backlink' --token linked-owner --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$linked_worktree" --scope 'accept valid linked-worktree administration backlink' --token linked-owner --pid "$$" >/dev/null
 
 seal_race_repo="$TEST_ROOT/shared-seal-race-repository"
 seal_race_scope_a='shared seal cleanup scope A'
@@ -478,7 +581,7 @@ seal_race_seal="$seal_race_repo/.git/.luna-checkout-identity"
 }
 seal_race_value="$(cat "$seal_race_seal")"
 
-bash "$CLAIM_SCRIPT" acquire --repo "$seal_race_repo" --scope "$seal_race_scope_b" --token seal-race-b >"$TEST_ROOT/shared-seal-race-b.out" 2>"$TEST_ROOT/shared-seal-race-b.err" &
+bash "$CLAIM_SCRIPT" acquire --repo "$seal_race_repo" --scope "$seal_race_scope_b" --token seal-race-b --pid "$$" >"$TEST_ROOT/shared-seal-race-b.out" 2>"$TEST_ROOT/shared-seal-race-b.err" &
 seal_race_pid_b=$!
 seal_race_status_b=0
 wait "$seal_race_pid_b" || seal_race_status_b=$?
@@ -515,7 +618,7 @@ rg -q '^token=seal-race-b$' "$seal_race_claim_b" || {
 	printf 'second scope claim owner changed after failed first-scope cleanup\n' >&2
 	exit 1
 }
-bash "$CLAIM_SCRIPT" release --repo "$seal_race_repo" --scope "$seal_race_scope_b" --token seal-race-b >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$seal_race_repo" --scope "$seal_race_scope_b" --token seal-race-b --pid "$$" >/dev/null
 
 fallback_repo="$TEST_ROOT/fallback-preflight-repository"
 fallback_scope='fallback preflight under claim lock'
@@ -580,7 +683,7 @@ fallback_claim_root="$fallback_repo/.git/.luna-cross-path-claims"
 LUNA_TEST_PREFLIGHT_MARKER="$fallback_preflight_marker" \
 LUNA_TEST_PREFLIGHT_GATE="$fallback_preflight_gate" \
 LUNA_TEST_PREFLIGHT_FAILURE_MARKER="$fallback_preflight_failure_marker" \
-bash "$fallback_script_dir/cross-path-claim.sh" acquire --fallback-preflight --repo "$fallback_repo" --scope "$fallback_scope" --token fallback-owner >"$TEST_ROOT/fallback-preflight.out" 2>"$TEST_ROOT/fallback-preflight.err" &
+bash "$fallback_script_dir/cross-path-claim.sh" acquire --fallback-preflight --repo "$fallback_repo" --scope "$fallback_scope" --token fallback-owner --pid "$$" >"$TEST_ROOT/fallback-preflight.out" 2>"$TEST_ROOT/fallback-preflight.err" &
 fallback_preflight_pid=$!
 fallback_wait_attempt=0
 while [[ ! -e "$fallback_preflight_marker" && "$fallback_wait_attempt" -lt 1000 ]]; do
@@ -686,7 +789,7 @@ fallback_competing_pid=''
 	printf 'competing acquisition bypassed serialized fallback preflight: status=%s\n' "$fallback_competing_status" >&2
 	exit 1
 }
-bash "$fallback_script_dir/cross-path-claim.sh" release --repo "$fallback_repo" --scope "$fallback_scope" --token fallback-owner >/dev/null
+bash "$fallback_script_dir/cross-path-claim.sh" release --repo "$fallback_repo" --scope "$fallback_scope" --token fallback-owner --pid "$$" >/dev/null
 
 assert_fallback_preflight_failure() {
 	local case_name="$1"
@@ -900,7 +1003,8 @@ bash "$launch_fixture_scripts/cross-path-claim.sh" acquire \
 	--fallback-preflight \
 	--repo "$launch_fixture_repo" \
 	--scope "$launch_fixture_scope" \
-	--token "$launch_fixture_token" >/dev/null
+	--token "$launch_fixture_token" \
+	--pid "$$" >/dev/null
 
 launch_fixture_status=0
 if CODEX_BIN=codex \
@@ -932,6 +1036,10 @@ rg -Fq -- "token=$launch_fixture_token" "$launch_fixture_claim_path" || {
 	printf 'same-owner fallback launch changed parent-held claim owner\n' >&2
 	exit 1
 }
+if rg -q '^lease=' "$launch_fixture_claim_path"; then
+	printf 'same-owner fallback launch leaked its pre-reservation re-entry lease\n' >&2
+	exit 1
+fi
 
 rm -f "$launch_fixture_init_marker"
 launch_fixture_competing_status=0
@@ -962,7 +1070,8 @@ rg -Fq -- "token=$launch_fixture_token" "$launch_fixture_claim_path" || {
 bash "$launch_fixture_scripts/cross-path-claim.sh" release \
 	--repo "$launch_fixture_repo" \
 	--scope "$launch_fixture_scope" \
-	--token "$launch_fixture_token" >/dev/null
+	--token "$launch_fixture_token" \
+	--pid "$$" >/dev/null
 [[ -z "$(find "$launch_fixture_claim_root" -mindepth 1 -maxdepth 1 -type f -print -quit)" ]] || {
 	printf 'fallback launch regression fixture left a live claim\n' >&2
 	exit 1

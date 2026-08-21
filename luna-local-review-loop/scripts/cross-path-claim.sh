@@ -22,6 +22,7 @@ REENTER=0
 REENTER_OR_ACQUIRE=0
 FALLBACK_PREFLIGHT=0
 PRESERVE_OWNER_PID=0
+RELEASE_REENTRY=0
 CLAIM_ROOT=''
 CLAIM_PATH=''
 CLAIM_KEY=''
@@ -37,6 +38,9 @@ REGISTRY_PREFLIGHT_RELEASE_TOKEN=''
 CHECKOUT_PHYSICAL_IDENTITY=''
 CHECKOUT_IDENTITY=''
 SHA256_COMMAND=''
+STORED_OWNER_PID=''
+STORED_OWNER_INSTANCE=''
+LEASE_RECORDS=''
 
 usage() {
 	local exit_code="${1:-0}"
@@ -46,7 +50,8 @@ Usage:
   cross-path-claim.sh acquire --reenter --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
   cross-path-claim.sh acquire --reenter-or-acquire --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
   cross-path-claim.sh acquire --fallback-preflight --repo PATH --scope TEXT --token TOKEN [--pid PID] [--preserve-owner-pid]
-  cross-path-claim.sh release --repo PATH --scope TEXT --token TOKEN [--pid PID]
+  cross-path-claim.sh release --repo PATH --scope TEXT --token TOKEN --pid PID
+  cross-path-claim.sh release --release-reentry --repo PATH --scope TEXT --token TOKEN --pid PID
 
 The claim is shared by native startup and the CLI fallback reservation. It is
 keyed by physical checkout identity plus immutable scope and is separate from
@@ -59,9 +64,13 @@ matches, including legacy fallback continuation after its active registry row
 has been validated. Acquire and release serialize through a short-lived
 private lock. Fallback preflight runs under that lock before checkout-seal
 creation and claim publication.
-When --preserve-owner-pid is supplied, same-owner re-entry validates the claim
-without handing off its release PID; the caller must win its registry-side
-ownership step before re-entering again to hand off release authority.
+Normal owner release requires --pid so it can prove the current owner's
+process instance; use --release-reentry for a separately leased re-entry.
+When --preserve-owner-pid is supplied, same-owner re-entry records a private
+process-instance lease without handing off its release PID; the caller must
+win its registry-side ownership step before re-entering again to hand off
+release authority. A lease is removed only by its matching process instance;
+stale leases are reclaimed only after process-exit or PID-reuse proof.
 EOF
 	exit "$exit_code"
 }
@@ -212,14 +221,18 @@ owner_metadata_shape_is_valid() {
 	local path="$1"
 	awk -F= '
 		BEGIN { valid = 1 }
-		NR == 1 { valid = valid && NF == 2 && $1 == "version" && $2 == "1"; next }
+		NR == 1 { valid = valid && NF == 2 && $1 == "version" && $2 == "2"; next }
 		NR == 2 { valid = valid && NF == 2 && $1 == "identity" && $2 != ""; next }
 		NR == 3 { valid = valid && NF == 2 && $1 == "scope" && $2 != ""; next }
 		NR == 4 { valid = valid && NF == 2 && $1 == "token" && $2 != ""; next }
 		NR == 5 { valid = valid && NF == 2 && $1 == "pid" && $2 ~ /^[0-9]+$/; next }
-		{ valid = 0 }
+		NR == 6 { valid = valid && NF == 2 && $1 == "instance" && $2 != ""; next }
+		{
+			separator = index($2, "|")
+			valid = valid && NF == 2 && $1 == "lease" && separator > 1 && substr($2, 1, separator - 1) ~ /^[0-9]+$/ && substr($2, separator + 1) != ""
+		}
 		END {
-			if (NR != 5) valid = 0
+			if (NR < 6) valid = 0
 			exit(valid ? 0 : 1)
 		}
 	' "$path" >/dev/null 2>&1
@@ -648,9 +661,13 @@ acquire_claim_lock() {
 write_owner() {
 	local owner_tmp=''
 	local owner_pid="${REQUESTED_PID:-$$}"
+	local owner_instance=''
+	owner_instance="$(process_instance_identity "$owner_pid" 2>/dev/null)" || return 1
 	owner_tmp="$(mktemp "$CLAIM_ROOT/.claim.XXXXXX")" || return 1
-	if ! printf 'version=1\nidentity=%s\nscope=%s\ntoken=%s\npid=%s\n' \
-		"$CHECKOUT_IDENTITY" "$CLAIM_KEY" "$TOKEN" "$owner_pid" >"$owner_tmp"; then
+	if ! {
+		printf 'version=2\nidentity=%s\nscope=%s\ntoken=%s\npid=%s\ninstance=%s\n' \
+			"$CHECKOUT_IDENTITY" "$CLAIM_KEY" "$TOKEN" "$owner_pid" "$owner_instance"
+	} >"$owner_tmp"; then
 		rm -f "$owner_tmp"
 		return 1
 	fi
@@ -672,12 +689,22 @@ write_owner() {
 	fi
 }
 
-refresh_owner_pid() {
+write_owner_metadata() {
 	local owner_tmp=''
-	local owner_pid="${REQUESTED_PID:-$$}"
+	local owner_pid="$1"
+	local owner_instance="$2"
+	local record=''
 	owner_tmp="$(mktemp "$CLAIM_ROOT/.claim.XXXXXX")" || return 1
-	if ! printf 'version=1\nidentity=%s\nscope=%s\ntoken=%s\npid=%s\n' \
-		"$CHECKOUT_IDENTITY" "$CLAIM_KEY" "$TOKEN" "$owner_pid" >"$owner_tmp"; then
+	if ! {
+		printf 'version=2\nidentity=%s\nscope=%s\ntoken=%s\npid=%s\ninstance=%s\n' \
+			"$CHECKOUT_IDENTITY" "$CLAIM_KEY" "$TOKEN" "$owner_pid" "$owner_instance"
+		if [[ -n "$LEASE_RECORDS" ]]; then
+			while IFS= read -r record; do
+				[[ -n "$record" ]] || continue
+				printf 'lease=%s\n' "$record"
+			done <<<"$LEASE_RECORDS"
+		fi
+	} >"$owner_tmp"; then
 		rm -f "$owner_tmp"
 		return 1
 	fi
@@ -685,7 +712,7 @@ refresh_owner_pid() {
 		rm -f "$owner_tmp"
 		return 1
 	fi
-	if ! [[ -f "$CLAIM_PATH" && ! -L "$CLAIM_PATH" ]] || ! claim_owner_matches; then
+	if ! [[ -f "$CLAIM_PATH" && ! -L "$CLAIM_PATH" ]]; then
 		rm -f "$owner_tmp"
 		return 1
 	fi
@@ -702,18 +729,159 @@ read_owner_field() {
 	awk -F= -v field="$field" '$1 == field {print substr($0, index($0, "=") + 1); exit}' "$CLAIM_PATH"
 }
 
+load_claim_metadata() {
+	local record=''
+	private_file_is_valid "$CLAIM_PATH" || return 1
+	owner_metadata_shape_is_valid "$CLAIM_PATH" || return 1
+	[[ "$(read_owner_field version)" == 2 ]] || return 1
+	STORED_OWNER_PID="$(read_owner_field pid)" || return 1
+	STORED_OWNER_INSTANCE="$(read_owner_field instance)" || return 1
+	LEASE_RECORDS=''
+	while IFS= read -r record; do
+		[[ -n "$record" ]] || continue
+		if [[ -n "$LEASE_RECORDS" ]]; then
+			LEASE_RECORDS+=$'\n'
+		fi
+		LEASE_RECORDS+="$record"
+	done < <(awk -F= '$1 == "lease" {print substr($0, index($0, "=") + 1)}' "$CLAIM_PATH")
+}
+
 claim_owner_matches() {
-	local stored_version
 	local stored_identity
 	local stored_scope
 	local stored_token
-	private_file_is_valid "$CLAIM_PATH" || return 1
-	owner_metadata_shape_is_valid "$CLAIM_PATH" || return 1
-	stored_version="$(read_owner_field version)" || return 1
+	load_claim_metadata || return 1
 	stored_identity="$(read_owner_field identity)" || return 1
 	stored_scope="$(read_owner_field scope)" || return 1
 	stored_token="$(read_owner_field token)" || return 1
-	[[ "$stored_version" == 1 && "$stored_identity" == "$CHECKOUT_IDENTITY" && "$stored_scope" == "$CLAIM_KEY" && "$stored_token" == "$TOKEN" ]]
+	[[ "$stored_identity" == "$CHECKOUT_IDENTITY" && "$stored_scope" == "$CLAIM_KEY" && "$stored_token" == "$TOKEN" ]]
+}
+
+lease_record_for_process() {
+	local pid="${1:-${REQUESTED_PID:-$$}}"
+	local instance=''
+	instance="$(process_instance_identity "$pid" 2>/dev/null)" || return 1
+	printf '%s|%s\n' "$pid" "$instance"
+}
+
+lease_records_contain() {
+	local target="$1"
+	local record=''
+	while IFS= read -r record; do
+		[[ "$record" == "$target" ]] && return 0
+	done <<<"$LEASE_RECORDS"
+	return 1
+}
+
+append_lease_record() {
+	local record="$1"
+	if ! lease_records_contain "$record"; then
+		if [[ -n "$LEASE_RECORDS" ]]; then
+			LEASE_RECORDS+=$'\n'
+		fi
+		LEASE_RECORDS+="$record"
+	fi
+}
+
+remove_lease_record() {
+	local target="$1"
+	local record=''
+	local kept=''
+	local removed=1
+	while IFS= read -r record; do
+		[[ -n "$record" ]] || continue
+		if [[ "$record" == "$target" ]]; then
+			removed=0
+			continue
+		fi
+		if [[ -n "$kept" ]]; then
+			kept+=$'\n'
+		fi
+		kept+="$record"
+	done <<<"$LEASE_RECORDS"
+	LEASE_RECORDS="$kept"
+	return "$removed"
+}
+
+lease_process_is_stale() {
+	local pid="$1"
+	local expected_instance="$2"
+	local current_instance=''
+	if ! process_is_live_non_zombie "$pid"; then
+		return 0
+	fi
+	current_instance="$(process_instance_identity "$pid" 2>/dev/null)" || return 2
+	[[ "$current_instance" == "$expected_instance" ]] && return 1
+	return 0
+}
+
+prune_stale_leases() {
+	local record=''
+	local lease_pid=''
+	local lease_instance=''
+	local kept=''
+	local changed=0
+	local lease_status=0
+	load_claim_metadata || return 1
+	while IFS= read -r record; do
+		[[ -n "$record" ]] || continue
+		lease_pid="${record%%|*}"
+		lease_instance="${record#*|}"
+		lease_status=0
+		lease_process_is_stale "$lease_pid" "$lease_instance" || lease_status=$?
+		case "$lease_status" in
+		0) changed=1; continue ;;
+		1) : ;;
+		*) return 2 ;;
+		esac
+		if [[ -n "$kept" ]]; then
+			kept+=$'\n'
+		fi
+		kept+="$record"
+	done <<<"$LEASE_RECORDS"
+	if [[ "$changed" -eq 1 ]]; then
+		LEASE_RECORDS="$kept"
+		write_owner_metadata "$STORED_OWNER_PID" "$STORED_OWNER_INSTANCE" || return 1
+	fi
+}
+
+owner_process_is_live() {
+	local current_instance=''
+	if ! process_is_live_non_zombie "$STORED_OWNER_PID"; then
+		return 1
+	fi
+	current_instance="$(process_instance_identity "$STORED_OWNER_PID" 2>/dev/null)" || return 2
+	[[ "$current_instance" == "$STORED_OWNER_INSTANCE" ]] && return 0
+	return 1
+}
+
+register_reentry_lease() {
+	local current_pid="${REQUESTED_PID:-$$}"
+	local current_instance=''
+	local record=''
+	load_claim_metadata || return 1
+	current_instance="$(process_instance_identity "$current_pid" 2>/dev/null)" || return 1
+	if [[ "$STORED_OWNER_PID" == "$current_pid" ]]; then
+		[[ "$STORED_OWNER_INSTANCE" == "$current_instance" ]] || return 1
+		return 0
+	fi
+	record="$current_pid|$current_instance"
+	append_lease_record "$record"
+	write_owner_metadata "$STORED_OWNER_PID" "$STORED_OWNER_INSTANCE"
+}
+
+refresh_owner_pid() {
+	local owner_pid="${REQUESTED_PID:-$$}"
+	local owner_instance=''
+	local record=''
+	load_claim_metadata || return 1
+	owner_instance="$(process_instance_identity "$owner_pid" 2>/dev/null)" || return 1
+	if [[ "$STORED_OWNER_PID" == "$owner_pid" ]]; then
+		[[ "$STORED_OWNER_INSTANCE" == "$owner_instance" ]] || return 1
+	fi
+	record="$owner_pid|$owner_instance"
+	remove_lease_record "$record" || true
+	write_owner_metadata "$owner_pid" "$owner_instance"
 }
 
 acquire_claim() {
@@ -731,8 +899,11 @@ acquire_claim() {
 			if [[ "$FALLBACK_PREFLIGHT" -eq 1 ]]; then
 				finish_fallback_preflight
 			fi
+			prune_stale_leases || die "$EXIT_RUNTIME_STATE" 'cannot validate same-owner cross-path claim leases without process-instance proof.'
 			if [[ "$PRESERVE_OWNER_PID" -eq 0 ]]; then
 				refresh_owner_pid || die "$EXIT_FILESYSTEM" 'cannot hand off cross-path claim ownership after re-entry.'
+			else
+				register_reentry_lease || die "$EXIT_FILESYSTEM" 'cannot record same-owner cross-path claim lease after re-entry.'
 			fi
 			printf 'Re-entered cross-path claim=%s\n' "$CLAIM_KEY"
 			release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after re-entry.'
@@ -767,12 +938,12 @@ acquire_claim() {
 	die "$EXIT_CONFLICT" "cross-path claim is already held for this checkout and immutable scope: $CLAIM_KEY."
 }
 
-release_claim() {
-	local stored_version
+release_owner_claim() {
 	local stored_identity
 	local stored_scope
 	local stored_token
-	local stored_pid
+	local owner_status=0
+	[[ -n "$REQUESTED_PID" ]] || die "$EXIT_USAGE" 'release requires --pid for process-instance ownership.'
 	resolve_claim
 	acquire_claim_lock
 	[[ -e "$GIT_DIR_REAL/.luna-checkout-identity" || -L "$GIT_DIR_REAL/.luna-checkout-identity" ]] || die "$EXIT_FILESYSTEM" 'Git checkout identity seal is missing; refusing to release a claim.'
@@ -781,19 +952,78 @@ release_claim() {
 		die "$EXIT_FILESYSTEM" "cross-path claim path is not a real regular file: $CLAIM_PATH."
 	fi
 	[[ -f "$CLAIM_PATH" ]] || die "$EXIT_CONFLICT" "cross-path claim is not held: $CLAIM_KEY."
-	private_file_is_valid "$CLAIM_PATH" || die "$EXIT_CONFLICT" 'cross-path claim has no valid owner metadata; refusing to guess ownership.'
-	owner_metadata_shape_is_valid "$CLAIM_PATH" || die "$EXIT_CONFLICT" 'cross-path claim owner metadata is malformed; refusing to guess ownership.'
-	stored_version="$(read_owner_field version)" || die "$EXIT_CONFLICT" 'cross-path claim has no valid owner metadata; refusing to guess ownership.'
+	load_claim_metadata || die "$EXIT_CONFLICT" 'cross-path claim has no valid owner metadata; refusing to guess ownership.'
 	stored_identity="$(read_owner_field identity)" || die "$EXIT_CONFLICT" 'cross-path claim owner identity is missing; refusing to guess ownership.'
 	stored_scope="$(read_owner_field scope)" || die "$EXIT_CONFLICT" 'cross-path claim owner scope is missing; refusing to guess ownership.'
 	stored_token="$(read_owner_field token)" || die "$EXIT_CONFLICT" 'cross-path claim owner token is missing; refusing to guess ownership.'
-	stored_pid="$(read_owner_field pid)" || die "$EXIT_CONFLICT" 'cross-path claim owner PID is missing; refusing to guess ownership.'
-	[[ "$stored_version" == 1 && "$stored_identity" == "$CHECKOUT_IDENTITY" && "$stored_scope" == "$CLAIM_KEY" ]] || die "$EXIT_CONFLICT" 'cross-path claim owner metadata does not match this checkout and scope.'
+	[[ "$stored_identity" == "$CHECKOUT_IDENTITY" && "$stored_scope" == "$CLAIM_KEY" ]] || die "$EXIT_CONFLICT" 'cross-path claim owner metadata does not match this checkout and scope.'
 	[[ "$stored_token" == "$TOKEN" ]] || die "$EXIT_CONFLICT" 'cross-path claim token does not match its owner.'
-	[[ -z "$REQUESTED_PID" || "$stored_pid" == "$REQUESTED_PID" ]] || die "$EXIT_CONFLICT" 'cross-path claim owner PID changed; preserving the current owner.'
+	if [[ -n "$REQUESTED_PID" ]]; then
+		[[ "$STORED_OWNER_PID" == "$REQUESTED_PID" ]] || die "$EXIT_CONFLICT" 'cross-path claim owner PID changed; preserving the current owner.'
+		[[ "$(process_instance_identity "$REQUESTED_PID" 2>/dev/null)" == "$STORED_OWNER_INSTANCE" ]] || die "$EXIT_CONFLICT" 'cross-path claim owner process instance changed; preserving the current owner.'
+	fi
+	prune_stale_leases || die "$EXIT_RUNTIME_STATE" 'cannot validate cross-path claim leases without process-instance proof.'
+	if [[ -n "$LEASE_RECORDS" ]]; then
+		release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after preserving active re-entry leases.'
+		printf 'Preserved cross-path claim=%s for active same-token re-entry\n' "$CLAIM_KEY"
+		return 0
+	fi
 	rm "$CLAIM_PATH" || die "$EXIT_FILESYSTEM" 'cannot remove cross-path claim file.'
 	release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after claim removal.'
 	printf 'Released cross-path claim=%s\n' "$CLAIM_KEY"
+}
+
+release_reentry_claim() {
+	local current_pid="$REQUESTED_PID"
+	local current_instance=''
+	local current_record=''
+	local owner_status=0
+	resolve_claim
+	acquire_claim_lock
+	[[ -n "$current_pid" ]] || die "$EXIT_USAGE" 'release-reentry requires --pid for process-instance ownership.'
+	[[ -e "$GIT_DIR_REAL/.luna-checkout-identity" || -L "$GIT_DIR_REAL/.luna-checkout-identity" ]] || die "$EXIT_FILESYSTEM" 'Git checkout identity seal is missing; refusing to release a re-entry lease.'
+	set_checkout_identity
+	if [[ -L "$CLAIM_PATH" || -e "$CLAIM_PATH" && ! -f "$CLAIM_PATH" ]]; then
+		die "$EXIT_FILESYSTEM" "cross-path claim path is not a real regular file: $CLAIM_PATH."
+	fi
+	[[ -f "$CLAIM_PATH" ]] || die "$EXIT_CONFLICT" "cross-path claim is not held: $CLAIM_KEY."
+	claim_owner_matches || die "$EXIT_CONFLICT" 'cross-path claim owner metadata does not match this checkout, scope, and token.'
+	prune_stale_leases || die "$EXIT_RUNTIME_STATE" 'cannot validate cross-path claim leases without process-instance proof.'
+	current_instance="$(process_instance_identity "$current_pid" 2>/dev/null)" || die "$EXIT_CONFLICT" 're-entry process instance is unavailable; preserving the current claim.'
+	current_record="$current_pid|$current_instance"
+	lease_records_contain "$current_record" || die "$EXIT_CONFLICT" 'matching cross-path claim re-entry lease is not present; refusing to guess ownership.'
+	remove_lease_record "$current_record" || die "$EXIT_CONFLICT" 'cannot remove matching cross-path claim re-entry lease.'
+	if [[ -n "$LEASE_RECORDS" ]]; then
+		write_owner_metadata "$STORED_OWNER_PID" "$STORED_OWNER_INSTANCE" || die "$EXIT_FILESYSTEM" 'cannot atomically remove cross-path claim re-entry lease.'
+		release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after re-entry lease cleanup.'
+		printf 'Released cross-path claim re-entry=%s\n' "$CLAIM_KEY"
+		return 0
+	fi
+	owner_status=0
+	owner_process_is_live || owner_status=$?
+	case "$owner_status" in
+	0)
+		write_owner_metadata "$STORED_OWNER_PID" "$STORED_OWNER_INSTANCE" || die "$EXIT_FILESYSTEM" 'cannot atomically remove cross-path claim re-entry lease.'
+		release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after retaining active owner claim.'
+		printf 'Released cross-path claim re-entry=%s; owner claim retained\n' "$CLAIM_KEY"
+		;;
+	1)
+		rm "$CLAIM_PATH" || die "$EXIT_FILESYSTEM" 'cannot remove cross-path claim after terminal re-entry cleanup.'
+		release_claim_lock || die "$EXIT_FILESYSTEM" 'cannot release cross-path claim lock after terminal claim removal.'
+		printf 'Released cross-path claim=%s after terminal re-entry cleanup\n' "$CLAIM_KEY"
+		;;
+	*)
+		die "$EXIT_RUNTIME_STATE" 'cannot prove cross-path claim owner process exit; preserving the current claim.'
+		;;
+	esac
+}
+
+release_claim() {
+	if [[ "$RELEASE_REENTRY" -eq 1 ]]; then
+		release_reentry_claim
+	else
+		release_owner_claim
+	fi
 }
 
 [[ $# -gt 0 ]] || usage "$EXIT_USAGE"
@@ -821,10 +1051,14 @@ while [[ $# -gt 0 ]]; do
 		REQUESTED_PID="$2"
 		shift 2
 		;;
-	--preserve-owner-pid)
-		PRESERVE_OWNER_PID=1
-		shift
-		;;
+		--preserve-owner-pid)
+			PRESERVE_OWNER_PID=1
+			shift
+			;;
+		--release-reentry)
+			RELEASE_REENTRY=1
+			shift
+			;;
 		--reenter)
 			REENTER=1
 			shift
@@ -852,12 +1086,20 @@ esac
 [[ "$REENTER" -eq 0 || "$REENTER_OR_ACQUIRE" -eq 0 ]] || die "$EXIT_USAGE" '--reenter and --reenter-or-acquire cannot be combined.'
 [[ "$FALLBACK_PREFLIGHT" -eq 0 || "$MODE" == acquire ]] || die "$EXIT_USAGE" '--fallback-preflight is only valid with acquire.'
 [[ "$PRESERVE_OWNER_PID" -eq 0 || "$MODE" == acquire ]] || die "$EXIT_USAGE" '--preserve-owner-pid is only valid with acquire.'
+[[ "$RELEASE_REENTRY" -eq 0 || "$MODE" == release ]] || die "$EXIT_USAGE" '--release-reentry is only valid with release.'
+[[ "$RELEASE_REENTRY" -eq 0 || "$REENTER" -eq 0 ]] || die "$EXIT_USAGE" '--release-reentry cannot be combined with acquire re-entry.'
 validate_scope
 validate_token
 if [[ -n "$REQUESTED_PID" ]]; then
 	case "$REQUESTED_PID" in
 	'' | 0 | *[!0-9]*) die "$EXIT_USAGE" '--pid must be a positive numeric process ID.' ;;
 	esac
+fi
+if [[ "$MODE" == release && -z "$REQUESTED_PID" ]]; then
+	if [[ "$RELEASE_REENTRY" -eq 1 ]]; then
+		die "$EXIT_USAGE" 'release-reentry requires --pid for process-instance ownership.'
+	fi
+	die "$EXIT_USAGE" 'release requires --pid for process-instance ownership.'
 fi
 case "$MODE" in
 acquire) acquire_claim ;;
