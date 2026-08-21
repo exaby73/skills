@@ -52,12 +52,12 @@ readonly TEST_ROOT
 cleanup_test_root() {
 	local fixture_pid
 	local runner_pid
-	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}" "${reservation_race_runner_pid:-}" "${pre_reservation_runner_pid:-}" "${two_launcher_a_pid:-}" "${two_launcher_b_pid:-}"; do
+	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}" "${reservation_race_runner_pid:-}" "${reentry_reservation_runner_pid:-}" "${post_reservation_return_runner_pid:-}" "${pre_reservation_runner_pid:-}" "${two_launcher_a_pid:-}" "${two_launcher_b_pid:-}" "${reverse_launcher_a_pid:-}" "${reverse_launcher_b_pid:-}" "${missing_launcher_a_pid:-}" "${missing_launcher_b_pid:-}"; do
 		[[ -n "$runner_pid" ]] || continue
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
 	done
-	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}" "${continue_claim_race_owner_pid:-}"; do
+	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}" "${continue_claim_race_owner_pid:-}" "${reentry_reservation_owner_pid:-}" "${post_reservation_return_owner_pid:-}"; do
 		[[ -n "$fixture_pid" ]] || continue
 		kill -TERM "$fixture_pid" 2>/dev/null || true
 		wait "$fixture_pid" 2>/dev/null || true
@@ -1121,6 +1121,12 @@ set -euo pipefail
 if [[ "${LUNA_TEST_STAT_GATE:-0}" == 1 && "$#" -eq 3 && "$1" == '-c' && "$2" == '%a' && "$3" == "${LUNA_TEST_ARTIFACT_ROOT:-}" && ! -e "${LUNA_TEST_STAT_MARKER:-}" ]]; then
   : >"$LUNA_TEST_STAT_MARKER"
   while [[ ! -e "$LUNA_TEST_STAT_RELEASE" ]]; do sleep 0.01; done
+  [[ "${LUNA_TEST_STAT_FAIL_AFTER_GATE:-0}" == 1 ]] && exit 1
+fi
+if [[ "${LUNA_TEST_STAT_FAIL_AFTER_GATE:-0}" == 1 && "$#" -eq 3 && "${!#}" == "${LUNA_TEST_ARTIFACT_ROOT:-}" ]]; then
+  if [[ ("$1" == '-c' && "$2" == '%a') || ("$1" == '-f' && "$2" == '%Lp') ]]; then
+    exit 1
+  fi
 fi
 exec "$LUNA_TEST_REAL_STAT" "$@"
 EOF
@@ -1233,6 +1239,163 @@ for two_launcher_candidate in "$launch_pre_reservation_claim_root"/*; do
 done
 chmod 0700 "$registry_dir/artifacts"
 
+printf '%s\n' 'reverse-order same-token launch race' >"$PROMPT_FILE"
+reverse_launcher_task_id='reverse-same-token-launcher-race'
+reverse_launcher_scope='preserve claim before reverse same-token reservation'
+reverse_launcher_a_stat_marker="$TEST_ROOT/reverse-same-token-launcher-a-stat"
+reverse_launcher_a_stat_release="$TEST_ROOT/reverse-same-token-launcher-a-stat-release"
+reverse_launcher_b_stat_marker="$TEST_ROOT/reverse-same-token-launcher-b-stat"
+reverse_launcher_b_stat_release="$TEST_ROOT/reverse-same-token-launcher-b-stat-release"
+chmod 0755 "$registry_dir/artifacts"
+reverse_launcher_a_pid=''
+LUNA_TEST_STAT_GATE=1 \
+LUNA_TEST_ARTIFACT_ROOT="$registry_dir/artifacts" \
+LUNA_TEST_STAT_MARKER="$reverse_launcher_a_stat_marker" \
+LUNA_TEST_STAT_RELEASE="$reverse_launcher_a_stat_release" \
+LUNA_TEST_REAL_STAT="$pre_reservation_real_stat" \
+PATH="$pre_reservation_stat_bin:$PATH" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$reverse_launcher_task_id" --scope "$reverse_launcher_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/reverse-same-token-launcher-a.out" 2>&1 &
+reverse_launcher_a_pid=$!
+poll_attempt=0
+while [[ ! -e "$reverse_launcher_a_stat_marker" ]] && process_is_live_non_zombie "$reverse_launcher_a_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$reverse_launcher_a_stat_marker" ]] || fail 'reverse-order launcher A did not reach post-claim setup gate'
+
+reverse_launcher_b_pid=''
+LUNA_TEST_STAT_GATE=1 \
+LUNA_TEST_ARTIFACT_ROOT="$registry_dir/artifacts" \
+LUNA_TEST_STAT_MARKER="$reverse_launcher_b_stat_marker" \
+LUNA_TEST_STAT_RELEASE="$reverse_launcher_b_stat_release" \
+LUNA_TEST_REAL_STAT="$pre_reservation_real_stat" \
+PATH="$pre_reservation_stat_bin:$PATH" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$reverse_launcher_task_id" --scope "$reverse_launcher_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/reverse-same-token-launcher-b.out" 2>&1 &
+reverse_launcher_b_pid=$!
+poll_attempt=0
+while [[ ! -e "$reverse_launcher_b_stat_marker" ]] && process_is_live_non_zombie "$reverse_launcher_b_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$reverse_launcher_b_stat_marker" ]] || fail 'reverse-order launcher B did not re-enter before reservation'
+reverse_launcher_claim_path=''
+for reverse_launcher_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$reverse_launcher_candidate" && ! -L "$reverse_launcher_candidate" ]] || continue
+	if rg -q "^token=task-$reverse_launcher_task_id$" "$reverse_launcher_candidate"; then
+		reverse_launcher_claim_path="$reverse_launcher_candidate"
+		break
+	fi
+done
+[[ -n "$reverse_launcher_claim_path" ]] || fail 'reverse-order same-token race did not retain claim during launcher B re-entry'
+reverse_launcher_claim_pid="$(awk -F= '$1 == "pid" {print $2; exit}' "$reverse_launcher_claim_path")"
+[[ "$reverse_launcher_claim_pid" == "$reverse_launcher_a_pid" ]] || fail 'launcher B stole claim release authority before reservation'
+jq -e --arg task_id "$reverse_launcher_task_id" 'all(.workers[]; .task_id != $task_id) and all(.identity_ledger[]; .task_id != $task_id)' "$registry_path" >/dev/null || fail 'reverse-order launcher B reserved before launcher A'
+
+chmod 0700 "$registry_dir/artifacts"
+: >"$reverse_launcher_a_stat_release"
+reverse_launcher_a_status=0
+wait "$reverse_launcher_a_pid" || reverse_launcher_a_status=$?
+reverse_launcher_a_pid=''
+[[ "$reverse_launcher_a_status" -eq 0 ]] || fail "reverse-order launcher A failed after winning reservation: $reverse_launcher_a_status"
+jq -e --arg task_id "$reverse_launcher_task_id" 'any(.identity_ledger[]; .task_id == $task_id and .status == "retired" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'reverse-order launcher A did not complete and retire its reservation'
+[[ -f "$reverse_launcher_claim_path" && ! -L "$reverse_launcher_claim_path" ]] || fail 'launcher A removed the claim before launcher B terminal cleanup'
+rg -q "^lease=${reverse_launcher_b_pid}\\|.+$" "$reverse_launcher_claim_path" || fail 'launcher A terminal cleanup removed launcher B live re-entry lease'
+
+: >"$reverse_launcher_b_stat_release"
+reverse_launcher_b_status=0
+wait "$reverse_launcher_b_pid" || reverse_launcher_b_status=$?
+reverse_launcher_b_pid=''
+[[ "$reverse_launcher_b_status" -eq 6 ]] || fail "reverse-order launcher B returned $reverse_launcher_b_status instead of reservation conflict"
+jq -e --arg task_id "$reverse_launcher_task_id" 'all(.workers[]; .task_id != $task_id) and any(.identity_ledger[]; .task_id == $task_id and .status == "retired" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'reverse-order launcher B changed registry state'
+for reverse_launcher_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$reverse_launcher_candidate" && ! -L "$reverse_launcher_candidate" ]] || continue
+	if rg -q "^token=task-$reverse_launcher_task_id$" "$reverse_launcher_candidate"; then
+		fail 'losing launcher B left a cross-path claim'
+	fi
+done
+chmod 0700 "$registry_dir/artifacts"
+
+printf '%s\n' 'same-token re-entry survives original pre-reservation failure' >"$PROMPT_FILE"
+missing_launcher_task_id='same-token-pre-reservation-failure'
+missing_launcher_scope='preserve claim while original launcher fails before reservation'
+missing_launcher_a_stat_marker="$TEST_ROOT/missing-same-token-launcher-a-stat"
+missing_launcher_a_stat_release="$TEST_ROOT/missing-same-token-launcher-a-stat-release"
+missing_launcher_b_stat_marker="$TEST_ROOT/missing-same-token-launcher-b-stat"
+missing_launcher_b_stat_release="$TEST_ROOT/missing-same-token-launcher-b-stat-release"
+chmod 0700 "$registry_dir/artifacts"
+missing_launcher_a_pid=''
+LUNA_TEST_STAT_GATE=1 \
+LUNA_TEST_STAT_FAIL_AFTER_GATE=1 \
+LUNA_TEST_ARTIFACT_ROOT="$registry_dir/artifacts" \
+LUNA_TEST_STAT_MARKER="$missing_launcher_a_stat_marker" \
+LUNA_TEST_STAT_RELEASE="$missing_launcher_a_stat_release" \
+LUNA_TEST_REAL_STAT="$pre_reservation_real_stat" \
+PATH="$pre_reservation_stat_bin:$PATH" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$missing_launcher_task_id" --scope "$missing_launcher_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/missing-same-token-launcher-a.out" 2>&1 &
+missing_launcher_a_pid=$!
+poll_attempt=0
+while [[ ! -e "$missing_launcher_a_stat_marker" ]] && process_is_live_non_zombie "$missing_launcher_a_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$missing_launcher_a_stat_marker" ]] || fail 'missing same-token launcher A did not reach deterministic pre-reservation gate'
+
+missing_launcher_b_pid=''
+LUNA_TEST_STAT_GATE=1 \
+LUNA_TEST_ARTIFACT_ROOT="$registry_dir/artifacts" \
+LUNA_TEST_STAT_MARKER="$missing_launcher_b_stat_marker" \
+LUNA_TEST_STAT_RELEASE="$missing_launcher_b_stat_release" \
+LUNA_TEST_REAL_STAT="$pre_reservation_real_stat" \
+PATH="$pre_reservation_stat_bin:$PATH" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$missing_launcher_task_id" --scope "$missing_launcher_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/missing-same-token-launcher-b.out" 2>&1 &
+missing_launcher_b_pid=$!
+poll_attempt=0
+while [[ ! -e "$missing_launcher_b_stat_marker" ]] && process_is_live_non_zombie "$missing_launcher_b_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$missing_launcher_b_stat_marker" ]] || fail 'missing same-token launcher B did not re-enter before original reservation failure'
+missing_launcher_claim_path=''
+for missing_launcher_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$missing_launcher_candidate" && ! -L "$missing_launcher_candidate" ]] || continue
+	if rg -q "^token=task-$missing_launcher_task_id$" "$missing_launcher_candidate"; then
+		missing_launcher_claim_path="$missing_launcher_candidate"
+		break
+	fi
+done
+[[ -n "$missing_launcher_claim_path" ]] || fail 'missing same-token race did not retain claim during B re-entry'
+missing_launcher_claim_pid="$(awk -F= '$1 == "pid" {print $2; exit}' "$missing_launcher_claim_path")"
+[[ "$missing_launcher_claim_pid" == "$missing_launcher_a_pid" ]] || fail 'missing same-token launcher B changed owner before reservation'
+rg -q "^lease=${missing_launcher_b_pid}\\|.+$" "$missing_launcher_claim_path" || fail 'missing same-token launcher B did not publish its private re-entry lease'
+jq -e --arg task_id "$missing_launcher_task_id" 'all(.workers[]; .task_id != $task_id) and all(.identity_ledger[]; .task_id != $task_id)' "$registry_path" >/dev/null || fail 'missing same-token launcher B reserved before original failure'
+
+: >"$missing_launcher_a_stat_release"
+missing_launcher_a_status=0
+wait "$missing_launcher_a_pid" || missing_launcher_a_status=$?
+missing_launcher_a_pid=''
+[[ "$missing_launcher_a_status" -ne 0 ]] || fail 'missing same-token launcher A unexpectedly succeeded after forced pre-reservation failure'
+[[ -f "$missing_launcher_claim_path" && ! -L "$missing_launcher_claim_path" ]] || fail 'original launcher cleanup removed B re-entry claim'
+rg -q "^lease=${missing_launcher_b_pid}\\|.+$" "$missing_launcher_claim_path" || fail 'original launcher cleanup removed B live re-entry lease'
+jq -e --arg task_id "$missing_launcher_task_id" 'all(.workers[]; .task_id != $task_id) and all(.identity_ledger[]; .task_id != $task_id)' "$registry_path" >/dev/null || fail 'original launcher failure published registry state'
+
+missing_launcher_competing_status=0
+CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id missing-different-token --scope "$missing_launcher_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/missing-different-token.out" 2>&1 || missing_launcher_competing_status=$?
+[[ "$missing_launcher_competing_status" -eq 6 ]] || fail "different-token launch bypassed B's active re-entry claim: $missing_launcher_competing_status"
+jq -e --arg task_id missing-different-token 'all(.workers[]; .task_id != $task_id) and all(.identity_ledger[]; .task_id != $task_id)' "$registry_path" >/dev/null || fail 'different-token contender changed registry state during B transition'
+
+: >"$missing_launcher_b_stat_release"
+missing_launcher_b_status=0
+wait "$missing_launcher_b_pid" || missing_launcher_b_status=$?
+missing_launcher_b_pid=''
+[[ "$missing_launcher_b_status" -eq 0 ]] || fail "same-token launcher B failed after original pre-reservation failure: $missing_launcher_b_status"
+jq -e --arg task_id "$missing_launcher_task_id" 'any(.identity_ledger[]; .task_id == $task_id and .status == "retired" and .terminal_status == "completed")' "$registry_path" >/dev/null || fail 'same-token launcher B did not complete after original pre-reservation failure'
+for missing_launcher_candidate in "$launch_pre_reservation_claim_root"/*; do
+	[[ -f "$missing_launcher_candidate" && ! -L "$missing_launcher_candidate" ]] || continue
+	if rg -q "^token=task-$missing_launcher_task_id$" "$missing_launcher_candidate"; then
+		fail 'same-token launcher B left its claim after terminal cleanup'
+	fi
+done
+
 invalid_retry_scope='release launcher-created claim after invalid retry sandbox'
 invalid_retry_parent='invalid-retry-sandbox-parent'
 invalid_retry_task='invalid-retry-sandbox-child'
@@ -1253,7 +1416,7 @@ parent_claim_scope='preserve parent-held claim after invalid retry sandbox'
 parent_claim_task='parent-held-invalid-retry-sandbox'
 "$REGISTRY_SCRIPT" reserve --repo "$REPO_ROOT" --task-id "$parent_claim_task-parent" --scope "$parent_claim_scope" --sandbox read-only >/dev/null
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$parent_claim_task-parent" --status failed --evidence 'parent-held claim fixture parent' >/dev/null
-bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" --pid "$$" >/dev/null
 parent_claim_status=0
 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$parent_claim_task" --scope "$parent_claim_scope" --retry-of "$parent_claim_task-parent" --sandbox workspace-write --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/parent-held-invalid-retry-sandbox.out" 2>&1 || parent_claim_status=$?
 [[ "$parent_claim_status" -eq 6 ]] || fail "parent-held invalid retry sandbox returned $parent_claim_status instead of conflict"
@@ -1266,7 +1429,150 @@ for parent_claim_candidate in "$launch_pre_reservation_claim_root"/*; do
 	fi
 done
 [[ -n "$parent_claim_path" ]] || fail 'parent-held claim was released after rejected retry reservation'
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" >/dev/null
+if rg -q '^lease=' "$parent_claim_path"; then
+	fail 'parent-held claim retained a stale re-entry lease after rejected retry reservation'
+fi
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" --pid "$$" >/dev/null
+
+printf '%s\n' 'preserve parent-held claim after committed re-entry reservation interrupt' >"$PROMPT_FILE"
+reentry_reservation_task_id='reentry-reservation-publication-interrupt-race'
+reentry_reservation_scope='preserve parent-held claim after committed re-entry reservation interrupt'
+reentry_reservation_bin="$TEST_ROOT/reentry-reservation-race-bin"
+reentry_reservation_mv="$reentry_reservation_bin/mv"
+reentry_reservation_published_marker="$TEST_ROOT/reentry-reservation-published"
+reentry_reservation_release_marker="$TEST_ROOT/reentry-reservation-release"
+reentry_reservation_real_mv="$(command -v mv)"
+mkdir -m 0700 "$reentry_reservation_bin"
+cat >"$reentry_reservation_mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${LUNA_TEST_RESERVE_GATE:-0}" == 1 && "$#" -eq 2 && "$1" == */.registry.* && "$2" == "${LUNA_TEST_REGISTRY_PATH:-}" ]]; then
+	"$LUNA_TEST_REAL_MV" "$@"
+	: >"${LUNA_TEST_RESERVE_PUBLISHED_MARKER:?}"
+	while [[ ! -e "${LUNA_TEST_RESERVE_RELEASE_MARKER:?}" ]]; do
+		sleep 0.01
+	done
+	exit 0
+fi
+exec "$LUNA_TEST_REAL_MV" "$@"
+EOF
+chmod 0700 "$reentry_reservation_mv"
+reentry_reservation_owner_pid=''
+sleep 30 &
+reentry_reservation_owner_pid=$!
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$reentry_reservation_owner_pid" >/dev/null
+reentry_reservation_runner_pid=''
+LUNA_TEST_RESERVE_GATE=1 \
+LUNA_TEST_RESERVE_PUBLISHED_MARKER="$reentry_reservation_published_marker" \
+LUNA_TEST_RESERVE_RELEASE_MARKER="$reentry_reservation_release_marker" \
+LUNA_TEST_REGISTRY_PATH="$registry_path" \
+LUNA_TEST_REAL_MV="$reentry_reservation_real_mv" \
+PATH="$reentry_reservation_bin:$PATH" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$reentry_reservation_task_id" --scope "$reentry_reservation_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/reentry-reservation-race.out" 2>&1 &
+reentry_reservation_runner_pid=$!
+poll_attempt=0
+while [[ ! -e "$reentry_reservation_published_marker" ]] && process_is_live_non_zombie "$reentry_reservation_runner_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$reentry_reservation_published_marker" ]] || fail 're-entry reservation race did not reach post-publication gate'
+jq -e --arg task_id "$reentry_reservation_task_id" --arg scope "$reentry_reservation_scope" 'any(.workers[]; .task_id == $task_id and .scope == $scope and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 're-entry reservation race did not publish exact live token-bearing reservation'
+reentry_reservation_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+reentry_reservation_claim_path=''
+for reentry_reservation_candidate in "$reentry_reservation_claim_root"/*; do
+	[[ -f "$reentry_reservation_candidate" && ! -L "$reentry_reservation_candidate" ]] || continue
+	if rg -q "^token=task-$reentry_reservation_task_id$" "$reentry_reservation_candidate"; then
+		reentry_reservation_claim_path="$reentry_reservation_candidate"
+		break
+	fi
+done
+[[ -n "$reentry_reservation_claim_path" ]] || fail 're-entry reservation race did not retain the parent-held claim'
+rg -q "^lease=$reentry_reservation_runner_pid\\|.+$" "$reentry_reservation_claim_path" || fail 're-entry reservation race did not publish the runner lease'
+kill "$reentry_reservation_owner_pid" 2>/dev/null || true
+wait "$reentry_reservation_owner_pid" 2>/dev/null || true
+reentry_reservation_owner_pid=''
+kill -TERM "$reentry_reservation_runner_pid"
+: >"$reentry_reservation_release_marker"
+reentry_reservation_status=0
+wait "$reentry_reservation_runner_pid" || reentry_reservation_status=$?
+reentry_reservation_runner_pid=''
+[[ "$reentry_reservation_status" -ne 0 ]] || fail 're-entry reservation publication interrupt unexpectedly succeeded'
+[[ -f "$reentry_reservation_claim_path" && ! -L "$reentry_reservation_claim_path" ]] || fail 'token-bearing re-entry failure released the last cross-path claim'
+rg -q '^lease=' "$reentry_reservation_claim_path" || fail 'token-bearing re-entry failure released its ambiguity-preserving lease'
+jq -e --arg task_id "$reentry_reservation_task_id" 'any(.workers[]; .task_id == $task_id and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'token-bearing re-entry failure lost the committed reservation'
+reentry_reservation_invocation_token="$(jq -er --arg task_id "$reentry_reservation_task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token' "$registry_path")"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$reentry_reservation_task_id" --status interrupted --evidence 'token-bearing re-entry ambiguity fixture complete' --invocation-token "$reentry_reservation_invocation_token" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$$" >/dev/null
+[[ ! -e "$reentry_reservation_claim_path" && ! -L "$reentry_reservation_claim_path" ]] || fail 're-entry reservation ambiguity fixture left a cross-path claim after recovery'
+
+printf '%s\n' 'preserve parent-held claim after post-reservation handoff interrupt' >"$PROMPT_FILE"
+post_reservation_return_task_id='post-reservation-handoff-interrupt-race'
+post_reservation_return_scope='preserve claim after post-reservation handoff interrupt'
+post_reservation_return_bash_env="$TEST_ROOT/post-reservation-return-bash-env"
+post_reservation_return_marker="$TEST_ROOT/post-reservation-return-marker"
+post_reservation_return_release_marker="$TEST_ROOT/post-reservation-return-release"
+cat >"$post_reservation_return_bash_env" <<'EOF'
+if [[ "${LUNA_TEST_POST_RESERVATION_RETURN_GATE:-0}" == 1 ]]; then
+  set -T
+  trap '
+    if [[ "$BASH_COMMAND" == *INVOCATION_CLAIMED=1* && "${LUNA_TEST_POST_RESERVATION_RETURN_TRIGGERED:-0}" != 1 ]]; then
+      LUNA_TEST_POST_RESERVATION_RETURN_TRIGGERED=1
+      : >"${LUNA_TEST_POST_RESERVATION_RETURN_MARKER:?}"
+      while [[ ! -e "${LUNA_TEST_POST_RESERVATION_RETURN_RELEASE_MARKER:?}" ]]; do
+        sleep 0.01
+      done
+    fi
+  ' DEBUG
+fi
+EOF
+chmod 0600 "$post_reservation_return_bash_env"
+post_reservation_return_owner_pid=''
+sleep 30 &
+post_reservation_return_owner_pid=$!
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$post_reservation_return_scope" --token "task-$post_reservation_return_task_id" --pid "$post_reservation_return_owner_pid" >/dev/null
+post_reservation_return_runner_pid=''
+LUNA_TEST_POST_RESERVATION_RETURN_GATE=1 \
+LUNA_TEST_POST_RESERVATION_RETURN_MARKER="$post_reservation_return_marker" \
+LUNA_TEST_POST_RESERVATION_RETURN_RELEASE_MARKER="$post_reservation_return_release_marker" \
+BASH_ENV="$post_reservation_return_bash_env" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$post_reservation_return_task_id" --scope "$post_reservation_return_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/post-reservation-return.out" 2>&1 &
+post_reservation_return_runner_pid=$!
+poll_attempt=0
+while [[ ! -e "$post_reservation_return_marker" ]] && process_is_live_non_zombie "$post_reservation_return_runner_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$post_reservation_return_marker" ]] || fail 'post-reservation handoff fixture did not reach its controlled interrupt boundary'
+jq -e --arg task_id "$post_reservation_return_task_id" --arg scope "$post_reservation_return_scope" 'any(.workers[]; .task_id == $task_id and .scope == $scope and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'post-reservation handoff fixture did not publish its token-bearing reservation'
+post_reservation_return_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+post_reservation_return_claim_path=''
+for post_reservation_return_candidate in "$post_reservation_return_claim_root"/*; do
+	[[ -f "$post_reservation_return_candidate" && ! -L "$post_reservation_return_candidate" ]] || continue
+	if rg -q "^token=task-$post_reservation_return_task_id$" "$post_reservation_return_candidate"; then
+		post_reservation_return_claim_path="$post_reservation_return_candidate"
+		break
+	fi
+done
+[[ -n "$post_reservation_return_claim_path" ]] || fail 'post-reservation handoff fixture did not retain the parent-held claim'
+rg -q "^lease=$post_reservation_return_runner_pid\\|.+$" "$post_reservation_return_claim_path" || fail 'post-reservation handoff fixture did not retain the runner lease'
+kill "$post_reservation_return_owner_pid" 2>/dev/null || true
+wait "$post_reservation_return_owner_pid" 2>/dev/null || true
+post_reservation_return_owner_pid=''
+kill -TERM "$post_reservation_return_runner_pid"
+: >"$post_reservation_return_release_marker"
+post_reservation_return_status=0
+wait "$post_reservation_return_runner_pid" || post_reservation_return_status=$?
+post_reservation_return_runner_pid=''
+[[ "$post_reservation_return_status" -ne 0 ]] || fail 'post-reservation handoff interrupt unexpectedly succeeded'
+[[ -f "$post_reservation_return_claim_path" && ! -L "$post_reservation_return_claim_path" ]] || fail 'post-reservation handoff interrupt released the last cross-path claim'
+rg -q '^lease=' "$post_reservation_return_claim_path" || fail 'post-reservation handoff interrupt released its ambiguity-preserving lease'
+jq -e --arg task_id "$post_reservation_return_task_id" 'any(.workers[]; .task_id == $task_id and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'post-reservation handoff interrupt lost the committed reservation'
+post_reservation_return_invocation_token="$(jq -er --arg task_id "$post_reservation_return_task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token' "$registry_path")"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$post_reservation_return_task_id" --status interrupted --evidence 'post-reservation handoff interrupt fixture complete' --invocation-token "$post_reservation_return_invocation_token" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$post_reservation_return_scope" --token "task-$post_reservation_return_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$post_reservation_return_scope" --token "task-$post_reservation_return_task_id" --pid "$$" >/dev/null
+[[ ! -e "$post_reservation_return_claim_path" && ! -L "$post_reservation_return_claim_path" ]] || fail 'post-reservation handoff fixture left a cross-path claim after recovery'
 
 printf '%s\n' 'interrupt after reservation publication' >"$PROMPT_FILE"
 reservation_race_task_id='reservation-publication-interrupt-race'
@@ -1326,7 +1632,8 @@ done
 [[ "$reservation_race_claim_present" -eq 1 ]] || fail 'committed reservation interrupt released launcher cross-path claim'
 reservation_race_invocation_token="$(jq -er --arg task_id "$reservation_race_task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token' "$registry_path")"
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$reservation_race_task_id" --status interrupted --evidence 'reservation publication interrupt claim-retention fixture complete' --invocation-token "$reservation_race_invocation_token" >/dev/null
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$reservation_race_scope" --token "task-$reservation_race_task_id" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$reservation_race_scope" --token "task-$reservation_race_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$reservation_race_scope" --token "task-$reservation_race_task_id" --pid "$$" >/dev/null
 
 printf '%s\n' 'blocked worker' >"$PROMPT_FILE"
 blocked_output="$(FAKE_BLOCKED_RESUME=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id blocked-runner --scope 'blocked runner retry scope' --sandbox read-only --prompt-file "$PROMPT_FILE" 2>"$TEST_ROOT/blocked-runner.err")"
@@ -1442,7 +1749,7 @@ legacy_race_unrelated_scope='preserve unrelated claim during legacy invocation r
 "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --session-id 01legacy-race-session >/dev/null
 "$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --session-id 01legacy-race-session >/dev/null
 mkdir -m 0700 "$registry_dir/artifacts/$legacy_race_task_id"
-bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$legacy_race_unrelated_scope" --token legacy-race-unrelated >/dev/null
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$legacy_race_unrelated_scope" --token legacy-race-unrelated --pid "$$" >/dev/null
 # Legacy controller that won registry invocation has no cross-path claim. The
 # continuation under test acquires the previously absent claim, then loses
 # claim-invocation. Its failure cleanup must retain that new claim until
@@ -1473,8 +1780,9 @@ kill "$legacy_race_owner_pid" 2>/dev/null || true
 wait "$legacy_race_owner_pid" 2>/dev/null || true
 legacy_race_owner_pid=''
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$legacy_race_task_id" --status interrupted --evidence 'legacy invocation-race claim retention test complete' >/dev/null
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$legacy_race_scope" --token "task-$legacy_race_task_id" >/dev/null
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$legacy_race_unrelated_scope" --token legacy-race-unrelated >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$legacy_race_scope" --token "task-$legacy_race_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$legacy_race_scope" --token "task-$legacy_race_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$legacy_race_unrelated_scope" --token legacy-race-unrelated --pid "$$" >/dev/null
 
 printf '%s\n' 'legacy finish loses invocation race' >"$PROMPT_FILE"
 finish_race_task_id='legacy-finish-invocation-race'
@@ -1507,7 +1815,8 @@ kill "$finish_race_owner_pid" 2>/dev/null || true
 wait "$finish_race_owner_pid" 2>/dev/null || true
 finish_race_owner_pid=''
 "$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$finish_race_task_id" --status interrupted --evidence 'legacy finish invocation-race claim retention test complete' >/dev/null
-bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$finish_race_scope" --token "task-$finish_race_task_id" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$finish_race_scope" --token "task-$finish_race_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$finish_race_scope" --token "task-$finish_race_task_id" --pid "$$" >/dev/null
 
 printf '%s\n' 'preserve active claim when continuation loses invocation race' >"$PROMPT_FILE"
 continue_claim_race_task_id='continue-claim-invocation-race'
@@ -1538,7 +1847,7 @@ reentered_retirement_scope='release re-entered claim after terminal cleanup'
 "$REGISTRY_SCRIPT" bind --repo "$REPO_ROOT" --task-id "$reentered_retirement_task_id" --session-id 01reentered-retirement-session >/dev/null
 "$REGISTRY_SCRIPT" activate --repo "$REPO_ROOT" --task-id "$reentered_retirement_task_id" --session-id 01reentered-retirement-session >/dev/null
 mkdir -m 0700 "$registry_dir/artifacts/$reentered_retirement_task_id"
-bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$reentered_retirement_scope" --token "task-$reentered_retirement_task_id" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$reentered_retirement_scope" --token "task-$reentered_retirement_task_id" --pid "$$" >/dev/null
 reentered_retirement_status=0
 FAKE_INVALID_PARENT_ACTION=1 CODEX_BIN="$BIN_DIR/codex" "$RUNNER_SCRIPT" continue --repo "$REPO_ROOT" --task-id "$reentered_retirement_task_id" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/reentered-retirement.out" 2>&1 || reentered_retirement_status=$?
 [[ "$reentered_retirement_status" -ne 0 ]] || fail 're-entered claim launcher failure unexpectedly succeeded'
@@ -1675,19 +1984,19 @@ if rg -- '-maxdepth' "$RUNNER_SCRIPT" >/dev/null; then fail 'runner used GNU-onl
 # The rewritten fixture adds local-runner (one resume), the old-Codex
 # read-only task (one resume), the legacy claimless continuation (one resume),
 # the re-entered-claim failure (one resume), and the continuation-runner
-# launch/continue pair (two resumes), plus the same-token launcher handoff
-# (one resume), while removing the old sparse-continuation resume:
-# 20 - 1 + 1 + 1 + 1 + 1 + 2 + 1 = 26.
+# launch/continue pair (two resumes), plus opposite- and reverse-order
+# same-token launcher handoffs (one resume each), while removing old
+# sparse-continuation resume: 20 - 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1 + 1 = 28.
 resume_count="$(rg -c 'exec resume .* -- (01fake-session-[0-9]+|01sparse-continuation|01legacy-session|01reentered-retirement-session) -' "$CODEX_CALLS")"
-[[ "$resume_count" -eq 26 ]] || fail "expected twenty-six exact-session resumes, got $resume_count"
+[[ "$resume_count" -eq 28 ]] || fail "expected twenty-eight exact-session resumes, got $resume_count"
 ignore_count="$(rg -c -- '--ignore-user-config' "$CODEX_CALLS")"
-[[ "$ignore_count" -eq 50 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
+[[ "$ignore_count" -eq 54 ]] || fail "expected unrelated user MCP config disabled on every Codex call, got $ignore_count"
 read_only_count="$(rg -c -- '-s read-only' "$CODEX_CALLS")"
-[[ "$read_only_count" -eq 24 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
+[[ "$read_only_count" -eq 26 ]] || fail "expected every handshake to use read-only sandbox, got $read_only_count"
 resume_sandbox_count="$(rg -c -- 'exec resume .*sandbox_mode=' "$CODEX_CALLS")"
-[[ "$resume_sandbox_count" -eq 26 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
+[[ "$resume_sandbox_count" -eq 28 ]] || fail "expected every resume to reapply its registered sandbox, got $resume_sandbox_count"
 read_only_resume_count="$(rg -c -- 'exec resume .*sandbox_mode="read-only"' "$CODEX_CALLS")"
-[[ "$read_only_resume_count" -eq 6 ]] || fail "expected read-only sandbox on retry, blocked retry, and both continued-session resumes, got $read_only_resume_count"
+[[ "$read_only_resume_count" -eq 6 ]] || fail "expected read-only sandbox on retry, blocked retry, and continued-session resumes, got $read_only_resume_count"
 if ! awk -v expected="cwd=$repo_real " '/exec resume/ && index($0, expected) != 1 {bad=1} END {exit bad ? 1 : 0}' "$CODEX_CALLS"; then
 	fail 'a resumed Codex session ran outside the canonical target repository'
 fi

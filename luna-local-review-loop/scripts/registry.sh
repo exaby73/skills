@@ -713,6 +713,13 @@ command_reservation_status() {
 		printf 'committed\n'
 		return 0
 	fi
+	if jq -e --arg task_id "$task_id" --arg scope "$scope" '
+      any(.workers[]; .task_id == $task_id and .scope == $scope and .status == "reserved" and (.invocation_token == null or .invocation_token == ""))
+      and any(.identity_ledger[]; .task_id == $task_id and .scope == $scope and .status == "reserved")
+    ' "$REGISTRY_PATH" >/dev/null; then
+		printf 'not-committed\n'
+		return 0
+	fi
 	if jq -e --arg task_id "$task_id" 'any(.workers[]; .task_id == $task_id) or any(.identity_ledger[]; .task_id == $task_id and (.status == "reserved" or .status == "bound" or .status == "active"))' "$REGISTRY_PATH" >/dev/null; then
 		die "$EXIT_CONFLICT" "reservation status is ambiguous for task $task_id; preserve registry state and cross-path claim for explicit recovery."
 	fi
