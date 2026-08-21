@@ -52,12 +52,12 @@ readonly TEST_ROOT
 cleanup_test_root() {
 	local fixture_pid
 	local runner_pid
-	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}" "${reservation_race_runner_pid:-}" "${pre_reservation_runner_pid:-}" "${two_launcher_a_pid:-}" "${two_launcher_b_pid:-}" "${reverse_launcher_a_pid:-}" "${reverse_launcher_b_pid:-}" "${missing_launcher_a_pid:-}" "${missing_launcher_b_pid:-}"; do
+	for runner_pid in "${terminating_runner_pid:-}" "${hard_killed_runner_pid:-}" "${unproven_runner_pid:-}" "${cadence_runner_pid:-}" "${prompt_race_runner_pid:-}" "${reservation_race_runner_pid:-}" "${reentry_reservation_runner_pid:-}" "${pre_reservation_runner_pid:-}" "${two_launcher_a_pid:-}" "${two_launcher_b_pid:-}" "${reverse_launcher_a_pid:-}" "${reverse_launcher_b_pid:-}" "${missing_launcher_a_pid:-}" "${missing_launcher_b_pid:-}"; do
 		[[ -n "$runner_pid" ]] || continue
 		kill -TERM "$runner_pid" 2>/dev/null || true
 		wait "$runner_pid" 2>/dev/null || true
 	done
-	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}" "${continue_claim_race_owner_pid:-}"; do
+	for fixture_pid in "${bind_owner_pid:-}" "${dead_bind_owner_pid:-}" "${stale_owner_pid:-}" "${claim_owner_a:-}" "${claim_owner_b:-}" "${unproven_lease_writer_pid:-}" "${legacy_race_owner_pid:-}" "${finish_race_owner_pid:-}" "${continue_claim_race_owner_pid:-}" "${reentry_reservation_owner_pid:-}"; do
 		[[ -n "$fixture_pid" ]] || continue
 		kill -TERM "$fixture_pid" 2>/dev/null || true
 		wait "$fixture_pid" 2>/dev/null || true
@@ -1433,6 +1433,78 @@ if rg -q '^lease=' "$parent_claim_path"; then
 	fail 'parent-held claim retained a stale re-entry lease after rejected retry reservation'
 fi
 bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$parent_claim_scope" --token "task-$parent_claim_task" --pid "$$" >/dev/null
+
+printf '%s\n' 'preserve parent-held claim after committed re-entry reservation interrupt' >"$PROMPT_FILE"
+reentry_reservation_task_id='reentry-reservation-publication-interrupt-race'
+reentry_reservation_scope='preserve parent-held claim after committed re-entry reservation interrupt'
+reentry_reservation_bin="$TEST_ROOT/reentry-reservation-race-bin"
+reentry_reservation_mv="$reentry_reservation_bin/mv"
+reentry_reservation_published_marker="$TEST_ROOT/reentry-reservation-published"
+reentry_reservation_release_marker="$TEST_ROOT/reentry-reservation-release"
+reentry_reservation_real_mv="$(command -v mv)"
+mkdir -m 0700 "$reentry_reservation_bin"
+cat >"$reentry_reservation_mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${LUNA_TEST_RESERVE_GATE:-0}" == 1 && "$#" -eq 2 && "$1" == */.registry.* && "$2" == "${LUNA_TEST_REGISTRY_PATH:-}" ]]; then
+	"$LUNA_TEST_REAL_MV" "$@"
+	: >"${LUNA_TEST_RESERVE_PUBLISHED_MARKER:?}"
+	while [[ ! -e "${LUNA_TEST_RESERVE_RELEASE_MARKER:?}" ]]; do
+		sleep 0.01
+	done
+	exit 0
+fi
+exec "$LUNA_TEST_REAL_MV" "$@"
+EOF
+chmod 0700 "$reentry_reservation_mv"
+reentry_reservation_owner_pid=''
+sleep 30 &
+reentry_reservation_owner_pid=$!
+bash "$CLAIM_SCRIPT" acquire --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$reentry_reservation_owner_pid" >/dev/null
+reentry_reservation_runner_pid=''
+LUNA_TEST_RESERVE_GATE=1 \
+LUNA_TEST_RESERVE_PUBLISHED_MARKER="$reentry_reservation_published_marker" \
+LUNA_TEST_RESERVE_RELEASE_MARKER="$reentry_reservation_release_marker" \
+LUNA_TEST_REGISTRY_PATH="$registry_path" \
+LUNA_TEST_REAL_MV="$reentry_reservation_real_mv" \
+PATH="$reentry_reservation_bin:$PATH" CODEX_BIN="$BIN_DIR/codex" \
+	"$RUNNER_SCRIPT" launch --repo "$REPO_ROOT" --task-id "$reentry_reservation_task_id" --scope "$reentry_reservation_scope" --prompt-file "$PROMPT_FILE" >"$TEST_ROOT/reentry-reservation-race.out" 2>&1 &
+reentry_reservation_runner_pid=$!
+poll_attempt=0
+while [[ ! -e "$reentry_reservation_published_marker" ]] && process_is_live_non_zombie "$reentry_reservation_runner_pid" && [[ "$poll_attempt" -lt 200 ]]; do
+	sleep 0.05
+	poll_attempt=$((poll_attempt + 1))
+done
+[[ -e "$reentry_reservation_published_marker" ]] || fail 're-entry reservation race did not reach post-publication gate'
+jq -e --arg task_id "$reentry_reservation_task_id" --arg scope "$reentry_reservation_scope" 'any(.workers[]; .task_id == $task_id and .scope == $scope and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 're-entry reservation race did not publish exact live token-bearing reservation'
+reentry_reservation_claim_root="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir)/.luna-cross-path-claims"
+reentry_reservation_claim_path=''
+for reentry_reservation_candidate in "$reentry_reservation_claim_root"/*; do
+	[[ -f "$reentry_reservation_candidate" && ! -L "$reentry_reservation_candidate" ]] || continue
+	if rg -q "^token=task-$reentry_reservation_task_id$" "$reentry_reservation_candidate"; then
+		reentry_reservation_claim_path="$reentry_reservation_candidate"
+		break
+	fi
+done
+[[ -n "$reentry_reservation_claim_path" ]] || fail 're-entry reservation race did not retain the parent-held claim'
+rg -q "^lease=$reentry_reservation_runner_pid\\|.+$" "$reentry_reservation_claim_path" || fail 're-entry reservation race did not publish the runner lease'
+kill "$reentry_reservation_owner_pid" 2>/dev/null || true
+wait "$reentry_reservation_owner_pid" 2>/dev/null || true
+reentry_reservation_owner_pid=''
+kill -TERM "$reentry_reservation_runner_pid"
+: >"$reentry_reservation_release_marker"
+reentry_reservation_status=0
+wait "$reentry_reservation_runner_pid" || reentry_reservation_status=$?
+reentry_reservation_runner_pid=''
+[[ "$reentry_reservation_status" -ne 0 ]] || fail 're-entry reservation publication interrupt unexpectedly succeeded'
+[[ -f "$reentry_reservation_claim_path" && ! -L "$reentry_reservation_claim_path" ]] || fail 'token-bearing re-entry failure released the last cross-path claim'
+rg -q '^lease=' "$reentry_reservation_claim_path" || fail 'token-bearing re-entry failure released its ambiguity-preserving lease'
+jq -e --arg task_id "$reentry_reservation_task_id" 'any(.workers[]; .task_id == $task_id and .status == "reserved" and (.invocation_token | type == "string" and length > 0))' "$registry_path" >/dev/null || fail 'token-bearing re-entry failure lost the committed reservation'
+reentry_reservation_invocation_token="$(jq -er --arg task_id "$reentry_reservation_task_id" '.workers[] | select(.task_id == $task_id) | .invocation_token' "$registry_path")"
+"$REGISTRY_SCRIPT" complete-and-retire --repo "$REPO_ROOT" --task-id "$reentry_reservation_task_id" --status interrupted --evidence 'token-bearing re-entry ambiguity fixture complete' --invocation-token "$reentry_reservation_invocation_token" >/dev/null
+bash "$CLAIM_SCRIPT" acquire --reenter --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$$" >/dev/null
+bash "$CLAIM_SCRIPT" release --repo "$REPO_ROOT" --scope "$reentry_reservation_scope" --token "task-$reentry_reservation_task_id" --pid "$$" >/dev/null
+[[ ! -e "$reentry_reservation_claim_path" && ! -L "$reentry_reservation_claim_path" ]] || fail 're-entry reservation ambiguity fixture left a cross-path claim after recovery'
 
 printf '%s\n' 'interrupt after reservation publication' >"$PROMPT_FILE"
 reservation_race_task_id='reservation-publication-interrupt-race'

@@ -232,10 +232,20 @@ finish_on_error() {
 	if [[ "$FINISHED" -eq 0 && "$PRESERVE_REGISTRY_STATE" -eq 0 && "$registry_cleanup_status" -eq 0 && "$CROSS_PATH_CLAIMED" -eq 1 ]]; then
 		if [[ "$CROSS_PATH_LEASE_HELD" -eq 1 ]]; then
 			# A preserved re-entry owns only its matching lease until the
-			# registry handoff. Release that lease on every failure path; the
-			# claim primitive retains a live owner claim and removes an exited
-			# owner claim only after proving no lease remains.
-			release_claim_owned_by_launcher=1
+			# registry handoff. If reservation publication was attempted but
+			# not acknowledged, probe its locked outcome before releasing the
+			# lease: only a proven tokenless rejection may release it.
+			if [[ "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
+				reservation_probe_status=0
+				reservation_outcome_is_rejected || reservation_probe_status=$?
+				case "$reservation_probe_status" in
+				0) release_claim_owned_by_launcher=1 ;;
+				1) : ;; # The exact reservation committed; preserve registry and claim.
+				*) registry_cleanup_status=1 ;; # No locked proof; preserve state and claim.
+				esac
+			else
+				release_claim_owned_by_launcher=1
+			fi
 		elif [[ "$MODE" == launch && "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 0 ]]; then
 			release_claim_owned_by_launcher=1
 		elif [[ "$CROSS_PATH_CLAIM_ACQUIRED" -eq 1 && "$REGISTRY_RESERVATION_ATTEMPTED" -eq 1 && "$REGISTRY_RESERVATION_SUCCEEDED" -eq 0 ]]; then
