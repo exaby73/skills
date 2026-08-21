@@ -48,6 +48,8 @@ Every `code-reviewer` pass and re-review uses a fresh read-only Sol-High agent: 
 
 A code-review agent never edits files, stages, commits, pushes, changes GitHub state, launches workers, or makes the final delivery decision. Do not substitute a Luna worker, the parent/controller, or another model. If Sol-High is unavailable or its identity/configuration cannot be verified, report `Evidence blocked` and do not claim review approval.
 
+For the owner-authorized issue #72 delivery, the parent retains each fresh local review conclusion as local evidence; GitHub review publication is not required. This exception is scoped to #72 and does not change review requirements for other deliveries.
+
 On a CLI-fallback host, run the bundled read-only Sol route after implementation/validation and for every re-review:
 
 ~~~sh
