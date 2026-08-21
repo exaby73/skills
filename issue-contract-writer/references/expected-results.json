@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "packagePaths": [
+    "SKILL.md",
+    "agents/openai.yaml",
+    "references/expected-results.json",
+    "references/fixture-catalog.md",
+    "scripts/test_fixtures.py"
+  ],
+  "catalogSha256": "67fa68f26740de35bd3fadc20191c5bd58b2ca2319fffa2f812e8d264ce97f15",
+  "fixtures": [
+    {
+      "id": "unbounded-natural-language",
+      "kind": "negative",
+      "expectedConclusion": "Reject as unbounded",
+      "requiredSignals": [
+        "reject every equivalent way",
+        "reviewer-discovered paraphrases",
+        "No finite input domain",
+        "## Stopping conditions"
+      ]
+    },
+    {
+      "id": "bounded-structural",
+      "kind": "positive",
+      "expectedConclusion": "Ready to publish",
+      "requiredSignals": [
+        "R1`: In bounded domain",
+        "Residual risk is an unlisted future resource",
+        "exact path set pass",
+        "Parent owns publication"
+      ]
+    },
+    {
+      "id": "finite-universal",
+      "kind": "positive",
+      "expectedConclusion": "Ready to publish",
+      "requiredSignals": [
+        "six-value lifecycle enum",
+        "Residual risk is behavior for a future seventh state",
+        "## Explicit exclusions",
+        "schema@7777777"
+      ]
+    },
+    {
+      "id": "ambiguous-evidence",
+      "kind": "negative",
+      "expectedConclusion": "Needs clarification",
+      "requiredSignals": [
+        "Make the workflow better",
+        "Reviewers confirm the implementation is correct",
+        "None named",
+        "unresolved"
+      ]
+    },
+    {
+      "id": "fixture-boundary",
+      "kind": "positive",
+      "expectedConclusion": "Ready to publish",
+      "requiredSignals": [
+        "declared endpoint fixture set",
+        "Threat model is cross-team access",
+        "Residual risk is authorization behavior on unlisted endpoints",
+        "separate evidence sources"
+      ]
+    }
+  ]
+}

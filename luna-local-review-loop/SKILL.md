@@ -58,6 +58,16 @@ On a CLI-fallback host, run the bundled read-only Sol route after implementation
 
 That route selects and verifies only `gpt-5.6-sol` with reasoning `high` under `read-only`; the prompt must carry the same complete contract, guidance, target revisions, full diff, and validation evidence on every fresh run. If the route or Sol-High configuration is unavailable, fallback implementation may be recorded as work in progress, but the delivery outcome remains `Evidence blocked` and the parent cannot approve it.
 
+## Parent finding ledger and convergence
+
+For every local Sol review, the parent/controller records a concise finding ledger containing reviewer role and exact head, stable root-cause identifier, parent classification, reachable scenario or reason it is unreachable, failed guard, material impact, chosen action, and whether the same root cause appeared earlier.
+
+Classify every finding as exactly one of `valid-blocking`, `valid-non-blocking`, `invalid`, or `evidence-blocked` before assigning branch work. Only `valid-blocking` findings may create worker work or change the branch. Reviewer severity is evidence, not authorization. A hypothetical future mutation is non-blocking unless it is present in current delivery or has a credible repository entry path, failed guards, and material impact.
+
+Deduplicate findings that share one root cause; new wording, synonyms, or examples are not new root causes. Permit one bounded fix and fresh re-review for a root cause. If the same root-cause family returns in a second re-review, stop automatic worker routing and make a convergence decision: reject non-material variants, change the acceptance or architecture boundary, or request owner direction. A third same-root worker/review cycle is prohibited without explicit user authorization recorded in the governing issue.
+
+Keep reviewer prompts and mutation fixtures fixed during a review cycle. Do not append unrestricted historical synonym lists or ask reviewers to search for unspecified “common ordinary equivalents.” A material current defect may add a bounded regression; green validation proves only the frozen corpus and named structural properties.
+
 ## Keep orchestration off the critical path
 
 - Never use this skill to modify, test, validate, or review its own installed files. Luna skill maintenance is parent-direct work.
