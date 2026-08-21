@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "id": "unbounded-natural-language",
+      "expectedConclusion": "Reject as unbounded",
+      "requiredSignals": [
+        "arbitrary natural-language paraphrases",
+        "finite domain",
+        "frozen corpus",
+        "stopping condition"
+      ]
+    },
+    {
+      "id": "bounded-structural",
+      "expectedConclusion": "Ready to publish",
+      "requiredSignals": [
+        "finite observable result",
+        "named validator",
+        "explicit exclusions",
+        "parent/controller"
+      ]
+    },
+    {
+      "id": "finite-universal",
+      "expectedConclusion": "Ready to publish",
+      "requiredSignals": [
+        "defined finite domain",
+        "included and excluded cases",
+        "completion condition",
+        "schema@7777777"
+      ]
+    },
+    {
+      "id": "ambiguous-evidence",
+      "expectedConclusion": "Needs clarification",
+      "requiredSignals": [
+        "observable result",
+        "named validator",
+        "unresolved owner decision"
+      ]
+    },
+    {
+      "id": "fixture-boundary",
+      "expectedConclusion": "Ready to publish",
+      "requiredSignals": [
+        "production endpoint",
+        "declared finite inputs",
+        "threat model",
+        "frozen two-route corpus"
+      ]
+    }
+  ]
+}

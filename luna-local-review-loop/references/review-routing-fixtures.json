@@ -45,6 +45,71 @@
       "fallbackReviewer": null
     }
   },
+  "convergence": {
+    "classifications": [
+      "valid-blocking",
+      "valid-non-blocking",
+      "invalid",
+      "evidence-blocked"
+    ],
+    "ledgerFields": [
+      "reviewerRole",
+      "exactHead",
+      "rootCause",
+      "classification",
+      "reachableScenario",
+      "failedGuard",
+      "materialImpact",
+      "chosenAction",
+      "priorOccurrence"
+    ],
+    "replay": [
+      {
+        "cycle": 1,
+        "rootCause": "validator-language-boundary",
+        "occurrence": "initial",
+        "action": "bounded-fix-and-rereview",
+        "workerAllowed": true
+      },
+      {
+        "cycle": 2,
+        "rootCause": "validator-language-boundary",
+        "occurrence": "first-recurrence",
+        "action": "bounded-fix-and-rereview",
+        "workerAllowed": true
+      },
+      {
+        "cycle": 3,
+        "rootCause": "validator-language-boundary",
+        "occurrence": "second-recurrence",
+        "action": "convergence-decision",
+        "workerAllowed": false
+      },
+      {
+        "cycle": 4,
+        "rootCause": "validator-language-boundary",
+        "occurrence": "third-cycle-request",
+        "action": "explicit-user-authorization-required",
+        "workerAllowed": false
+      }
+    ],
+    "hypotheticalFutureMutation": {
+      "classification": "valid-non-blocking",
+      "workerAllowed": false,
+      "hasCurrentEntryPath": false,
+      "hasMaterialImpact": false
+    },
+    "materialCurrentDefect": {
+      "classification": "valid-blocking",
+      "workerAllowed": true,
+      "hasCurrentEntryPath": true,
+      "hasMaterialImpact": true
+    },
+    "promptPolicy": {
+      "fixedForCycle": true,
+      "dynamicSynonymCorpus": false
+    }
+  },
   "prohibitedSubstitutions": [
     "luna-as-reviewer",
     "parent-as-reviewer",

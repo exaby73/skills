@@ -44,6 +44,56 @@ expect(review["unavailable"] == {
     "fallbackReviewer": None,
 }, "Sol unavailable outcome")
 
+convergence = data["convergence"]
+expect(convergence["classifications"] == [
+    "valid-blocking",
+    "valid-non-blocking",
+    "invalid",
+    "evidence-blocked",
+], "parent finding classifications")
+expect(convergence["ledgerFields"] == [
+    "reviewerRole",
+    "exactHead",
+    "rootCause",
+    "classification",
+    "reachableScenario",
+    "failedGuard",
+    "materialImpact",
+    "chosenAction",
+    "priorOccurrence",
+], "parent finding ledger fields")
+
+replay = convergence["replay"]
+expect([entry["cycle"] for entry in replay] == [1, 2, 3, 4], "finite convergence replay cycles")
+expect(replay[0]["workerAllowed"] is True, "initial root cause may route one bounded fix")
+expect(replay[1]["occurrence"] == "first-recurrence", "first recurrence is explicit")
+expect(replay[1]["workerAllowed"] is True, "one bounded fix and re-review is allowed")
+expect(replay[2]["occurrence"] == "second-recurrence", "second recurrence is explicit")
+expect(replay[2]["action"] == "convergence-decision", "second recurrence stops automatic routing")
+expect(replay[2]["workerAllowed"] is False, "second recurrence cannot start a worker")
+expect(replay[3]["action"] == "explicit-user-authorization-required", "third cycle needs authorization")
+expect(replay[3]["workerAllowed"] is False, "third cycle cannot start without authorization")
+expect({entry["rootCause"] for entry in replay} == {"validator-language-boundary"}, "replay deduplicates one root cause")
+
+hypothetical = convergence["hypotheticalFutureMutation"]
+expect(hypothetical == {
+    "classification": "valid-non-blocking",
+    "workerAllowed": False,
+    "hasCurrentEntryPath": False,
+    "hasMaterialImpact": False,
+}, "hypothetical mutation remains non-blocking")
+material = convergence["materialCurrentDefect"]
+expect(material == {
+    "classification": "valid-blocking",
+    "workerAllowed": True,
+    "hasCurrentEntryPath": True,
+    "hasMaterialImpact": True,
+}, "material current defect still blocks")
+expect(convergence["promptPolicy"] == {
+    "fixedForCycle": True,
+    "dynamicSynonymCorpus": False,
+}, "review prompts remain fixed")
+
 for path in (skill_root / "SKILL.md", skill_root / "README.md", skill_root / "agents" / "openai.yaml"):
     text = path.read_text()
     if "Parent performs validation and review" in text:
@@ -62,6 +112,11 @@ rg -q 'model .*gpt-5\.6-sol.*reasoning .*high' "$SKILL_ROOT/SKILL.md"
 rg -q 'report .*Evidence blocked' "$SKILL_ROOT/SKILL.md"
 rg -q 'Do not substitute a Luna worker' "$SKILL_ROOT/SKILL.md"
 rg -q 'same complete contract, guidance, target revisions, full diff, and validation evidence' "$SKILL_ROOT/SKILL.md"
+rg -qi 'parent finding ledger' "$SKILL_ROOT/SKILL.md"
+rg -q 'valid-blocking.*valid-non-blocking.*invalid.*evidence-blocked' "$SKILL_ROOT/SKILL.md"
+rg -q 'second re-review' "$SKILL_ROOT/SKILL.md"
+rg -q 'third same-root worker/review cycle' "$SKILL_ROOT/SKILL.md"
+rg -q 'mutation fixtures fixed' "$SKILL_ROOT/SKILL.md"
 rg -q 'fresh read-only Sol-High reviewer' "$SKILL_ROOT/README.md"
 rg -q 'run-review\.sh' "$SKILL_ROOT/README.md"
 

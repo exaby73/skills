@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Contract Writer"
+  short_description: "Draft bounded, evidence-backed issue contracts"
+  default_prompt: "Use $issue-contract-writer to reconcile sources and validate this issue contract before publication."

@@ -74,6 +74,16 @@ Include a non-blocking suggestion only when it offers useful, material value. La
 
 Do not repeat a resolved or evidence-based rejected concern without new evidence. Deduplicate findings that share one root cause and identify the smallest common fix boundary.
 
+## Parent finding classification and convergence
+
+The reviewer supplies evidence; the parent/controller owns branch changes and final delivery judgment. Before assigning implementation work, the parent records every finding in a concise ledger with the reviewer role and exact head, stable root-cause identifier, classification, reachable scenario or reason it is unreachable, failed guard, material impact, chosen action, and whether the same root cause appeared in an earlier pass.
+
+Use exactly one parent classification for each finding: `valid-blocking`, `valid-non-blocking`, `invalid`, or `evidence-blocked`. Only `valid-blocking` findings may cause a branch change. Reviewer severity is evidence, not authorization. A hypothetical future mutation is non-blocking unless it is present in the current delivery or has a credible repository entry path, failed existing guards, and material impact.
+
+Deduplicate different examples that share one root cause. One bounded fix and fresh re-review is allowed for a root cause. If that root-cause family recurs in a second re-review, stop automatic routing and make a convergence decision: reject non-material variants, change the acceptance or architecture boundary, or request owner direction. A third same-root worker/review cycle requires explicit user authorization recorded in the governing issue.
+
+Keep reviewer prompts and mutation fixtures fixed for a review cycle. Do not append historical synonyms, request unspecified “ordinary equivalents,” or expand a corpus for hypothetical variants. A material current defect may add one bounded regression; a passing fixture validator proves only its declared finite domain and named structural properties.
+
 ## Validate findings
 
 Before concluding:
