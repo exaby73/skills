@@ -81,9 +81,9 @@ Add one reusable issue-contract-writer skill.
 
 ## Acceptance criteria
 
-- `R1`: The skill has front matter with name `issue-contract-writer`; validator: `python3 issue-contract-writer/scripts/test_fixtures.py`; completion: command passes at target head.
-- `R2`: The catalog and expected-results file contain exactly five frozen fixture IDs; validator: the same script; completion: IDs and decisions match.
-- `R3`: The skill states that production boundaries and fixture calibration have separate domains; validator: exact required phrase check in the script; completion: phrase is present.
+- `R1`: In bounded domain `{issue-contract-writer/SKILL.md, issue-contract-writer/agents/openai.yaml, issue-contract-writer/references/fixture-catalog.md, issue-contract-writer/references/expected-results.json, issue-contract-writer/scripts/test_fixtures.py}`, included cases are those five paths and excluded cases are all other repository paths. Residual risk is an unlisted future resource; validator: `python3 issue-contract-writer/scripts/test_fixtures.py`; completion: front matter and exact path set pass at target head.
+- `R2`: In bounded domain `{unbounded-natural-language, bounded-structural, finite-universal, ambiguous-evidence, fixture-boundary}`, included cases are those five frozen IDs and excluded cases are reviewer-generated fixtures. Residual risk is behavior outside the frozen corpus; validator: the same script; completion: IDs, required signals, and decisions match.
+- `R3`: In bounded domain `{explicit security or production boundary, repository calibration fixture}`, included cases are those two statements and excluded cases are arbitrary semantic interpretation. Residual risk is untested prose outside the fixture corpus; validator: exact required phrase check in the script; completion: phrase is present.
 
 ## Validation evidence
 
@@ -127,7 +127,19 @@ Proposed contract
 ```md
 ## Acceptance criteria
 
-- For every value in the six-value lifecycle enum, the projection emits exactly one canonical state marker. Included cases are the six enum values; excluded cases are arbitrary prose and future states. Validator: `pnpm run check:lifecycle-enum`; completion: the command passes against `schema@7777777`.
+- For every value in the six-value lifecycle enum, the projection emits exactly one canonical state marker. Included cases are the six enum values; excluded cases are arbitrary prose and future states. Residual risk is behavior for a future seventh state; validator: `pnpm run check:lifecycle-enum`; completion: the command passes against `schema@7777777`.
+
+## Outcome
+
+Validate one bounded lifecycle projection contract.
+
+## In scope
+
+- The six-value lifecycle enum and its projection marker.
+
+## Explicit exclusions
+
+- Do not classify arbitrary prose or future enum values.
 
 ## Validation evidence
 
@@ -140,6 +152,10 @@ Proposed contract
 ## Stopping conditions
 
 - Stop if the schema adds a seventh state without an owner decision.
+
+## Owner decisions
+
+- Parent owns any schema expansion.
 ```
 
 ## Fixture: ambiguous-evidence
@@ -207,8 +223,24 @@ Proposed contract
 ```md
 ## Acceptance criteria
 
-- `R1`: Every request to the declared endpoint fixture set `{POST /teams/:id/invite, POST /teams/:id/accept}` must enforce the authenticated-team authorization property. Included cases are those two routes and their documented actor roles; excluded cases are unrelated endpoints and arbitrary prose. Threat model is cross-team access. Validator: `tests/security-contract.test.ts`; completion: both route cases pass.
-- `R2`: The calibration validator must report only the frozen two-route corpus and must not claim exhaustive semantic coverage. Validator: `python3 scripts/test_fixtures.py`; completion: the corpus hash and domain statement match.
+- `R1`: Every request to the declared endpoint fixture set `{POST /teams/:id/invite, POST /teams/:id/accept}` must enforce the authenticated-team authorization property. Included cases are those two routes and their documented actor roles; excluded cases are unrelated endpoints and arbitrary prose. Threat model is cross-team access. Residual risk is authorization behavior on unlisted endpoints; validator: `tests/security-contract.test.ts`; completion: both route cases pass.
+- `R2`: In bounded domain `{POST /teams/:id/invite, POST /teams/:id/accept}`, the calibration validator must report only the frozen two-route corpus and must not claim exhaustive semantic coverage. Included cases are the two route fixtures; excluded cases are unlisted paraphrases. Residual risk is untested prose outside the corpus; validator: `python3 scripts/test_fixtures.py`; completion: the corpus hash and domain statement match.
+
+## Outcome
+
+Protect two declared team routes and calibrate their finite security fixtures.
+
+## In scope
+
+- The two declared route fixtures and authenticated-team authorization property.
+
+## Explicit exclusions
+
+- Do not generalize the fixture validator to arbitrary endpoints or prose.
+
+## Dependencies and relationships
+
+- The production authorization test and fixture validator are separate evidence sources for the same two-route domain.
 ```
 
 ## Validation evidence

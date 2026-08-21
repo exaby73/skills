@@ -21,6 +21,21 @@ EXPECTED_CONCLUSIONS = {
     "ambiguous-evidence": "Needs clarification",
     "fixture-boundary": "Ready to publish",
 }
+REQUIRED_CONTRACT_SECTIONS = (
+    "## Outcome\n",
+    "## In scope\n",
+    "## Explicit exclusions\n",
+    "## Acceptance criteria\n",
+    "## Validation evidence\n",
+    "## Dependencies and relationships\n",
+    "## Stopping conditions\n",
+    "## Owner decisions\n",
+)
+POSITIVE_FIXTURES = {
+    "bounded-structural",
+    "finite-universal",
+    "fixture-boundary",
+}
 ALLOWED_CONCLUSIONS = {
     "Ready to publish",
     "Needs clarification",
@@ -117,12 +132,27 @@ def main() -> None:
             f"## Fixture: {fixture_id}\n\n### Fixture input\n" in catalog_text,
             f"catalog is missing complete fixture input for {fixture_id}",
         )
+        fixture_text = catalog_text.split(f"## Fixture: {fixture_id}\n", 1)[1].split(
+            "\n## Fixture:", 1
+        )[0]
         signals = fixture["requiredSignals"]
         require(isinstance(signals, list) and signals, f"{fixture_id} needs required signals")
         require(
             all(isinstance(signal, str) and signal.strip() for signal in signals),
             f"{fixture_id} required signals must be non-empty strings",
         )
+        for signal in signals:
+            require(signal in fixture_text, f"{fixture_id} is missing frozen signal: {signal}")
+        if fixture_id in POSITIVE_FIXTURES:
+            for section in REQUIRED_CONTRACT_SECTIONS:
+                require(
+                    section in fixture_text,
+                    f"{fixture_id} positive fixture is missing contract section: {section.strip()}",
+                )
+            require(
+                "Residual risk" in fixture_text,
+                f"{fixture_id} positive fixture must state residual risk",
+            )
 
     require(seen == set(EXPECTED_CONCLUSIONS), "fixture IDs do not match frozen corpus")
     require(

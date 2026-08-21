@@ -5,9 +5,9 @@
       "id": "unbounded-natural-language",
       "expectedConclusion": "Reject as unbounded",
       "requiredSignals": [
-        "arbitrary natural-language paraphrases",
-        "finite domain",
-        "frozen corpus",
+        "reject every equivalent way",
+        "reviewer-discovered paraphrases",
+        "No finite input domain",
         "stopping condition"
       ]
     },
@@ -15,19 +15,19 @@
       "id": "bounded-structural",
       "expectedConclusion": "Ready to publish",
       "requiredSignals": [
-        "finite observable result",
-        "named validator",
-        "explicit exclusions",
-        "parent/controller"
+        "R1`: In bounded domain",
+        "Residual risk is an unlisted future resource",
+        "exact path set pass",
+        "Parent owns publication"
       ]
     },
     {
       "id": "finite-universal",
       "expectedConclusion": "Ready to publish",
       "requiredSignals": [
-        "defined finite domain",
-        "included and excluded cases",
-        "completion condition",
+        "six-value lifecycle enum",
+        "Residual risk is behavior for a future seventh state",
+        "## Explicit exclusions",
         "schema@7777777"
       ]
     },
@@ -35,19 +35,20 @@
       "id": "ambiguous-evidence",
       "expectedConclusion": "Needs clarification",
       "requiredSignals": [
-        "observable result",
-        "named validator",
-        "unresolved owner decision"
+        "Make the workflow better",
+        "Reviewers confirm the implementation is correct",
+        "None named",
+        "unresolved"
       ]
     },
     {
       "id": "fixture-boundary",
       "expectedConclusion": "Ready to publish",
       "requiredSignals": [
-        "production endpoint",
-        "declared finite inputs",
-        "threat model",
-        "frozen two-route corpus"
+        "declared endpoint fixture set",
+        "Threat model is cross-team access",
+        "Residual risk is authorization behavior on unlisted endpoints",
+        "separate evidence sources"
       ]
     }
   ]
