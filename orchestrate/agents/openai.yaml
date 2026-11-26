@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate"
+  short_description: "Coordinate delivery for the owner through delegated agents"
+  default_prompt: "Use $orchestrate to resume as orchestrator: read the checkpoint log, then continue the work in flight."
