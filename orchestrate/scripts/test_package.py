@@ -106,7 +106,7 @@ REQUIRED = {
     ),
 }
 
-FENCE = re.compile(r"^(```|~~~).*?^\1", re.S | re.M)
+FENCE = re.compile(r"^[ \t]*(```|~~~).*?^[ \t]*\1", re.S | re.M)
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 HEADING = re.compile(r"^#{1,6} +(.+?) *$", re.M)
 
