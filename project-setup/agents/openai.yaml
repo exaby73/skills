@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Setup"
+  short_description: "Set up a repository with the owner-led agent workflow"
+  default_prompt: "Use $project-setup to detect what this repository has, show me one plan, and set up the agent workflow once I approve."
