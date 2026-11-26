@@ -48,18 +48,4 @@ When you review a pull request, or before you merge one, follow `docs/agents/rev
 <!-- piece: trains -->
 Open and merge pull requests through merge trains, as `docs/agents/merge-trains.md` says.
 
-## Agent skills
-
-<!-- piece: tracker -->
-### Issue tracker
-
-Issues live in GitHub Issues on `<<GITHUB_REPO>>`, managed with `gh`. See `docs/agents/issue-tracker.md`.
-
-<!-- piece: tracker -->
-### Triage labels
-
-The five default triage labels, each named after its role. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+<!-- When tracker is on, setup-matt-pocock-skills adds its "Agent skills" section here. -->

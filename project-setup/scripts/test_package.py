@@ -24,12 +24,9 @@ EXPECTED_PACKAGE_PATHS = {
     "scripts/test_package.py",
     "templates/AGENTS.md",
     "templates/cadre-guidelines-delivering.md",
-    "templates/docs/agents/domain.md",
-    "templates/docs/agents/issue-tracker.md",
     "templates/docs/agents/merge-trains.md",
     "templates/docs/agents/notices.md",
     "templates/docs/agents/review.md",
-    "templates/docs/agents/triage-labels.md",
     "templates/docs/development/manage-agent-skills.md",
     "templates/docs/development/writing-tests.md",
     "templates/docs/product-decisions.md",
@@ -40,7 +37,6 @@ PLACEHOLDERS = {
     "PROJECT_NAME",
     "PROJECT_SUMMARY",
     "OWNER",
-    "GITHUB_REPO",
     "DEFAULT_BRANCH",
     "SETUP_COMMAND",
     "CHECK_COMMANDS",
@@ -63,20 +59,19 @@ SKILL_SECTIONS = (
     "## 4. Get One Approval\n",
     "## 5. Write\n",
     "## 6. Run Setup and Verify\n",
-    "## 7. Commit and Report\n",
+    "## 7. Commit\n",
+    "## 8. Onboard Cadre\n",
+    "## 9. Deliver and Report\n",
 )
 ROUTED_TEMPLATES = (
     "docs/agents/review.md",
     "docs/agents/merge-trains.md",
     "docs/agents/notices.md",
-    "docs/agents/issue-tracker.md",
-    "docs/agents/triage-labels.md",
-    "docs/agents/domain.md",
     "docs/development/writing-tests.md",
     "docs/development/manage-agent-skills.md",
 )
 
-FENCE = re.compile(r"^(```|~~~).*?^\1", re.S | re.M)
+FENCE = re.compile(r"^[ \t]*(```|~~~).*?^[ \t]*\1", re.S | re.M)
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 HEADING = re.compile(r"^#{1,6} +(.+?) *$", re.M)
 
@@ -124,7 +119,7 @@ def main() -> None:
     require(len(match.group(2)) <= 1024 and "Use when" in match.group(2), "description must be short and name its triggers")
     for section in SKILL_SECTIONS:
         require(section in skill, f"SKILL.md lacks {section.strip()}")
-    for phrase in ("one approval", "idempotent", "nothing to change", "writes nothing into `.cadre/`", "cadre:create"):
+    for phrase in ("one approval", "idempotent", "nothing to change", "Only `cadre:create`", "setup-matt-pocock-skills", "its own one approval"):
         require(phrase in skill, f"SKILL.md lacks '{phrase}'")
     for piece in PIECES:
         require(f"| `{piece}`:" in skill, f"SKILL.md's piece table lacks {piece}")
@@ -162,11 +157,12 @@ def main() -> None:
     agents = (TEMPLATES / "AGENTS.md").read_text()
     for rel in ROUTED_TEMPLATES:
         require(rel in agents, f"templates/AGENTS.md does not route to {rel}")
-    labels = (TEMPLATES / "docs/agents/triage-labels.md").read_text()
     conventions = (SKILL_ROOT / "references/conventions.md").read_text()
+    require("setup-matt-pocock-skills/SKILL.md" in conventions, "conventions.md must delegate the tracker to setup-matt-pocock-skills")
     for label in TRIAGE_LABELS:
-        require(f"`{label}`" in labels, f"triage-labels.md lacks {label}")
-        require(f"gh label create {label} " in conventions, f"conventions.md does not create {label}")
+        require(f"`{label}`" in conventions, f"conventions.md lacks the {label} label")
+    cadre_ref = (SKILL_ROOT / "references/cadre.md").read_text()
+    require("## Run Cadre" in cadre_ref and "`cadre:create`" in cadre_ref, "cadre.md must run cadre:create")
 
     review = (TEMPLATES / "docs/agents/review.md").read_text()
     for phrase in ("COMMENT only", "file and line", "failure scenario", "only the fix commits", "sign-in, access control, money, or deleting data", "no further round", "--match-head-commit"):
@@ -176,7 +172,7 @@ def main() -> None:
         require(phrase in cadre, f"cadre lessons lack '{phrase}'")
 
     catalog = (SKILL_ROOT / "references/agent-skills.md").read_text()
-    for skill_name in ("docs-governance", "writing-for-agents", "gwt-tester", "code-review", "pair-review", "leaving-pr-comments", "wayfinder", "wayfinder-pane", "impeccable", "research", "prototype", "tdd", "diagnosing-bugs", "grilling", "domain-modeling", "orchestrate"):
+    for skill_name in ("setup-matt-pocock-skills", "docs-governance", "writing-for-agents", "gwt-tester", "code-review", "pair-review", "leaving-pr-comments", "wayfinder", "wayfinder-pane", "impeccable", "research", "prototype", "tdd", "diagnosing-bugs", "grilling", "domain-modeling", "orchestrate"):
         require(f"`{skill_name}`" in catalog, f"catalog lacks {skill_name}")
 
     print(f"project-setup package valid: {len(EXPECTED_PACKAGE_PATHS)} files")

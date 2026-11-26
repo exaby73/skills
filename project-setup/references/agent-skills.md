@@ -9,7 +9,7 @@ Install the **core** group always, and each other group the owner picks in step 
 | Group | Recommend | Source | Skills |
 | --- | --- | --- | --- |
 | core | always | `hexsis-llc/skills` | `docs-governance`, `gwt-tester`, `pair-review`, `git-committer` |
-| core | always | `mattpocock/skills` | `writing-for-agents`, `code-review`, `wayfinder`, `research`, `prototype`, `tdd`, `diagnosing-bugs`, `grilling`, `grill-with-docs`, `domain-modeling`, `triage`, `to-spec`, `to-tickets`, `handoff` |
+| core | always | `mattpocock/skills` | `setup-matt-pocock-skills`, `writing-for-agents`, `code-review`, `wayfinder`, `research`, `prototype`, `tdd`, `diagnosing-bugs`, `grilling`, `grill-with-docs`, `domain-modeling`, `triage`, `to-spec`, `to-tickets`, `handoff` |
 | core | always | `t3dotgg/tstack` | `leaving-pr-comments` |
 | core | always | `exaby73/skills` | `orchestrate` |
 | design | when `frontend=yes` | `pbakaus/impeccable` | `impeccable` |
@@ -17,7 +17,7 @@ Install the **core** group always, and each other group the owner picks in step 
 | more thinking tools | no | `mattpocock/skills` | `ask-matt`, `codebase-design`, `improve-codebase-architecture`, `grill-me`, `teach`, `to-questionnaire`, `wait-what`, `retro`, `wizard` |
 | automated reviewers | when `ci=github-actions` | `exaby73/skills`, `hexsis-llc/skills` | `code-reviewer`, `scope-reviewer`, `ui-ux-reviewer`; `claude-pr-review` |
 
-Leave out `setup-matt-pocock-skills`, whose docs this run writes, and, when `cadre` is on, `implement` and `implement-spec`, since Cadre implements.
+When `cadre` is on, leave out `implement` and `implement-spec`, since Cadre implements.
 
 ## Write
 

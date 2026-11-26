@@ -1,26 +1,23 @@
 # Pieces: Tracker, Testing, and Review
 
-Three pieces that each write docs from a template and route to them from `AGENTS.md`.
+Three pieces that each write docs and route to them from `AGENTS.md`.
 
-## Issue Tracker and Triage Labels
+## Issue Tracker, Triage Labels, and Domain Docs
 
-Issues live in GitHub Issues, managed with `gh`. The skills speak of five triage roles, and the repository has one label for each.
+The engineering skills (`triage`, `to-tickets`, `to-spec`, `wayfinder`, and the rest) read three docs in `docs/agents/`: where issues live, the label for each of the five triage roles, and where the glossary and ADRs are. The `setup-matt-pocock-skills` skill writes them, creates missing labels, and adds the "Agent skills" block to `AGENTS.md`. The `skills` piece installs it first.
 
-1. Write [issue-tracker.md](../templates/docs/agents/issue-tracker.md) and [triage-labels.md](../templates/docs/agents/triage-labels.md) into `docs/agents/`, and the tracker subsections of the AGENTS.md section "Agent skills".
-2. Check the target before the first write: `gh repo view --json nameWithOwner` must print the `github_repo` from the plan. In a fork, `gh` can default to the upstream parent.
-3. Create each label `detect.sh` reports missing, and only those:
+Its own instructions ask the owner one section at a time. Settle each section in this run's plan instead, and follow the installed `.agents/skills/setup-matt-pocock-skills/SKILL.md` with those answers, asking the owner nothing more:
 
-   ```sh
-   gh label create needs-triage    --color d4c5f9 --description "Maintainer needs to evaluate this issue"
-   gh label create needs-info      --color fbca04 --description "Waiting on reporter for more information"
-   gh label create ready-for-agent --color 0e8a16 --description "Fully specified, ready for an AFK agent"
-   gh label create ready-for-human --color 1d76db --description "Requires human implementation"
-   gh label create wontfix         --color ffffff --description "Will not be actioned"
-   ```
+| Its section | Recommend in the plan |
+| --- | --- |
+| A. Issue tracker | GitHub when `github_repo` is set; GitLab when the remote is GitLab; local markdown under `.scratch/` when there is no remote, with `gh repo create` and a second run named in the report. |
+| B. Triage labels | The five defaults, `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`, unless the tracker already uses other names for those roles. |
+| C. Domain docs | Single-context, unless it finds monorepo signals. |
 
-   When the repository already uses other names for these roles, keep its labels and write its names into `triage-labels.md`'s second column instead.
+Two of its rules meet this run's:
 
-With no GitHub remote, keep this piece off, and name `gh repo create` and a second run of this skill in the report.
+- **The file it edits:** it edits `CLAUDE.md` when that exists. After the `docs` piece, `CLAUDE.md` is a symlink, so edit `AGENTS.md` itself and check that `readlink CLAUDE.md` still prints `AGENTS.md`.
+- **A Cadre project:** when `cadre` is on, add the Cadre paragraph from [cadre.md](cadre.md#write) to the `issue-tracker.md` it writes.
 
 ## Testing
 
@@ -36,4 +33,4 @@ Write [review.md](../templates/docs/agents/review.md) into `docs/agents/`, the A
 
 ## Done
 
-The docs each piece names exist and `docs/README.md` lists them, `AGENTS.md` routes to each, and `gh label list` shows the five roles when `tracker` is on.
+The docs each piece names exist and `docs/README.md` lists them, `AGENTS.md` routes to each, and a GitHub or GitLab tracker has a label for each of the five roles.

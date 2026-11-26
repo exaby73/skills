@@ -20,8 +20,7 @@ The `docs-governance` skill owns this piece, and its BOOTSTRAP.md is the procedu
 - **The register:** a new `docs/product-decisions.md` starts from [templates/docs/product-decisions.md](../templates/docs/product-decisions.md). Every piece the owner turns on adds its entry there, dated the day they approve the plan.
 - **The index:** `docs/README.md` lists every doc this run writes, under its folder, with when to read it. Take each line's wording from the doc's first paragraph.
 - **The glossary:** a new `GLOSSARY.md` holds a title and a one-line summary of the project, with no terms yet. Terms arrive through `grill-with-docs` and `domain-modeling`.
-- **Domain docs:** [templates/docs/agents/domain.md](../templates/docs/agents/domain.md) into `docs/agents/`, which tells the engineering skills to read the glossary and ADRs before exploring.
 
 ## Done
 
-`detect.sh` reports `agents_md=file`, `claude_md=symlink-to-agents` (or `import-agents`), `docs_index`, `glossary`, `decision_register`, and `adr_dir` present, `agent_docs` including domain, and `scratch_ignored=yes`.
+`detect.sh` reports `agents_md=file`, `claude_md=symlink-to-agents` (or `import-agents`), `docs_index`, `glossary`, `decision_register`, and `adr_dir` present, and `scratch_ignored=yes`.
